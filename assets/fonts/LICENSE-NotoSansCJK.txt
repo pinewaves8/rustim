@@ -1,0 +1,9 @@
+Noto Sans CJK — SIL Open Font License, Version 1.1
+
+File:   NotoSansCJK-Regular.ttc (18 MB, a TrueType collection: SC/TC/HK/JP/KR faces)
+Source: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc, Debian package fonts-noto-cjk
+Upstream: https://github.com/notofonts/noto-cjk
+Why bundled: a bare Linux container has no CJK face at all, and CI must render
+             identical pixels on three platforms, so text cannot come from the system.
+
+

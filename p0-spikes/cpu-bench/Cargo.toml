@@ -1,0 +1,13 @@
+[package]
+name = "cpu-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vello_common = "0.3.0"
+vello_cpu = { version = "0.3.0", features = ["multithreading"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

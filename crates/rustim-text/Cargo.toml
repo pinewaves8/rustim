@@ -1,0 +1,31 @@
+[package]
+name = "rustim-text"
+description = "Text shaping (parley/skrifa) and Typst formula compilation. Phase 1+."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustim-math.workspace = true
+rustim-color.workspace = true
+parley.workspace = true
+# Needed for exactly one thing: `lstm`, the code path for ICU4X's dictionary and
+# LSTM segmenters. parley pulls icu_segmenter with `default-features = false`, so
+# its `auto` (== `lstm`) is off, and parley's own `complex-scripts` feature only
+# picks `new_dictionary` — the models have to exist for it to pick. Without this
+# the segmenter logs "No segmentation model for complex script: Chinese/Japanese"
+# to stderr once per shaped line and falls back to UAX#14 alone: CJK still breaks
+# between ideographs, but nothing can break inside a Chinese sentence at a word
+# boundary. Feature unification makes naming it here sufficient; this crate never
+# calls into it directly.
+icu_segmenter = { version = "2.1.2", default-features = false, features = ["lstm"] }
+
+[dev-dependencies]
+# Reads the Manim measurement in `tests/fixtures/`; see `tests/manim_text_scale.rs`.
+serde_json.workspace = true
+# Reads the cap height and units-per-em out of the bundled face, which is the
+# other half of that measurement. Deliberately dev-only for now: it is the same
+# 0.44.0 that `glifo` already pins, so it adds no second copy to the tree, and
+# step 5 (Typst outlines) is where this crate starts needing it for real.
+skrifa = "0.44.0"

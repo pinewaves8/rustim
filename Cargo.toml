@@ -1,0 +1,75 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rustim-math",
+    "crates/rustim-color",
+    "crates/rustim-mobject",
+    "crates/rustim-anim",
+    "crates/rustim-text",
+    "crates/rustim-scene",
+    "crates/rustim-render",
+    "crates/rustim-export",
+    "crates/rustim-app",
+]
+# Throwaway Phase-0 probes with their own target dirs; not part of the engine.
+exclude = ["p0-spikes"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+rustim-math = { path = "crates/rustim-math" }
+rustim-color = { path = "crates/rustim-color" }
+rustim-mobject = { path = "crates/rustim-mobject" }
+rustim-anim = { path = "crates/rustim-anim" }
+rustim-text = { path = "crates/rustim-text" }
+rustim-scene = { path = "crates/rustim-scene" }
+rustim-render = { path = "crates/rustim-render" }
+rustim-export = { path = "crates/rustim-export" }
+
+# Pinned to versions verified on 2026-10-16 (see 方案建议.md 3.6).
+kurbo = "0.13.1"
+peniko = "0.6.1"
+vello_common = "0.3.0"
+vello_cpu = "0.3.0"
+wgpu = "30.0.1"
+winit = "0.30.13"
+softbuffer = "0.4.8"
+# Text shaping. Pinned to 0.11.1, not the 0.12 that 方案建议.md §3.2 names: 0.11.1's
+# dependency set (fontique 0.11.1 + skrifa 0.44.0 + read-fonts 0.41.0) is *exactly*
+# what glifo 0.4.0 — vello_cpu's text backend — already links, so the whole stack
+# shares one skrifa. 0.12 is the release that split out `parley_engine` and moves to
+# a different skrifa, i.e. a second rasteriser of every glyph (§3.6 risk 3).
+# `default-features = false` is load-bearing: parley's default `system` feature pulls
+# fontique's `system` feature, which links fontconfig/objc2-core-text/windows and
+# discovers fonts from OS paths — exactly what §10.6's guard 3 forbids. `std` alone
+# still exports SourceCache and Collection, so self-registered font bytes work.
+# `complex-scripts` selects ICU4X's dictionary segmenters over the UAX#14-only
+# ones — see `crates/rustim-text/Cargo.toml`, which supplies the matching
+# icu_segmenter features.
+parley = { version = "0.11.1", default-features = false, features = ["std", "complex-scripts"] }
+
+# Accessibility (P1 step 3). Only `rustim-app` may link these: the semantic layer
+# lives in `rustim-scene`, which stays accesskit-free so it can compile to wasm and
+# be reused by a DOM/ARIA target — Web and native need the same *semantic data*,
+# not the same AccessKit tree (§4.6). CI asserts this with `cargo tree`.
+accesskit = "0.25.1"
+accesskit_winit = "0.34.1"
+
+# Test-only in the six kernel crates: used there to read the Manim fixtures
+# (`crates/rustim-math/tests/fixtures/`) and to round-trip the command layer
+# through JSON, and deliberately not a real dependency of any of them, so it
+# cannot reach the `wasm32-unknown-unknown` build. `rustim-app` is not a kernel
+# crate and is the one place it is a real dependency — the `--inspect` surface
+# has to emit JSON for a host to read (`crates/rustim-app/src/main.rs`).
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Optimised, but keep line info so release-mode profiles are still readable.
+debug = 1

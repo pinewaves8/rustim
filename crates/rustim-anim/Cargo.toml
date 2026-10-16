@@ -1,0 +1,11 @@
+[package]
+name = "rustim-anim"
+description = "Rate functions, the Animation trait, and timeline evaluation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustim-math.workspace = true
+rustim-mobject.workspace = true

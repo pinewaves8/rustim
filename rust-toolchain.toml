@@ -1,0 +1,14 @@
+# Pinned so CI and the dev machine agree. Bump deliberately.
+#
+# `stable`, not an exact version, on purpose. This machine's stable toolchain
+# (1.99.0 at time of writing) already has rustfmt and clippy; every other
+# channel named here has to be fetched whole from static.rust-lang.org, which
+# on this network runs at single-digit KB/s — pinning `1.92` made a bare
+# `cargo build` spend 15 minutes downloading a toolchain and never reach the
+# workspace. Do not "restore" that pin: 1.92 is the *MSRV floor* required by
+# `typst 0.15.1` (方案建议.md §3), which belongs in `[workspace.package]
+# rust-version` in the root Cargo.toml, not in the channel. A floor and a
+# target are different things, and only the floor needs to be old.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

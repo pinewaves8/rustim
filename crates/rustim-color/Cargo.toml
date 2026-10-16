@@ -1,0 +1,11 @@
+[package]
+name = "rustim-color"
+description = "The 3b1b palette and colour helpers, over peniko's colour types."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peniko.workspace = true
+rustim-math.workspace = true

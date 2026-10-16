@@ -1,0 +1,15 @@
+[package]
+name = "rustim-export"
+description = "Deterministic offscreen rendering and the ffmpeg pipe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustim-render.workspace = true
+# For `Tolerance::default`'s background: the comparator's notion of "blank"
+# has to be the scene's background, and it must not be a second copy of #121212.
+rustim-color.workspace = true
+vello_common.workspace = true
+png = "0.18"

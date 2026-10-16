@@ -1,0 +1,15 @@
+[package]
+name = "gpu-probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pollster = "1.0.1"
+vello_common = "0.3.0"
+vello_gpu = "0.3.0"
+wgpu = "30.0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

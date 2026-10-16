@@ -1,0 +1,57 @@
+{
+  "cap_letters": [
+    {
+      "height": 0.48828125,
+      "letter": "H"
+    },
+    {
+      "height": 0.48828125,
+      "letter": "X"
+    },
+    {
+      "height": 0.48828125,
+      "letter": "T"
+    },
+    {
+      "height": 0.48828125,
+      "letter": "I"
+    },
+    {
+      "height": 0.48828125,
+      "letter": "E"
+    },
+    {
+      "height": 0.48828125,
+      "letter": "N"
+    },
+    {
+      "height": 0.48828125,
+      "letter": "F"
+    }
+  ],
+  "font": "Noto Sans CJK SC",
+  "frame_height": 8.0,
+  "frame_width": 14.222222222222221,
+  "manim_version": "0.22.0",
+  "measurements": [
+    {
+      "center_y": 0.0,
+      "font_size": 48,
+      "height": 0.72578125,
+      "width": 1.3626465
+    },
+    {
+      "center_y": 0.0,
+      "font_size": 24,
+      "height": 0.36328125,
+      "width": 0.6820801
+    },
+    {
+      "center_y": 0.0,
+      "font_size": 96,
+      "height": 1.45234375,
+      "width": 2.7269042999999997
+    }
+  ],
+  "text": "Xg勾"
+}

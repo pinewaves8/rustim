@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The three desktop targets are a hard product requirement (CLAUDE.md,
+  # 方案建议.md §10), so they are checked on every push from the first commit
+  # rather than added once the engine is "done" — by then the platform-specific
+  # damage is already baked in.
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # winit needs xkbcommon/wayland headers on Linux; macOS and Windows need
+      # nothing beyond the toolchain.
+      - name: install Linux windowing headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev
+
+      # Matches `channel` in rust-toolchain.toml; keep the two in step.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+
+  # The day-one guard from 方案建议.md §10.6: the semantic kernel must not grow a
+  # dependency on a platform that does not exist in a browser. Checking it on
+  # every push is much cheaper than discovering in Phase 2 that some convenience
+  # import dragged `std::fs` into the middle of the model.
+  wasm-kernel:
+    name: wasm32 semantic kernel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Deliberately excludes rustim-app (winit/softbuffer have no wasm32 build
+      # here), rustim-text and rustim-export (both do I/O by nature).
+      - run: >
+          cargo build --target wasm32-unknown-unknown
+          -p rustim-math -p rustim-color -p rustim-mobject
+          -p rustim-anim -p rustim-scene -p rustim-render
+
+      # The half of the guard a build cannot make. `accesskit` is platform
+      # agnostic enough to compile to wasm32, so a stray dependency would not
+      # fail the build above — it would silently put a desktop accessibility
+      # binding inside the kernel, which is meant to reach the browser through
+      # DOM/ARIA instead. Asserted both ways round, so the check cannot pass
+      # vacuously if the dependency is renamed away.
+      - name: accesskit stays in the application layer
+        run: |
+          if cargo tree -p rustim-scene -e no-dev | grep -q accesskit; then
+            echo "::error::accesskit reached the semantic kernel; it belongs in rustim-app only"
+            cargo tree -p rustim-scene -e no-dev | grep accesskit
+            exit 1
+          fi
+          if ! cargo tree -p rustim-app -e normal | grep -q accesskit; then
+            echo "::error::rustim-app no longer depends on accesskit; the check above is vacuous"
+            exit 1
+          fi
+
+  # Renders every reference scene through the real binary and compares it to a
+  # checked-in baseline, pixel by pixel.
+  #
+  # Baselines are per platform *and per architecture*, because vello_cpu
+  # rasterises in f32 and NEON and SSE/AVX do not round identically (方案建议.md
+  # §10.2(3)). So this job needs a matrix rather than one shared image, and it
+  # fails — loudly, never by skipping — on a platform whose baseline has not
+  # been committed yet. The render is uploaded as an artifact so that bootstrap
+  # is "download, review, commit", not "re-run and hope the log says enough".
+  goldens:
+    name: goldens (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The test runs the real binary, so it needs the same windowing headers as
+      # the `test` job even though this path opens no window.
+      - name: install Linux windowing headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: golden images
+        run: cargo test -p rustim-app --test goldens
+
+      # Only on failure, and `ignore` so a platform with no artifacts yet does
+      # not turn a clear "missing baseline" into a second, confusing error.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: golden-renders-${{ matrix.os }}
+          path: target/golden-artifacts/
+          if-no-files-found: ignore
+          retention-days: 30

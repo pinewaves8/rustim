@@ -1,0 +1,31 @@
+[package]
+name = "rustim-app"
+description = "The winit event loop, input routing, and the runnable binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustim-math.workspace = true
+rustim-color.workspace = true
+rustim-mobject.workspace = true
+rustim-anim.workspace = true
+rustim-render.workspace = true
+rustim-export.workspace = true
+rustim-scene.workspace = true
+# Text shaping. Only this crate links it: `rustim-render` must not (it would drag
+# parley into the `wasm32-unknown-unknown` kernel build), and `rustim-text` must
+# not link a renderer. The app is where the two sides meet, which is why it is
+# also the only place that converts a shaped run into a `DrawOp::GlyphRun`.
+rustim-text.workspace = true
+winit.workspace = true
+softbuffer.workspace = true
+accesskit.workspace = true
+accesskit_winit.workspace = true
+# The one crate where this is a real dependency rather than a test-only one. It
+# is not a `wasm-kernel` crate, so the root `Cargo.toml` rule against letting it
+# reach `wasm32-unknown-unknown` does not apply — and `--inspect` has to emit
+# JSON, because on a machine with no screen reader and no AT-SPI session bus a
+# file is the only way to see what the accessibility layer would say.
+serde_json.workspace = true

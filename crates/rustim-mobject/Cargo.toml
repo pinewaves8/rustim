@@ -1,0 +1,16 @@
+[package]
+name = "rustim-mobject"
+description = "The Mobject data model: points, style, deferred transform, scene tree."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustim-math.workspace = true
+rustim-color.workspace = true
+slotmap = "1.0.7"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json.workspace = true

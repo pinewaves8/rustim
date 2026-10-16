@@ -1,0 +1,5 @@
+/target
+/p0-spikes/*/target
+# Manim writes this next to whatever directory it is run from; it is regenerable
+# scratch (mostly the SVG text intermediates) and never part of the engine.
+/media

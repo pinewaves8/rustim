@@ -1,0 +1,18 @@
+[package]
+name = "rustim-math"
+description = "Points, affine transforms, Bezier maths and rate functions. No rendering, no platform code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# `serde` is on so that `Rect` can appear in the accessibility layer's
+# serialisable tree (`rustim-scene::a11y`) without a hand-rolled four-field
+# rectangle existing purely to be serialisable. Additive and platform-free, so it
+# does not affect the `wasm32-unknown-unknown` kernel build.
+kurbo = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+# Reads the Manim fixtures in `tests/fixtures/`; see `tests/manim_parity.rs`.
+serde_json.workspace = true

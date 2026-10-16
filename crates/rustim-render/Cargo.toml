@@ -1,0 +1,22 @@
+[package]
+name = "rustim-render"
+description = "The Renderer trait plus the vello_cpu and vello_gpu backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustim-math.workspace = true
+rustim-color.workspace = true
+vello_common.workspace = true
+# Named directly rather than reached through `vello_common::peniko`, because a
+# font handle is a public field of `DrawOp::GlyphRun`: a caller that builds a
+# glyph run must be able to name the type it is filling in without knowing which
+# crate the renderer happens to re-export it from. It is pure data — bytes plus a
+# face index — with no rasteriser and no platform code, so naming it here does
+# not widen this crate's surface.
+peniko.workspace = true
+vello_cpu = { workspace = true, features = ["multithreading"] }
+bytemuck = "1"
+thiserror = "2"
