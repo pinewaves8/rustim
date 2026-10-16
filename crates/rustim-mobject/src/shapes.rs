@@ -159,6 +159,143 @@ pub fn path_of(points: &[Point]) -> rustim_math::BezPath {
     bezier_path_from_points(points.iter().copied())
 }
 
+/// The inverse of [`path_of`]: a `kurbo` path back into Manim's flat
+/// control-point array, four points per cubic.
+///
+/// Glyph outlines arrive as `BezPath`s (from `skrifa`), and a mobject stores
+/// points, so something has to cross between the two. Doing it here — in the
+/// mobject crate, next to `path_of` — keeps the outline *source* out of this
+/// layer entirely: nothing below `rustim-text` learns what a font is, and a
+/// future outline source (a different shaper, hand-authored SVG paths, a
+/// boolean-op result) reuses this instead of reimplementing it.
+///
+/// **Every segment is emitted as a cubic, and every segment restates the
+/// previous segment's endpoint as its own start.** That is the same format
+/// [`bezier_path_from_points`] reads and the one [`bezier::anchors`] requires a
+/// multiple of four for; a `LineTo` written as a bare pair of points would make
+/// the array a different shape than every polygon in this engine and quietly
+/// break the geometry readers. `LineTo` and `ClosePath` therefore go through
+/// [`bezier::points_as_corners`], which puts the interior control points at
+/// `1/3` and `2/3` rather than stacking them on the endpoints — the degenerate
+/// spelling draws the same line and parameterises it differently, and
+/// `CLAUDE.md` records why that is not an acceptable "equivalent".
+///
+/// A subpath that is closed with its current point already at the start emits
+/// no closing segment: the points would be four copies of one coordinate, which
+/// adds nothing to the drawn path and does add a curve to traverse for anything
+/// that parameterises the array (morphing, `proportions_along_bezier_curve`).
+///
+/// # More than one subpath becomes one loop through a doubled slit
+///
+/// This is a real limitation of the format, not a detail. [`path_of`] reads the
+/// array back with a single `move_to` and nothing but `curve_to` after it, so an
+/// array cannot say "lift the pen here" — which means the second contour of an
+/// `o`, a `d`, an `=`, a `%` has to be *reachable* from the first by a segment
+/// that is part of the path. Concatenating naively would leave the implicit
+/// closing edge of the whole array running from the last point back to the
+/// first: one real edge straight across the glyph, on top of a counter that
+/// fills in solid.
+///
+/// So each later contour is entered through a **hub** — the first point of the
+/// first contour — and the loop returns to the hub at the end. Every bridge is
+/// therefore traversed exactly twice, in opposite directions, and a segment
+/// travelled once each way contributes nothing to the winding number. Under
+/// `Fill::NonZero`, which is what this engine's rasteriser uses, the filled
+/// region is then exactly the union of the contours with their own orientations:
+/// a font's outer contour and its counter wind opposite ways, so the counter
+/// cancels and stays empty. This is the same "keyhole" a triangulator uses to
+/// put a hole in a polygon, and it is why the alternative — one mobject per
+/// contour — is not needed to keep the per-symbol addressability the format is
+/// otherwise costing.
+///
+/// The hub's own point is a genuine contour point, so [`bezier::anchors`] still
+/// bounds the ink, and `critical_point` is unaffected.
+///
+/// An *open* single-contour path gets no trailing segment: the array is a
+/// polyline, and closing it is the fill's business (a fill closes an open
+/// subpath implicitly anyway).
+pub fn points_from_path(path: &rustim_math::BezPath) -> Vec<Point> {
+    use rustim_math::PathEl;
+
+    let mut out = Vec::new();
+    // Where the pen is now, and where the current subpath began. `ClosePath`
+    // needs both, and the origin is otherwise unrecoverable — `kurbo` does not
+    // restate it.
+    let mut cur: Option<Point> = None;
+    let mut origin: Option<Point> = None;
+    // The first point of the first contour: every later contour hangs off it.
+    let mut hub: Option<Point> = None;
+    // Whether a second contour was ever entered, which is the only case that
+    // needs the loop closed back onto the hub at the end.
+    let mut bridged = false;
+
+    for el in path.elements() {
+        match *el {
+            PathEl::MoveTo(p) => {
+                match hub {
+                    None => hub = Some(p),
+                    Some(h) => {
+                        // Out along the slit, then back along it to the new
+                        // contour. Zero-length halves are skipped so that a
+                        // contour that happens to start where the hub is does not
+                        // add a curve that goes nowhere.
+                        if let Some(from) = cur
+                            && from != h
+                        {
+                            out.extend(bezier::points_as_corners(&[from, h]));
+                        }
+                        out.extend(bezier::points_as_corners(&[h, p]));
+                        bridged = true;
+                    }
+                }
+                cur = Some(p);
+                origin = Some(p);
+            }
+            PathEl::LineTo(p) => {
+                if let Some(from) = cur {
+                    out.extend(bezier::points_as_corners(&[from, p]));
+                }
+                cur = Some(p);
+            }
+            PathEl::QuadTo(c, p) => {
+                if let Some(from) = cur {
+                    // Degree elevation. A quadratic is exactly representable as
+                    // a cubic, so this loses nothing — and emitting a quadratic
+                    // as if it were a cubic would bend the curve.
+                    let c1 = from + (c - from) * (2.0 / 3.0);
+                    let c2 = p + (c - p) * (2.0 / 3.0);
+                    out.extend([from, c1, c2, p]);
+                }
+                cur = Some(p);
+            }
+            PathEl::CurveTo(c1, c2, p) => {
+                if let Some(from) = cur {
+                    out.extend([from, c1, c2, p]);
+                }
+                cur = Some(p);
+            }
+            PathEl::ClosePath => {
+                if let (Some(from), Some(start)) = (cur, origin)
+                    && from != start
+                {
+                    out.extend(bezier::points_as_corners(&[from, start]));
+                }
+                cur = origin;
+            }
+        }
+    }
+
+    // Close the loop onto the hub, so the array's implicit closing edge is a
+    // point rather than a segment across the glyph.
+    if bridged
+        && let (Some(h), Some(from)) = (hub, cur)
+        && from != h
+    {
+        out.extend(bezier::points_as_corners(&[from, h]));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +402,164 @@ mod tests {
     fn shape_kinds_serialise_snake_case() {
         let json = serde_json::to_string(&ShapeKind::RightTriangle).unwrap();
         assert_eq!(json, "\"right_triangle\"");
+    }
+
+    /// A `LineTo` has to become a *uniform* cubic, not four copies of its
+    /// endpoints. Both draw the same segment, which is exactly why the
+    /// difference is easy to lose: `bezier::anchors` sees a different curve,
+    /// and morphing between a glyph outline and a square interpolates the two
+    /// arrays elementwise.
+    #[test]
+    fn a_straight_segment_becomes_a_uniform_cubic_not_a_degenerate_one() {
+        let mut path = rustim_math::BezPath::new();
+        path.move_to(Point::new(0.0, 0.0));
+        path.line_to(Point::new(2.0, 0.0));
+        let pts = points_from_path(&path);
+
+        assert_eq!(pts.len(), 4);
+        assert_eq!(pts[0], Point::new(0.0, 0.0));
+        assert_eq!(pts[3], Point::new(2.0, 0.0));
+        // The interior control points sit a third and two thirds along — the
+        // whole point of going through `points_as_corners`. Stacking them on
+        // the endpoints would still draw this line.
+        assert!((pts[1].x - 2.0 / 3.0).abs() < 1e-12, "{:?}", pts[1]);
+        assert!((pts[2].x - 4.0 / 3.0).abs() < 1e-12, "{:?}", pts[2]);
+    }
+
+    /// The round trip the glyph pipeline depends on: a path built from a point
+    /// array reads back as the same array. If this drifts, every glyph outline
+    /// arrives in the engine subtly reshaped rather than obviously broken.
+    #[test]
+    fn a_closed_triangle_round_trips_through_points_and_back() {
+        let corners = [
+            Point::new(0.0, 0.0),
+            Point::new(3.0, 0.0),
+            Point::new(0.0, 4.0),
+            Point::new(0.0, 0.0),
+        ];
+        let original = bezier::points_as_corners(&corners);
+        assert_eq!(points_from_path(&path_of(&original)), original);
+    }
+
+    /// A quadratic lifted to a cubic is the *same curve*, which is the only
+    /// reason degree elevation is allowed here. Reading a quadratic's control
+    /// point as a cubic's first would move the curve anywhere off the line.
+    #[test]
+    fn a_quadratic_is_elevated_to_the_same_curve() {
+        let mut path = rustim_math::BezPath::new();
+        path.move_to(Point::new(0.0, 0.0));
+        path.quad_to(Point::new(0.0, 1.0), Point::new(1.0, 1.0));
+        let pts = points_from_path(&path);
+
+        assert_eq!(pts.len(), 4);
+        // A cubic's midpoint is `(start + 3·c1 + 3·c2 + end) / 8`.
+        let mid =
+            (pts[0].to_vec2() + pts[1].to_vec2() * 3.0 + pts[2].to_vec2() * 3.0 + pts[3].to_vec2())
+                / 8.0;
+        // ...and the quadratic's is `(start + 2·c + end) / 4` = (0.25, 0.75).
+        assert!(
+            (mid.x - 0.25).abs() < 1e-12 && (mid.y - 0.75).abs() < 1e-12,
+            "{mid:?}"
+        );
+    }
+
+    /// A subpath closed where it already started needs no closing segment. One
+    /// would be four copies of a coordinate — invisible when drawn, but a whole
+    /// extra curve for anything that walks the array.
+    #[test]
+    fn closing_a_path_that_is_already_at_its_origin_adds_no_segment() {
+        let mut path = rustim_math::BezPath::new();
+        path.move_to(Point::new(0.0, 0.0));
+        path.line_to(Point::new(1.0, 0.0));
+        path.line_to(Point::new(0.0, 0.0));
+        path.close_path();
+
+        let pts = points_from_path(&path);
+        assert_eq!(pts.len(), 2 * 4);
+        assert_eq!(pts[pts.len() - 1], Point::new(0.0, 0.0));
+    }
+
+    /// The property that makes a two-contour glyph survive the flat array: the
+    /// counter stays empty. A `Vec<Point>` has no way to say "lift the pen", so
+    /// the second contour is reached through a hub and a doubled slit — and if
+    /// either half of that is wrong, the counter fills in solid.
+    ///
+    /// Asserted as a *winding number* rather than by eye, because that is the
+    /// quantity `Fill::NonZero` actually reads: outside the ring 0, in the ring
+    /// 1, in the counter 0.
+    #[test]
+    fn a_counter_stays_empty_when_the_contours_are_welded_into_one_loop() {
+        let mut path = rustim_math::BezPath::new();
+        // Outer, counter-clockwise.
+        path.move_to(Point::new(-2.0, -2.0));
+        path.line_to(Point::new(2.0, -2.0));
+        path.line_to(Point::new(2.0, 2.0));
+        path.line_to(Point::new(-2.0, 2.0));
+        path.close_path();
+        // Inner, wound the other way, as a font's counter is.
+        path.move_to(Point::new(-1.0, -1.0));
+        path.line_to(Point::new(-1.0, 1.0));
+        path.line_to(Point::new(1.0, 1.0));
+        path.line_to(Point::new(1.0, -1.0));
+        path.close_path();
+
+        let pts = points_from_path(&path);
+        assert!(
+            bezier::anchors(&pts).is_some(),
+            "the welded array is still a whole number of curves",
+        );
+        assert_eq!(
+            pts[pts.len() - 1],
+            pts[0],
+            "the loop returns to the hub, so the array's implicit closing edge is a point",
+        );
+
+        let poly = flatten(&pts);
+        assert_eq!(winding(&poly, Point::new(3.0, 0.0)), 0, "outside the ring");
+        assert_eq!(winding(&poly, Point::new(1.5, 0.0)), 1, "on the ring");
+        assert_eq!(winding(&poly, Point::new(0.0, 0.0)), 0, "in the counter");
+        // The slit runs from the hub to the second contour's start; a point on
+        // either side of it must not be affected by the doubled traversal.
+        assert_eq!(winding(&poly, Point::new(-1.5, -1.5)), 1, "beside the slit");
+    }
+
+    /// Sample a control-point array into a polygon, densely enough that the
+    /// winding test below is about the topology and not the flattening.
+    fn flatten(points: &[Point]) -> Vec<Point> {
+        const STEPS: usize = 32;
+        let mut poly = Vec::with_capacity(points.len() / 4 * STEPS);
+        // `as_chunks` rather than `chunks_exact`: the trailing remainder is
+        // empty by construction (the array is a whole number of curves) and the
+        // fixed-size array is destructured directly.
+        for &[p0, c1, c2, p3] in points.as_chunks::<4>().0 {
+            for i in 0..STEPS {
+                let t = i as f64 / STEPS as f64;
+                let u = 1.0 - t;
+                let b = p0.to_vec2() * (u * u * u)
+                    + c1.to_vec2() * (3.0 * u * u * t)
+                    + c2.to_vec2() * (3.0 * u * t * t)
+                    + p3.to_vec2() * (t * t * t);
+                poly.push(Point::new(b.x, b.y));
+            }
+        }
+        poly
+    }
+
+    /// The standard crossing count, which is exactly what a nonzero-fill
+    /// rasteriser computes.
+    fn winding(poly: &[Point], p: Point) -> i32 {
+        let mut w = 0;
+        for i in 0..poly.len() {
+            let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+            let side = (b - a).cross(p - a);
+            if a.y <= p.y {
+                if b.y > p.y && side > 0.0 {
+                    w += 1;
+                }
+            } else if b.y <= p.y && side < 0.0 {
+                w -= 1;
+            }
+        }
+        w
     }
 }

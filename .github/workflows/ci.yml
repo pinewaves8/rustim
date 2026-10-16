@@ -80,6 +80,72 @@ jobs:
             exit 1
           fi
 
+  # Typst, for formulas, arrives carrying a whole second shaping stack: a frozen
+  # `rustybuzz` / `ttf-parser` pair and its own font book. That is acceptable
+  # only because it is confined to `rustim-text`, which is deliberately *not* one
+  # of the six kernel crates — if it spread, the frozen parser and a second
+  # shaping engine would end up in the wasm build and in the rasteriser.
+  #
+  # A `cargo tree` guard rather than a build one, for the same reason as the
+  # accesskit pair above: Typst compiles to wasm32 quite happily, so nothing
+  # about the kernel build would fail if it leaked inward.
+  typst-subtree:
+    name: Typst stays inside rustim-text
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The six wasm kernel crates, each of which must reach Typst never.
+      - name: no Typst crate reaches the semantic kernel
+        run: |
+          failed=0
+          for p in rustim-math rustim-color rustim-mobject \
+                   rustim-anim rustim-scene rustim-render; do
+            if cargo tree -p "$p" -e normal --prefix none | grep -qE '^(typst(-| )|rustybuzz |ttf-parser )'; then
+              echo "::error::$p depends on Typst or on Typst's frozen shaping stack"
+              cargo tree -p "$p" -e normal --prefix none | grep -E '^(typst(-| )|rustybuzz |ttf-parser )'
+              failed=1
+            fi
+          done
+          # ...and the check must not be vacuous: if `rustim-text` stopped
+          # depending on Typst, every loop above would pass by finding nothing.
+          if ! cargo tree -p rustim-text -e normal --prefix none | grep -q '^typst v0.15'; then
+            echo "::error::rustim-text no longer depends on Typst; the check above proves nothing"
+            exit 1
+          fi
+          exit $failed
+
+      - name: the renderer never shapes
+        run: |
+          if cargo tree -p rustim-render -e normal --prefix none | grep -q rustim-text; then
+            echo "::error::rustim-render depends on rustim-text; only kurbo geometry may cross"
+            exit 1
+          fi
+          if ! cargo tree -p rustim-text -e normal --prefix none | grep -q '^rustybuzz '; then
+            echo "::error::Typst's shaping stack left rustim-text; the check above is vacuous"
+            exit 1
+          fi
+
+      # `skrifa` reads glyph outlines and is pinned to one version used twice:
+      # by `parley`/`glifo` (shaping, in the renderer) and by `rustim-text`
+      # (formulas). Exactly two versions must be in the whole application tree,
+      # and the older one must stay where it came from — Typst's own image
+      # subtree (`hayro-interpret`), which is harmless but *looks* like a
+      # mistake, which is why this asserts the pair by name.
+      - name: skrifa is one version, plus Typst's own
+        run: |
+          got=$(cargo tree -p rustim-app -e normal --prefix none | grep -oE '^skrifa v[0-9.]+' | sort -u)
+          want=$'skrifa v0.42.1\nskrifa v0.44.0'
+          if [ "$got" != "$want" ]; then
+            echo "::error::the skrifa versions in the tree changed"
+            echo "expected:"; echo "$want"
+            echo "got:";      echo "$got"
+            echo "if Typst moved off 0.42.1, update the note in rustim-text/Cargo.toml and CLAUDE.md"
+            exit 1
+          fi
+
   # Renders every reference scene through the real binary and compares it to a
   # checked-in baseline, pixel by pixel.
   #

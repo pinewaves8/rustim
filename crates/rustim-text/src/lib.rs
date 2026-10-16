@@ -31,13 +31,26 @@
 //!
 //! ## What is here, and what is not
 //!
-//! Shaping, line breaking and the missing-glyph report are here. Formulas are
-//! not: they need Typst, and P1 step 5 is where that lands. The module-level
-//! notes on what that requires are in `formula.rs` when it exists — until then,
-//! the two settled decisions are that formulas go through Typst rather than
-//! LaTeX (no TeX installation to shell out to, and a subprocess is not available
-//! in a browser) and that per-glyph *outlines* are the output, never a
-//! rasterised bitmap, because per-symbol addressability is the whole point.
+//! Two things, and they share only the font directory.
+//!
+//! **Shaping**, line breaking and the missing-glyph report. Everything it
+//! produces is *indices* — which glyph, from which face, at which offset — and
+//! the outlines they name are loaded downstream, by the backend's glyph cache.
+//!
+//! **Formulas**, in [`formula`]: a `$…$` fragment goes through Typst and comes
+//! back as a mobject tree with one child per glyph. That is the one place in
+//! this crate that touches a rasteriser's input rather than a shaper's output,
+//! and it is deliberately the opposite trade from the line above: the whole
+//! reason formulas do not go through `typst-render` is that per-glyph *outlines*
+//! — not a rasterised page — are what per-symbol addressability needs. LaTeX is
+//! out for the reason it always was: there is no TeX installation to shell out
+//! to, and a subprocess is not available in a browser.
+//!
+//! Note what is *not* shared between them: Typst brings its own shaping, its own
+//! font book and its own frozen `ttf-parser`. That subtree lives inside
+//! [`formula`], and neither `parley` nor `rustim-render` can see it.
+
+pub mod formula;
 
 use std::io;
 use std::path::{Path, PathBuf};

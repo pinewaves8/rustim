@@ -54,7 +54,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_rustim-app");
 /// registry without a golden fails the suite rather than quietly going
 /// untested, and a scene removed from it fails too, rather than leaving a stale
 /// baseline behind.
-const SCENES: [&str; 4] = ["pythagorean", "primitives", "composite", "text"];
+const SCENES: [&str; 5] = ["pythagorean", "primitives", "composite", "text", "formula"];
 
 fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
@@ -173,6 +173,23 @@ fn composite_matches_its_baseline() {
 #[test]
 fn text_matches_its_baseline() {
     check("text");
+}
+
+/// The formula scene is the one whose geometry comes from a *third-party*
+/// typesetting engine rather than from this repository.
+///
+/// That is what makes it worth a baseline rather than a unit test. The glyph
+/// paths themselves are checked in `rustim-text` — orientation, size, the shape
+/// of the point array — but four things can only be seen in an image: that a
+/// fraction's rule (a *stroke* in Typst's frame, expanded here into a filled
+/// quad) is drawn at all, that it sits between the numerals, that a letter with
+/// a counter keeps its hole rather than filling in solid, and that a Chinese
+/// character is typeset from the bundled face rather than from the font Typst
+/// would have picked. Each of those has been wrong during this step, and each
+/// was invisible to every test that does not rasterise.
+#[test]
+fn formula_matches_its_baseline() {
+    check("formula");
 }
 
 /// The scene list here and the scene registry in the binary must not drift.

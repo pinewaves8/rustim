@@ -9,6 +9,11 @@ license.workspace = true
 [dependencies]
 rustim-math.workspace = true
 rustim-color.workspace = true
+# A formula compiles to a mobject tree, so building one means naming `Mobject` and
+# `NodeKind::Formula`. The edge is safe in the direction that matters: `rustim-mobject`
+# depends on neither this crate nor anything above it, so there is no cycle, and only
+# `kurbo` geometry crosses — no Typst type reaches the semantic kernel.
+rustim-mobject.workspace = true
 parley.workspace = true
 # Needed for exactly one thing: `lstm`, the code path for ICU4X's dictionary and
 # LSTM segmenters. parley pulls icu_segmenter with `default-features = false`, so
@@ -21,11 +26,26 @@ parley.workspace = true
 # calls into it directly.
 icu_segmenter = { version = "2.1.2", default-features = false, features = ["lstm"] }
 
+# The formula compiler. `typst-layout` is named for `PagedDocument` alone — the
+# facade does not re-export it — and `typst-assets` for the New Computer Modern
+# Math face that typesetting a formula requires.
+typst.workspace = true
+typst-layout.workspace = true
+typst-assets.workspace = true
+
+# Glyph outlines. No longer dev-only: `formula` reads each glyph's outline out of
+# the face's own bytes, which is the whole reason this route was chosen over
+# `typst-render`'s raster. It is the same 0.44.0 that `parley`/`glifo` already
+# pin, so *that* version is one copy in the tree rather than two.
+#
+# `cargo tree -p rustim-text -i skrifa@0.44.0` is the check, with the version
+# named on purpose: the lock has a second `skrifa 0.42.1` inside Typst's own
+# subtree (`hayro-interpret` <- `hayro` <- `typst-svg` <- `typst-html`), which is
+# harmless — it parses Typst's images, and this crate reads the same font bytes
+# with its own copy — but a bare `cargo tree -i skrifa` reports two versions and
+# reads like a mistake.
+skrifa = "0.44.0"
+
 [dev-dependencies]
 # Reads the Manim measurement in `tests/fixtures/`; see `tests/manim_text_scale.rs`.
 serde_json.workspace = true
-# Reads the cap height and units-per-em out of the bundled face, which is the
-# other half of that measurement. Deliberately dev-only for now: it is the same
-# 0.44.0 that `glifo` already pins, so it adds no second copy to the tree, and
-# step 5 (Typst outlines) is where this crate starts needing it for real.
-skrifa = "0.44.0"

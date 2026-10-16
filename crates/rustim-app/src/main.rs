@@ -602,6 +602,142 @@ impl Scene for TextScene {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The formula scene: Typst, all the way to per-glyph paths
+// ---------------------------------------------------------------------------
+
+/// Formulas, typeset by Typst and drawn as one mobject per glyph.
+///
+/// Nothing here overrides `build_draw_list`: a formula's glyphs are ordinary
+/// filled point arrays, so the *default* tree walk draws them, and that is the
+/// whole point of the representation. `TextScene` above needs an override
+/// because a shaped run is not points; this scene needs none.
+///
+/// The five lines are chosen to disagree with each other, and each one covers a
+/// path that the others do not:
+///
+/// - a plain Pythagorean identity, which is the scene's spine and the one a bare
+///   `$x^2 + y^2 = c^2$` is asked for;
+/// - a fraction and a radical, which are `FrameItem::Shape` items — *stroked*
+///   lines, expanded into filled quads — so without them the golden image would
+///   never touch that code and a missing fraction bar would ship;
+/// - a subscripted sum, which is the only line whose glyphs sit at two different
+///   baselines inside one group transform, so it is what catches a composition
+///   error that a body without scripts cannot show;
+/// - Chinese inside math, which selects the bundled face: Typst has no CJK of
+///   its own, so this line fails visibly if `BUNDLED_DIR` is not in the world;
+/// - `d` and `o` in a word, which are the letters with counters — the case that
+///   proves the two-contour welding in `shapes::points_from_path` keeps the hole
+///   open rather than filling it in.
+struct FormulaScene {
+    /// The ids of the formula roots, in draw order.
+    nodes: Vec<NodeId>,
+}
+
+/// One line of [`FormulaScene`]. The body is **Typst math, not LaTeX**.
+struct FormulaLine {
+    body: &'static str,
+    label: &'static str,
+    color: rustim_color::Srgb,
+    at: (f64, f64),
+    /// A uniform scale on the root's deferred transform, so one image shows the
+    /// size following a transform rather than a `font_size`.
+    scale: f64,
+}
+
+const FORMULA_LINES: [FormulaLine; 5] = [
+    FormulaLine {
+        body: "a^2 + b^2 = c^2",
+        label: "勾股定理",
+        color: rustim_color::FG,
+        at: (0.0, 2.4),
+        scale: 1.0,
+    },
+    FormulaLine {
+        body: "frac(-b + sqrt(b^2 - 4a c), 2a)",
+        label: "求根公式",
+        color: rustim_color::BLUE,
+        at: (0.0, 0.7),
+        scale: 0.85,
+    },
+    FormulaLine {
+        body: "sum_(i=1)^n i = frac(n(n+1), 2)",
+        label: "等差数列求和",
+        color: rustim_color::YELLOW,
+        at: (0.0, -1.0),
+        scale: 0.85,
+    },
+    FormulaLine {
+        body: "d o g = \"狗\"",
+        label: "中英混排",
+        color: rustim_color::RED,
+        at: (0.0, -2.4),
+        scale: 0.9,
+    },
+    FormulaLine {
+        body: "e^(i pi) + 1 = 0",
+        label: "欧拉恒等式",
+        color: rustim_color::FG,
+        at: (3.9, -3.0),
+        scale: 0.5,
+    },
+];
+
+impl FormulaScene {
+    fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+
+    /// Compile every line and insert it.
+    ///
+    /// Built once, in `construct`, because a `FormulaCompiler` parses the whole
+    /// embedded Typst font set plus the bundled CJK face — the expensive half —
+    /// and then reuses it. A failure is reported and the line skipped, the same
+    /// rule `TextScene` follows for a missing font: this path *is* reachable, a
+    /// model can write a formula Typst will not parse, and a scene that panicked
+    /// on one would take the window down with it.
+    fn build(&mut self, ctx: &mut SceneContext) {
+        let mut compiler = match rustim_text::formula::FormulaCompiler::new() {
+            Ok(compiler) => compiler,
+            Err(e) => {
+                eprintln!("formula: {e}");
+                return;
+            }
+        };
+        for line in &FORMULA_LINES {
+            let formula = match compiler.compile(line.body) {
+                Ok(formula) => formula,
+                Err(e) => {
+                    eprintln!("formula {:?}: {e}", line.body);
+                    continue;
+                }
+            };
+            let ids = formula.insert(&mut ctx.tree);
+            // The glyphs and the rules hang off the root, so colour them where
+            // they are and move the root — one transform for the whole formula,
+            // which is what the deferred-transform story is for.
+            for id in ids.glyphs.iter().chain(ids.rules.iter()).copied() {
+                if let Some(m) = ctx.tree.get_mut(id) {
+                    m.style = filled(line.color, 1.0);
+                }
+            }
+            if let Some(root) = ctx.tree.get_mut(ids.root) {
+                root.label = Some(line.label.to_owned());
+                // Scale first, then place: `*` applies its right operand first, so
+                // the other order would scale the position along with the glyphs.
+                root.transform = Affine2::translate(line.at) * Affine2::scale(line.scale);
+            }
+            self.nodes.push(ids.root);
+        }
+    }
+}
+
+impl Scene for FormulaScene {
+    fn construct(&mut self, ctx: &mut SceneContext) {
+        self.build(ctx);
+    }
+}
+
 /// The `--scene` value used when the flag is absent.
 const DEFAULT_SCENE: &str = "pythagorean";
 
@@ -617,13 +753,20 @@ fn scene_by_name(name: &str) -> Option<Box<dyn Scene>> {
         "primitives" => Some(Box::new(PrimitivesScene)),
         "composite" => Some(Box::new(CompositeScene)),
         "text" => Some(Box::new(TextScene::new())),
+        "formula" => Some(Box::new(FormulaScene::new())),
         _ => None,
     }
 }
 
 /// The scene names `--scene` accepts, for `--help` and for the error path.
+///
+/// **This array and the match above are a matched pair** — see `CLAUDE.md`. The
+/// golden suite reads `--help` to decide which scenes it owes a baseline, so a
+/// scene in the match but not here is *not* offered by `--help`, and the suite's
+/// completeness check cannot see it: it compiles, it runs, and it silently skips
+/// its baseline forever.
 fn scene_names() -> String {
-    ["pythagorean", "primitives", "composite", "text"].join(", ")
+    ["pythagorean", "primitives", "composite", "text", "formula"].join(", ")
 }
 
 // ---------------------------------------------------------------------------

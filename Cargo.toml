@@ -59,6 +59,22 @@ parley = { version = "0.11.1", default-features = false, features = ["std", "com
 accesskit = "0.25.1"
 accesskit_winit = "0.34.1"
 
+# Formulas (P1 step 5). Typst compiles a `$...$` fragment to a laid-out frame; the
+# glyph outlines are then read out by hand — never through `typst-render`, which
+# rasterises and throws the vectors away. The crate split is the non-obvious part:
+# `PagedDocument` lives in `typst-layout` and the `typst` facade does *not* re-export
+# it, so both are named. `typst-library` arrives transitively through the facade's
+# `pub use typst_library::*`, which is also where `World`, `Frame`, `FrameItem`,
+# `TextItem` and `Font` come from.
+#
+# `typst-assets`' `fonts` feature is not optional: math is typeset in New Computer
+# Modern Math, so without it every formula fails to compile. These crates may only
+# ever be linked by `rustim-text`, which is deliberately *not* one of the six wasm
+# kernel crates — CI's wasm build is what enforces that.
+typst = "0.15.1"
+typst-layout = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
+
 # Test-only in the six kernel crates: used there to read the Manim fixtures
 # (`crates/rustim-math/tests/fixtures/`) and to round-trip the command layer
 # through JSON, and deliberately not a real dependency of any of them, so it

@@ -33,10 +33,10 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-16: **205 unit tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-16: **222 unit tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
-`rustim-app` and **not** from `rustim-scene`), all four golden scenes match their checked-in
+`rustim-app` and **not** from `rustim-scene`), all five golden scenes match their checked-in
 baselines, and `rustim-app --png out.png` reproduces the Manim reference frame with an **identical
 content bounding box** (`343,90,936,629`); only 0.012% of pixels differ by more than 2/255, and none
 by more than 8. See `方案建议.md` §5.2. The count is not decoration — every one of those claims is
@@ -91,6 +91,7 @@ cargo run -p rustim-app -- --inspect       # headless: the accessibility tree as
 cargo run -p rustim-app -- --frames 300    # run 300 frames then exit
 cargo run -p rustim-app -- --scene primitives  # ...a named scene; `--help` lists them
 cargo run -p rustim-app -- --scene text --png out.png   # CJK + Latin glyph runs
+cargo run -p rustim-app -- --scene formula --png out.png  # Typst → per-glyph outlines
 cargo test --workspace               # unit tests across all crates
 cargo test -p rustim-math ease_in_out       # a single test by name
 cargo test -p rustim-math --test manim_parity   # replay the checked-in Manim fixtures
@@ -198,13 +199,22 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   as the scene happens to need" — otherwise a duration change would silently rebless a golden as a
   capture of a half-faded frame.
 
-The four scenes are there to disagree with each other: `pythagorean` is the one with a Manim
+The five scenes are there to disagree with each other: `pythagorean` is the one with a Manim
 reference, `composite` covers deferred transforms, alpha and draw order through the mobject tree
 walk, `primitives` pushes strokes and clips as raw `DrawOp`s because nothing in the mobject model
 expresses either yet — without it the baselines would never touch stroke expansion or clip
-rasterisation, the two most intricate things `vello_cpu` does — and `text` is the only one whose
-pixels come from a file in this repository rather than from code, so losing `assets/fonts/` fails
-here rather than silently producing a blank frame for a user.
+rasterisation, the two most intricate things `vello_cpu` does — `text` is the only one whose pixels
+come from a file in this repository rather than from code, so losing `assets/fonts/` fails here
+rather than silently producing a blank frame for a user, and `formula` is the only one whose
+geometry comes from a *third-party* typesetting engine, which is what makes the image the only place
+that can see a dropped fraction rule or a filled-in counter (see "P1 step 5").
+
+**Adding a scene means editing two places in `crates/rustim-app/src/main.rs`**, and they are a
+matched pair: the `scene_by_name` match (~:750) and the literal array in `scene_names()` (~:768) that
+`--help` prints. The baseline guarantee above reads `--help`, so a scene wired into the match but not
+into that array is *not* offered by `--help`, and the suite's check cannot see it — it compiles, runs,
+and silently skips its baseline. Register it in both, then bootstrap the baseline for the arch you
+are on; the other two platforms are bootstrapped from the CI artifact (above).
 
 ## Architecture
 
@@ -222,11 +232,11 @@ last property.
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree`, stable `NodeId`, shape builders, `critical_point`, `world_anchors` | Real |
 | `rustim-anim` | `Animation` trait, `AnimationScheduler`, `FadeIn`, `MoveTo` | Real |
-| `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports | Shaping real; **Typst formulas not started** — see its module docs for what blocks them |
+| `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait, `DrawList`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, and the `compare` module that scores two frames | Real; ffmpeg pipe not written |
-| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter and the shaper↔rasteriser bridge (both as a **lib** target), four `--scene` entries, the golden suite | Real |
+| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter and the shaper↔rasteriser bridge (both as a **lib** target), five `--scene` entries, the golden suite | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead.
@@ -505,6 +515,57 @@ fields it actually reads — with `KeyPress::from_event` as the two-line adapter
 the keymap in CI. `ModifiersState` lives in `winit::keyboard`, not `winit::event`, and arrives in
 its own event, so Shift+Tab has to be tracked across events or it looks like Tab.
 
+**`debug_assert!(expr)` does not evaluate `expr` in a release build, so a side effect inside one
+happens in debug and *only* there.** `Formula::insert` reparents each freshly inserted glyph with
+`tree.reparent(id, root)`. Written as `debug_assert!(tree.reparent(id, root))` — the spelling that
+reads best — release builds never reparent, every glyph stays in the tree's root bucket,
+`parent_transform` returns IDENTITY for it, and the whole formula ignores its own transform and
+renders at the origin on top of every other formula. It looks like a layout bug, not a parenting
+one. Call the function, keep the result in a `let`, assert *that*. This has now cost that function
+twice; the comment there says so. The **golden suite cannot catch it**: `CARGO_BIN_EXE_rustim-app`
+is the *debug* binary, so a release-only defect is invisible to both the unit tests and the
+baselines. Run `cargo test --release` when touching anything with a `debug_assert!` in it.
+
+**Typst's frame is y-down; its text runs are y-up, and the two are composed, not cancelled.**
+`Frame::items()` gives `(Point, FrameItem)` in frame space (y down, `Abs` = points), while a text
+run's internal cursor is y-up. Following `typst-render`'s own `render_text`, the outline is
+`state · T(x_offset, −y_offset) · S(s, −s)`: the item's `Point` is a frame-space *translation*, and
+the run's own offsets carry the flip. The consequence that matters is that the glyph outline arrives
+y-up from `skrifa` (at `Size::unscaled()`, in font units) and the *same* sign flip serves both it
+and the run — so a formula is centred and flipped once, by the affine `FormulaCompiler` builds, and
+never per-glyph. Get the direction wrong and every glyph is mirrored about its own baseline
+(baselines correct, letters upside down), which is the identical failure `glifo`'s composite has and
+which reads as a font bug rather than a coordinate one.
+
+**A flat Manim point array cannot express a subpath break, so a glyph's counter has to be welded
+back in.** `bezier_path_from_points` (`rustim-mobject/src/tree.rs:269`) emits exactly one `move_to`
+and only `curve_to` thereafter; a font glyph with a hole (`o`, `d`, `g`, `=`, `%`, `8`) is *two*
+contours, and a counter filled solid is the visible result. `shapes::points_from_path` therefore
+walks each `MoveTo` after the first out to a **hub** point on the outer contour, traverses a doubled
+slit to the new subpath's start, and returns to the hub at the end (the "keyhole" retrace). Every
+bridge is traversed once in each direction, so its winding contribution is zero and
+`Fill::NonZero` leaves the counter empty. The test that guards it asserts a *winding number* at four
+points — outside, on the ring, inside the counter, beside the slit — because winding is the quantity
+the fill rule actually reads; "it looks right" cannot distinguish a welded glyph from a filled one.
+
+**A formula's rules are strokes, and the draw walk only emits fills.** A fraction's bar and a
+radical's overline are `FrameItem::Shape` carrying `Geometry::Line(..)`
+(`typst-layout/src/math/fraction.rs:74`, `radical.rs:137`) — `Shape` stores geometry *plus* an
+optional fill and an optional stroke, and these have no fill. `SceneContext::build_draw_list` emits
+paths, so a stroke-only shape is dropped and the formula reads as a bug. `formula::filled_shape`
+expands one into a filled quad of the stroke's own thickness (a rect for `Geometry::Rect`, `None`
+reported into `skipped_shapes` for anything needing a real stroker). `FrameItem::Shape` is the one
+thing this step needed that the tutorial's sketch does not mention at all.
+
+**`Glyph::span` is the element's span, not the glyph's.** Every glyph produced by one math element
+shares that element's `Span`, so it identifies a symbol only when one element produced one glyph.
+`"abc"` in math gives all three glyphs the whole literal's range, and labelling them from it makes
+three children with the same name. The usable rule is a comparison: use the source slice only when
+its **character count equals the shaped character count**, and fall back to the shaped text
+otherwise. (Related: math typesets a Latin letter as the *mathematical italic* codepoint — `x`
+becomes U+1D465 — so a label taken from the shaped glyph is not the character the author typed,
+which is what makes the source slice worth preferring at all.)
+
 ## Where the workspace diverges from the tutorial
 
 The tutorial puts everything in a flat `src/` (`main.rs`, `mobject.rs`, `animation.rs`, `scene.rs`,
@@ -522,9 +583,12 @@ Issues the tutorial's sketches leave open, and where each stands now:
 - **Hardcoded viewport** — *resolved.* The app's `Resized` handler resizes the renderer and the
   viewport together, so the background and the projection follow the window.
 - **`Formula` is a stub, and `typst::eval::World::default()` does not exist** (`World` is a trait you
-  implement, and you must supply `Font`/`FontBook`) — *still open*; see `rustim-text`. Plain text is
-  no longer part of this: `FontProvider` is the injectable font source Typst's `World` will need, and
-  it already proves the "no system font paths" contract the tutorial's sketch ignores.
+  implement, and you must supply `Font`/`FontBook`) — *resolved*: the sketch is aimed at typst
+  0.11/0.2 and every call in it is stale, but the route is now implemented in
+  `rustim-text::formula` and rendered by the `formula` scene (see "P1 step 5"). One correction to
+  the sketch's premise: `FontProvider` turned out *not* to be the injectable source Typst's `World`
+  needs — it holds a fontique collection, not bytes, so the `World` is fed from `typst-assets` plus
+  `BUNDLED_DIR` directly. The "no system font paths" contract it proves is honoured either way.
 - **Per-frame allocation** — *resolved in the frame loop*: the `DrawList` is reused via
   `clear(w, h)`, which keeps its capacity.
 - **Pinned dependency versions predate the APIs the sketches use** — verify every `winit` / `vello` /
@@ -555,68 +619,117 @@ Phase 0 (risk elimination) is done **and the skeleton it produced is verified gr
 the three probe crates, the window, PNG export, the workspace/CI skeleton, and the pixel-level Manim
 comparison.
 
-**P1 is in progress, and one step of it is left.** The order was not arbitrary: every step moves
-`Mobject`, `DrawOp`, the command protocol or the renderer backend, and moving those before the
-regression nets exist produces rework that is invisible until much later. Steps 1–4 shipped those
-nets first for exactly that reason, so step 5 inherits a workspace where a break shows up as a
-failure rather than as a wrong picture six weeks later.
+**P1 is complete.** The order was not arbitrary: every step moves `Mobject`, `DrawOp`, the command
+protocol or the renderer backend, and moving those before the regression nets exist produces rework
+that is invisible until much later. Steps 1–4 shipped those nets first for exactly that reason, so
+step 5 inherited a workspace where a break shows up as a failure rather than as a wrong picture six
+weeks later.
 
 | | P1 step | State |
 |---|---|---|
 | 1 | Numerical parity against Manim (426 cases at 1e-9) | done — see "Commands" |
-| 2 | Golden-image suite: four scenes, per-platform baselines, CI job | done — see "Golden images" |
+| 2 | Golden-image suite: five scenes, per-platform baselines, CI job | done — see "Golden images" |
 | 3 | Accessibility: structure + full keyboard + throttled announcements | done — see "Accessibility" |
 | 4 | Text: `parley` end to end (string → glyphs → screen), bundled CJK, measured font size | done — see "Text" |
-| 5 | Formulas: Typst → per-glyph outlines via `skrifa::OutlinePen`, never `typst-render` | **next** |
+| 5 | Formulas: Typst → per-glyph outlines via `skrifa::OutlinePen`, never `typst-render` | done — see "P1 step 5", `rustim-text::formula`, the `formula` scene |
 
-P1's deferred edges, deliberately: MathML flattening waits for Typst (step 5), self-voicing TTS for
-P5, and reading the system's "reduce motion" preference for a later task — only the explicit
-`ReducedMotion` switch and the pipe it feeds ship now. The CPU cost is **fill-area bound, not
+P1's deferred edges, deliberately: MathML flattening (a formula is now a glyph tree with per-symbol
+spans, so this is unblocked but unwritten), self-voicing TTS for
+P5, and **reduced motion is unshipped in both forms** — nothing in the workspace reads a platform
+"reduce motion" preference, and there is no explicit switch either (no `--reduced-motion` flag; the
+binary's only flags are `--frames`/`--png`/`--inspect`/`--scene`). Do not go looking for a
+`ReducedMotion` type: the sole motion-related accessibility control that exists today is
+`rustim-app::announce`'s throttle. The CPU cost is **fill-area bound, not
 shape-count bound** (4 large filled polygons at 720p already cost p50 2.25 ms of a 16.7 ms budget), so
 damage-rectangle invalidation is likely worth more than any micro-optimisation.
 
 The accessibility layer's own deferred edges, so they are not rediscovered as gaps: the
 macOS/Windows backends are **compile-checked only** (this machine has no accessible bus, so nothing
 beyond Linux compiles-and-hopes has been observed), a full-snapshot push per frame is fine at this
-scale but is not the shape a 500-node scene wants, and `--reduced-motion` is the explicit switch
-above rather than the system preference.
+scale but is not the shape a 500-node scene wants, and reduced motion is unshipped entirely (see
+above), so `MoveTo` animates at full speed for every user whatever their platform preference is set
+to.
 
-### P1 step 5 is where the next session starts
+### P1 step 5: formulas — Typst in, per-glyph outlines out
 
-**The first move writes no product code.** `crates/rustim-text/src/lib.rs` promises a `formula.rs`
-that does not exist yet, and the tutorial's `Formula` sketch is aimed at typst 0.11/0.2 — every call
-in it is stale, and `typst::eval::World::default()` does not exist (that `World` is a trait you
-implement, and you must hand it a `Font`/`FontBook`). So the first task is to fetch `typst 0.15.1`
-and read its manifest, to establish the two things the design rests on:
+**Landed.** `crates/rustim-text/src/formula.rs` is the *authority* for this step (read it before
+touching anything here; this section is the summary). A `$…$` fragment compiles to a
+`NodeKind::Formula` mobject holding **one child mobject per glyph**, each child an ordinary filled
+path in Manim's control-point layout — so a symbol is a real object with a `NodeId`, not a texture.
+`FormulaCompiler` is built once (it reads and parses the font set, which is the expensive part) and
+`compile(&str)` returns a `Formula`; `Formula::insert(&mut SceneTree)` returns a `FormulaNodes` of
+ids. A bad fragment is `FormulaError`, never a panic.
 
-- **the real crate split** — the `typst` facade against `typst-library` / `typst-layout` / `typst-kit`
-  — i.e. which crate actually owns `PagedDocument`, `Frame`, `FrameItem` and `World`;
-- **the exact `World` signature in 0.15.1**, since `FontProvider` is meant to be what backs it.
+The research move that preceded it settled two things, and **both came back different from the
+tutorial's sketch** (which is aimed at typst 0.11/0.2 — every call in it is stale, and
+`typst::eval::World::default()` does not exist: `World` is a trait you implement, handing it a
+`Font`/`FontBook`):
 
-Only then write the pipeline: compile a `$...$` fragment → `PagedDocument` → walk `Frame::items()` →
-`FrameItem::Text(TextItem)` → each glyph's outline through `skrifa::OutlinePen` → `kurbo::BezPath` →
-a `FormulaMobject` of per-glyph mobjects, cached by `(font, glyph_id, size)`.
+- **The crate split, and `typst::PagedDocument` does not exist.** `World`, `Library`, `Frame`,
+  `FrameItem`, `TextItem`, `Glyph`, `Font`, `FontInstance` and `Output` are all in **`typst-library`**;
+  **`PagedDocument` is in `typst-layout`**. The facade's entire export list is
+  `pub use typst_library::*` plus `syntax`/`utils` — it re-exports neither `typst-layout` nor
+  `typst-html`. So `typst-layout` is a *direct* dependency and the compile call names it:
+  `typst::compile::<typst_layout::PagedDocument>(&world)`. The facade cannot be dropped either:
+  `Library::default()` is an `impl` in the facade and it needs the facade's **private** `ROUTINES`
+  table. Dependencies run one way — `typst-library` does not depend on `typst-layout`.
+- **The exact `World` signature in 0.15.1** — **seven methods, all required, no defaults**:
+  `library`, `book`, `main`, `source(FileId)`, `file(FileId)`, `font(usize)`, `today(Option<Duration>)`;
+  `#[comemo::track]`-annotated, with blanket impls for `Box<W>`/`Arc<W>`/`&W`. `book`/`font` are
+  exactly what `FontProvider` already answers — the mapping the design assumed, confirmed. The
+  `World` is composed inside `formula.rs` from **typst-assets** the bundled CJK read straight from
+  `BUNDLED_DIR`; `FontProvider` is deliberately not reused, because it holds a fontique collection
+  rather than bytes.
 
-Four things already decided, so they are not rediscovered as open questions:
+Two fields are what make the route work, and neither was in the sketch:
 
-- **Never `typst-render`** (`方案建议.md` §8 item 8): it rasterises through tiny-skia and throws the
-  per-glyph vectors away, and per-symbol addressability is the entire point of this route.
-- **Fonts come from `typst-assets = { version = "0.15.1", features = ["fonts"] }`** (New Computer
-  Modern and friends) — not a hand-placed file, and not a system path, which is the same contract
-  `FontProvider` already honours. It is also where the `1.92` MSRV in the root `Cargo.toml` comes
-  from.
-- **`typst-layout` drags in frozen `rustybuzz ^0.20` / `ttf-parser ^0.25`.** Keep that subtree inside
-  `formula.rs` so the eventual upgrade (typst#8172, expected in 0.16) is a one-file change. This is
-  also where `skrifa` stops being a dev-dependency of `rustim-text` and becomes a real one; it is
-  already the only `0.44.0` in the tree, so naming it adds no second copy.
-- **No typst crate may reach the six wasm kernel crates.** `rustim-text` is deliberately *not* one of
-  them, so compilation stays there and only `kurbo` points cross into `rustim-mobject` — a formula is
-  a `NodeKind::Formula` mobject whose glyphs are ordinary mobjects, which is what keeps `rustim-render`
-  free of `rustim-text` and the kernel free of Typst.
+- **`Glyph::span: (Span, u16)`** gives every glyph its source location, so per-symbol addressability
+  is handed over by Typst rather than reconstructed. That is the property the whole route exists for.
+- **`Font::data() -> &Bytes`**, reached from `TextItem.font` through `FontInstance::font()`, gives the
+  raw bytes for `skrifa::FontRef::from_index` — so the frozen `rustybuzz`/`ttf-parser` subtree stays
+  inside Typst's own code while this crate keeps its `skrifa`.
 
-When it lands, the two commands that catch the failure modes above are
-`cargo tree -i ttf-parser` (`rustybuzz`'s subtree must stay inside `rustim-text`) and
-`cargo tree -i skrifa` (still exactly one `0.44.0`), on top of the usual wasm kernel build.
+Four decisions held, all confirmed by the implementation: **never `typst-render`** (it rasterises
+through tiny-skia and throws the per-glyph vectors away); **fonts from `typst-assets` plus
+`BUNDLED_DIR`**, never a system path (and `typst-assets` is where the `1.92` MSRV comes from);
+**`typst-layout`'s frozen `rustybuzz ^0.20` / `ttf-parser ^0.25` stays inside `formula.rs`**, so the
+eventual upgrade (typst#8172, expected in 0.16) is a one-file change; and **no Typst crate reaches
+the six wasm kernel crates** — only `kurbo` geometry crosses, into `rustim-mobject`. `typst-layout`
+also requires `kurbo = "0.13"`, which the workspace already pins, so the `BezPath` this route
+produces is the workspace's own type rather than a second copy.
+
+**What implementing it taught** — the four things that were not derivable from the sources, all
+covered by a test or an image (see "Hard-won facts" for the mechanism of each):
+
+1. **A multi-contour glyph cannot survive `points_from_path` unwelded.** `bezier_path_from_points`
+   emits exactly one `move_to` (`rustim-mobject/src/tree.rs:269`), so a flat `Vec<Point>` has no way
+   to start a second contour — and a glyph's counter (`o`, `d`, `=`, `%`) is a second contour. They
+   are welded through a hub with a doubled slit, so every bridge cancels to zero winding and the
+   counter stays open under `Fill::NonZero`.
+2. **A fraction's rule and a radical's overline are *strokes*, not fills**, and the draw walk emits
+   only fills. `FrameItem::Shape` with `Geometry::Line` is expanded into a filled quad by
+   `filled_shape` — a formula with no fraction bar reads as a bug, not as a missing feature.
+3. **`Glyph::span` is the *element's* span, shared by every glyph of a run.** So it names a glyph
+   only when one element produced one glyph; `"abc"` gives all three the whole literal, and the
+   guard is a shaped-character-count comparison.
+4. **Typst's frame is y-down and its text runs are y-up.** The item's `Point` is a frame-space
+   translation; the outline is composed as `state · T(x, −y) · S(s, −s)`. Getting this backwards
+   mirrors every glyph about its own baseline — the same trap the text section records, with the
+   same appearance.
+
+Deferred, deliberately, and reported rather than dropped: `Formula::skipped_shapes` counts the
+`FrameItem::Shape` cases that are neither a rule nor a rect (a `Geometry::Curve` needs a real
+stroker) and any `FrameItem::Image`; per-run colour is not carried over (every glyph takes the
+engine's colour), link annotations are ignored, and `GroupItem::clip` is not applied — math nests
+groups for layout but does not clip them. macOS and Windows `formula` baselines are bootstrapped
+from the CI artifact like the other four scenes'.
+
+The two commands that catch the failure modes above are
+`cargo tree -p rustim-text -i skrifa@0.44.0` and `cargo tree -i ttf-parser` — **and the version is
+named on purpose**: a bare `cargo tree -i skrifa` reports *two* versions, because the lock has a
+second, older `skrifa` inside Typst's own image subtree (`hayro-interpret`), which is harmless but
+reads like a mistake. Both, plus "no Typst crate reaches the kernel" and "`rustim-render` never
+depends on `rustim-text`", run as the `typst-subtree` CI job.
 
 - **P2** — more mobjects (lines, arrows, axes, function plots) and animations (`Transform`, `Rotate`,
   `Scale`, `FadeOut`); morph via `align_points`.
