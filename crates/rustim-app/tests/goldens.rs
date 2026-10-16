@@ -54,7 +54,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_rustim-app");
 /// registry without a golden fails the suite rather than quietly going
 /// untested, and a scene removed from it fails too, rather than leaving a stale
 /// baseline behind.
-const SCENES: [&str; 5] = ["pythagorean", "primitives", "composite", "text", "formula"];
+const SCENES: [&str; 6] = [
+    "pythagorean",
+    "primitives",
+    "composite",
+    "text",
+    "formula",
+    "transform",
+];
 
 fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
@@ -190,6 +197,22 @@ fn text_matches_its_baseline() {
 #[test]
 fn formula_matches_its_baseline() {
     check("formula");
+}
+
+/// The transform scene is the only one whose still is the *end* of an animation
+/// rather than a static arrangement.
+///
+/// It is here because that is the one thing no unit test can see. The morph's
+/// shape is pinned in `rustim-anim` against hand-computed midpoints; what an
+/// image adds is that the settled frame is a circle and a triangle and not the
+/// triangle and square it started from — i.e. that the alignment ran, that both
+/// padded and ragged paths rasterise, and that the style lerp arrived. A refused
+/// alignment no-ops and leaves the start shapes on screen, which looks like a
+/// plausible picture and is exactly the failure a test that never rasterises
+/// cannot catch.
+#[test]
+fn transform_matches_its_baseline() {
+    check("transform");
 }
 
 /// The scene list here and the scene registry in the binary must not drift.

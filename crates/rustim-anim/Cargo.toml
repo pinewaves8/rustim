@@ -9,3 +9,9 @@ license.workspace = true
 [dependencies]
 rustim-math.workspace = true
 rustim-mobject.workspace = true
+
+[dev-dependencies]
+# The palette, for the tests that check a morph's colours move. Only the tests
+# need distinct colours: `Transform` itself reaches `Srgb` through `Style` and
+# names no colour type, so this stays out of `[dependencies]`.
+rustim-color.workspace = true

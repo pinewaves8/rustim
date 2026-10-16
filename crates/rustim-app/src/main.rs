@@ -219,6 +219,167 @@ fn filled(color: rustim_color::Srgb, alpha: f64) -> Style {
 }
 
 // ---------------------------------------------------------------------------
+// The transform scene: the first morph
+// ---------------------------------------------------------------------------
+
+/// Place a shape so its own centre sits at `at`.
+///
+/// Shapes are built in their own coordinates — [`rustim_mobject::shapes::square`]
+/// and `circle` are centred, `right_triangle` has its right angle *at the origin*
+/// — so a scene that wants two of them side by side has to place them by
+/// measurement. `critical_point((0, 0))` is the bounding box centre of the
+/// materialised anchors, which is the local centre while the transform is still
+/// the identity.
+fn centred(mut m: Mobject, at: (f64, f64)) -> Mobject {
+    // A shape built from points always has anchors; the fallback keeps this a
+    // placement helper rather than one that can abort a scene.
+    let c = m.critical_point((0.0, 0.0)).unwrap_or(Point::new(0.0, 0.0));
+    m.transform = Affine2::translate((at.0 - c.x, at.1 - c.y));
+    m
+}
+
+/// What the two sources are once the morph has settled.
+///
+/// A `Transform` moves geometry, paint and opacity, and it deliberately says
+/// nothing about what the object *is* — it could not, since nothing in the engine
+/// knows that a triangle has become a circle. So the scene says it, once, when the
+/// morph ends, which is what any caller has to do. Without it the accessibility
+/// tree speaks from the stale kind: `--inspect` on this scene described the
+/// settled circle as "两条直角边长 3.2 和 3.2 的直角三角形，面积 5.12" and the
+/// settled triangle as a 2.6-square of area 6.76 — sizes measured honestly from
+/// the geometry, and both false. No pixel changes when the kind is wrong, which is
+/// exactly why `--inspect` is the tool that sees it.
+const SETTLED: [(&str, NodeKind); 2] = [
+    ("圆形", NodeKind::Circle),
+    ("直角三角形", NodeKind::RightTriangle),
+];
+
+/// Two morphs, one growing and one shrinking, so both alignment directions run.
+///
+/// The targets are **scene fields and not tree nodes**, which is the shape of
+/// Manim's `Transform`: the target is a donor that `begin` copies and that is
+/// never added to the scene (`animation/transform.py:201-203`). A plain
+/// `Transform` therefore leaves the *source* wearing the target's data — the
+/// settled frame shows two objects, not four — and the source also keeps its id,
+/// its `NodeKind` and its label, which is Manim's behaviour and not an oversight:
+/// the animation is about geometry, and the engine has no way to know that a
+/// triangle has become a circle. So the scene says what the sources have become,
+/// in [`SETTLED`], once the morph ends — which is what any caller has to do, and
+/// is the reason that const reads the way it does.
+///
+/// The pair is chosen so both directions of `align_points` run: on the left the
+/// 3-curve triangle is padded *up* to the circle's 4 curves, on the right it is
+/// the square's target that is ragged and gets padded. A scene with only one
+/// direction would leave the other half of the alignment port unexercised.
+struct TransformScene {
+    sources: Vec<NodeId>,
+    /// The donors, held so the scene owns them long enough to hand them over.
+    /// Nothing about rendering reads them back.
+    targets: Vec<Mobject>,
+    stage: usize,
+}
+
+impl TransformScene {
+    fn new() -> Self {
+        Self {
+            sources: Vec::new(),
+            targets: Vec::new(),
+            stage: 0,
+        }
+    }
+}
+
+impl Scene for TransformScene {
+    fn construct(&mut self, ctx: &mut SceneContext) {
+        // Left: 12 points / 3 curves morphing to 16 / 4. Blue to translucent
+        // yellow, so the settled still pins the *style* lerp arriving as well as
+        // the geometry — a morph that moved the points and left the paint behind
+        // would show up as a blue circle.
+        let mut tri = centred(
+            Mobject::new(rustim_mobject::shapes::right_triangle(3.0, 3.0)),
+            (-3.0, 0.0),
+        )
+        .with_style(filled(rustim_color::BLUE, 1.0))
+        .with_kind(NodeKind::RightTriangle)
+        .with_label("三角形");
+        tri.opacity = 0.0;
+
+        // Right: 16 points / 4 curves, morphing to a *ragged* target. Red to
+        // opaque white, so this side pins the other half of the style lerp.
+        let mut sq = centred(
+            Mobject::new(rustim_mobject::shapes::square(2.6, 2.6)),
+            (3.0, 0.0),
+        )
+        .with_style(filled(rustim_color::RED, 1.0))
+        .with_kind(NodeKind::Square)
+        .with_label("正方形");
+        sq.opacity = 0.0;
+
+        self.targets = vec![
+            centred(
+                Mobject::new(rustim_mobject::shapes::circle(1.6)),
+                (-3.0, 0.0),
+            )
+            .with_style(filled(rustim_color::YELLOW, 0.45))
+            .with_kind(NodeKind::Circle)
+            .with_label("圆形"),
+            centred(
+                Mobject::new(rustim_mobject::shapes::right_triangle(2.6, 2.6)),
+                (3.0, 0.0),
+            )
+            .with_style(filled(rustim_color::FG, 1.0))
+            .with_kind(NodeKind::RightTriangle)
+            .with_label("直角三角形"),
+        ];
+
+        self.sources.push(ctx.add(tri));
+        self.sources.push(ctx.add(sq));
+    }
+
+    fn update(&mut self, dt: f64, ctx: &mut SceneContext) {
+        ctx.animations.update(dt, &mut ctx.tree);
+
+        // Sequenced by hand, like the reference scene: the morph starts only once
+        // both fades have finished, so a slow frame makes the sequence later and
+        // never starts a morph from a half-faded shape.
+        if !ctx.animations.is_empty() {
+            return;
+        }
+        match self.stage {
+            0 => {
+                for id in &self.sources {
+                    ctx.animations
+                        .add(rustim_anim::FadeIn::new(*id).with_duration(0.4));
+                }
+                self.stage = 1;
+            }
+            1 => {
+                for (id, target) in self.sources.iter().zip(self.targets.iter()) {
+                    ctx.animations
+                        .add(rustim_anim::Transform::new(*id, target.clone()).with_duration(1.5));
+                }
+                self.stage = 2;
+            }
+            // Reached once the morph has finished, not when it was queued — the
+            // `is_empty` guard above is what makes that true.
+            2 => {
+                for (id, (label, kind)) in self.sources.iter().zip(SETTLED) {
+                    if let Some(m) = ctx.tree.get_mut(*id) {
+                        m.label = Some((*label).to_owned());
+                        m.kind = kind;
+                        m.dirty.semantic = true;
+                    }
+                }
+                self.stage = 3;
+            }
+            // Everything after that is the settled frame — which is what the
+            // headless `--png` path captures, ten seconds in.
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The primitives scene: raw draw operations
 // ---------------------------------------------------------------------------
 
@@ -754,6 +915,7 @@ fn scene_by_name(name: &str) -> Option<Box<dyn Scene>> {
         "composite" => Some(Box::new(CompositeScene)),
         "text" => Some(Box::new(TextScene::new())),
         "formula" => Some(Box::new(FormulaScene::new())),
+        "transform" => Some(Box::new(TransformScene::new())),
         _ => None,
     }
 }
@@ -766,7 +928,15 @@ fn scene_by_name(name: &str) -> Option<Box<dyn Scene>> {
 /// completeness check cannot see it: it compiles, it runs, and it silently skips
 /// its baseline forever.
 fn scene_names() -> String {
-    ["pythagorean", "primitives", "composite", "text", "formula"].join(", ")
+    [
+        "pythagorean",
+        "primitives",
+        "composite",
+        "text",
+        "formula",
+        "transform",
+    ]
+    .join(", ")
 }
 
 // ---------------------------------------------------------------------------

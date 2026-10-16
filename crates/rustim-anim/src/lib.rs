@@ -23,7 +23,7 @@ pub mod ops;
 
 use rustim_mobject::{NodeId, SceneTree};
 
-pub use ops::{FadeIn, MoveTo};
+pub use ops::{FadeIn, MoveTo, Transform};
 pub use rustim_math::rate::{self, RateFunc};
 
 /// A state change that plays out over a duration.
@@ -138,9 +138,14 @@ impl AnimationScheduler {
 
 /// A scene's node ids, in the order an animation should visit them.
 ///
-/// Morph-style animations need to pair up two point arrays; keeping the pairing
-/// explicit in data (rather than implied by traversal order) is what will let
-/// the AI layer express "morph this into that".
+/// Kept as a hook for the animations that genuinely address *two nodes* — an
+/// id-swapping `ReplacementTransform`, or a `LaggedStart` over a run of ids.
+///
+/// It is deliberately **not** what [`Transform`] takes, which is the one thing
+/// this alias was originally written for. Reading `animation/transform.py`
+/// settled it the other way: Manim's target is a donor `Mobject` that is never
+/// inserted and never touched (see [`Transform`]'s doc), so the honest pair is
+/// `(NodeId, Mobject)` — a node and a value, not two nodes.
 pub type NodePair = (NodeId, NodeId);
 
 #[cfg(test)]
@@ -255,6 +260,41 @@ mod tests {
         assert_eq!(tree.get(id).unwrap().opacity, 0.0);
         anim.interpolate(1.0, &mut tree);
         assert_eq!(tree.get(id).unwrap().opacity, 1.0);
+    }
+
+    /// The whole step, driven the way a scene drives it rather than by calling
+    /// `interpolate` by hand: queue it, tick past its duration, and the source is
+    /// wearing the target.
+    ///
+    /// The hand-called unit tests in `ops.rs` pin the *shape* of each frame; this
+    /// one pins that the scheduler actually reaches `alpha == 1.0` before it
+    /// `retain`s the animation away (`lib.rs:116`). If it dropped a frame early,
+    /// every unit test would still pass and a scene would settle one tick short of
+    /// the target — a defect no still frame can see.
+    #[test]
+    fn a_queued_transform_reaches_its_target() {
+        let mut tree = SceneTree::new();
+        let source = tree.insert(Mobject::new(rustim_mobject::shapes::right_triangle(
+            3.0, 3.0,
+        )));
+        let target = Mobject::new(rustim_mobject::shapes::circle(1.6));
+
+        let mut sched = AnimationScheduler::new();
+        sched.add(Transform::new(source, target.clone()));
+
+        for _ in 0..70 {
+            sched.update(1.0 / 60.0, &mut tree);
+        }
+
+        assert!(sched.is_empty(), "a finished transform must be dropped");
+        let got = &tree.get(source).unwrap().points;
+        assert_eq!(got.len(), target.points.len());
+        for (a, b) in got.iter().zip(target.points.iter()) {
+            assert!(
+                (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9,
+                "settled at {a:?}, target is {b:?}"
+            );
+        }
     }
 
     #[test]

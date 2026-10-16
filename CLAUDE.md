@@ -33,10 +33,10 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-16: **233 unit tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-16: **246 unit tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
-`rustim-app` and **not** from `rustim-scene`), all five golden scenes match their checked-in
+`rustim-app` and **not** from `rustim-scene`), all six golden scenes match their checked-in
 baselines, and `rustim-app --png out.png` reproduces the Manim reference frame with an **identical
 content bounding box** (`343,90,936,629`); only 0.012% of pixels differ by more than 2/255, and none
 by more than 8. See `方案建议.md` §5.2. The count is not decoration — every one of those claims is
@@ -199,15 +199,28 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   as the scene happens to need" — otherwise a duration change would silently rebless a golden as a
   capture of a half-faded frame.
 
-The five scenes are there to disagree with each other: `pythagorean` is the one with a Manim
+The six scenes are there to disagree with each other: `pythagorean` is the one with a Manim
 reference, `composite` covers deferred transforms, alpha and draw order through the mobject tree
 walk, `primitives` pushes strokes and clips as raw `DrawOp`s because nothing in the mobject model
 expresses either yet — without it the baselines would never touch stroke expansion or clip
 rasterisation, the two most intricate things `vello_cpu` does — `text` is the only one whose pixels
 come from a file in this repository rather than from code, so losing `assets/fonts/` fails here
-rather than silently producing a blank frame for a user, and `formula` is the only one whose
+rather than silently producing a blank frame for a user, `formula` is the only one whose
 geometry comes from a *third-party* typesetting engine, which is what makes the image the only place
-that can see a dropped fraction rule or a filled-in counter (see "P1 step 5").
+that can see a dropped fraction rule or a filled-in counter (see "P1 step 5"), and `transform` is the
+only one whose still is the *end* of an animation rather than a static arrangement: it morphs a
+3-curve triangle *up* into a circle and a 4-curve square *down* into a triangle, so one image shows
+both directions of the alignment padding and that the style lerp arrived (see "P2 step 2").
+
+Two things about the baselines themselves, both learned the hard way. **`BLESS=1` rewrites every
+baseline**, not just the one under review, because `check()` copies the render unconditionally. Of
+the five older baselines, four come back with different bytes and decode to pixel-identical images
+(`composite`: 28255 against 28688, and the diff bbox is `None`); the fifth, `formula`, matches byte
+for byte. Two renders of one scene from this binary *are* byte-identical, so this is a property of the
+committed files rather than of the encoder run — the cause is not established and does not matter,
+because the suite scores pixels. What does matter is that a bless run always leaves a non-empty diff,
+in which `git checkout`ing the untouched scenes is part of reviewing it, and that **`cmp` between a
+render and its baseline is a false alarm while `compare_png_files` is the honest check.**
 
 **Adding a scene means editing two places in `crates/rustim-app/src/main.rs`**, and they are a
 matched pair: the `scene_by_name` match (~:750) and the literal array in `scene_names()` (~:768) that
@@ -231,12 +244,12 @@ last property.
 | `rustim-math` | Points, `Affine2`, rate functions, the `Viewport` world→screen transform, and literal ports of Manim's `bezier` / `space_ops` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree`, stable `NodeId`, shape builders, `critical_point`, `world_anchors` | Real |
-| `rustim-anim` | `Animation` trait, `AnimationScheduler`, `FadeIn`, `MoveTo` | Real |
+| `rustim-anim` | `Animation` trait, `AnimationScheduler`, `FadeIn`, `MoveTo`, `Transform` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait, `DrawList`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, and the `compare` module that scores two frames | Real; ffmpeg pipe not written |
-| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter and the shaper↔rasteriser bridge (both as a **lib** target), five `--scene` entries, the golden suite | Real |
+| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter and the shaper↔rasteriser bridge (both as a **lib** target), six `--scene` entries, the golden suite | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead.
@@ -628,7 +641,7 @@ weeks later.
 | | P1 step | State |
 |---|---|---|
 | 1 | Numerical parity against Manim (439 cases at 1e-9) | done — see "Commands" |
-| 2 | Golden-image suite: five scenes, per-platform baselines, CI job | done — see "Golden images" |
+| 2 | Golden-image suite: six scenes, per-platform baselines, CI job | done — see "Golden images" |
 | 3 | Accessibility: structure + full keyboard + throttled announcements | done — see "Accessibility" |
 | 4 | Text: `parley` end to end (string → glyphs → screen), bundled CJK, measured font size | done — see "Text" |
 | 5 | Formulas: Typst → per-glyph outlines via `skrifa::OutlinePen`, never `typst-render` | done — see "P1 step 5", `rustim-text::formula`, the `formula` scene |
@@ -748,10 +761,43 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   with numpy's default `rtol = 1e-5`, so it is a *different constant* from the one `is_closed` uses
   (`1e-8`) and must not be inherited from it. A port that kept only `atol` splits a path into two
   subpaths where Manim keeps one, and the `rtol_boundary_no_split` fixture fails.
-  **Carried into step 2:** Manim's stored points *are* world coordinates, so its `align_points` sees
-  world points; here points are local beside a deferred `transform`, so alignment must happen in
-  **local** space and let the transform compose at draw time — the same split `Mobject::materialize`
-  and `to_bez_path` already make.
+  **Step 2, `Transform`, is done**, and it is what makes `align_points` live: the animation is in
+  `rustim-anim::ops`, `Style::lerp` (the pure value half of Manim's `VMobject.interpolate_color`) is
+  in `rustim-mobject`, and the `transform` scene puts both on screen. The step-1 open question —
+  where the `Mobject`-level wrapper goes — answered itself: **the animation *is* the wrapper**. There
+  is no `SceneTree::align_pair`, because Manim's `Transform.begin` copies the target into a private
+  `target_copy` and aligns against *that* (`animation/transform.py:200-212`), so the target is never a
+  scene object at all. Here the target is a free `Mobject` value handed to `Transform::new(source: NodeId,
+  target: Mobject)` — the node-target spelling is one `tree.get(b).clone()` at the call site — and the
+  source keeps its `NodeId` through the whole morph.
+  Four things about it are load-bearing. **Points are local here and world in Manim**, so both the
+  point array and the deferred affine are lerped; for a translate or scale delta that reproduces
+  Manim's world-space result exactly, and for a *rotation* delta it does not, because interpolating an
+  affine componentwise is not interpolating an angle — the same caveat `MoveTo`'s doc already carries.
+  Materialising both sides and writing back `transform = IDENTITY` would be "more correct" and would
+  throw away the O(1) deferred transform the architecture is built on. **`alpha == 1.0` is an exact
+  copy**, reproducing the short-circuit at `types/vectorized_mobject.py:1983-1987`; be precise about
+  what that buys — `(1 - 1) * a + 1 * b` already lands on `b` for finite values, so it is a *guard*
+  (a non-finite component would otherwise make the style `NaN`), which is why the test that observes
+  it poisons a component with `INFINITY`. **A ragged source is a no-op, not a panic** — `begin` has no
+  error channel, so the captured state stays `None` and every `interpolate` returns early, matching
+  the posture of a command naming a deleted node. And **a plain `Transform` leaves the source wearing
+  the target's data**, keeping its kind and label: the donor is never added, so the settled frame
+  holds two objects and not four.
+  **Not ported, on purpose, and the doc comment there says so:** `align_submobjects`,
+  `null_point_align` and the transparent-placeholder padding with its per-child recursion
+  (`mobject.py:3149-3227`) — every shape in `rustim-mobject` today is childless with all geometry in
+  `points`, so a shape-to-shape morph is fully covered while a *group*-to-group morph would align only
+  the top-level array. `path_arc` / `path_func` (the default is a straight lerp, and the seam is one
+  function pointer, so it is additive later) and sheen (`Style` has no `sheen_direction`) are out for
+  the same reason.
+  **What the accessibility work learned from it:** a `Transform` moves geometry and says nothing
+  about what the object *is*, and it cannot — nothing in the engine knows a triangle has become a
+  circle. So the caller has to say it, and the `transform` scene does, once the morph settles. That is
+  not a nicety: before the scene said it, `--inspect` described the settled circle as
+  "两条直角边长 3.2 和 3.2 的直角三角形，面积 5.12" and the settled triangle as a 2.6-square of area
+  6.76 — sizes measured honestly from the geometry, and both false. The kind is invisible in pixels
+  (the two renders were byte-identical), so a golden can never catch it; `--inspect` is the tool.
 - **P3+** — camera (pan/zoom/focus); video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration

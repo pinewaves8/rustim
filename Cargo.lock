@@ -3122,6 +3122,7 @@ dependencies = [
 name = "rustim-anim"
 version = "0.0.0"
 dependencies = [
+ "rustim-color",
  "rustim-math",
  "rustim-mobject",
 ]
