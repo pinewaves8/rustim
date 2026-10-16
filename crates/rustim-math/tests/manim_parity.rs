@@ -730,6 +730,46 @@ fn critical_point_matches() {
     rec.assert_exhaustive(&["critical_point"]);
 }
 
+/// `VMobject.align_points` — one case per pair in the `align_pairs` input.
+///
+/// Four of the twelve are there because a plausible port goes wrong on them, and
+/// knowing which is which is most of reading a failure here:
+///
+/// - `single_vs_single_shortcut` — two *one-point* paths with different points
+///   come back untouched, at length one. The equal-count early return runs before
+///   any normalisation, and upstream flags the shortcut as over-eager with a
+///   `TODO`; the port reproduces it rather than tidying it up.
+/// - `trailing_null_trim` / `trailing_null_double_trim` — the output is
+///   **shorter** than the input, 8 → 4 and 12 → 4, because trailing curves that
+///   fold onto the point before them are trimmed, repeatedly.
+/// - `trailing_null_partial_no_trim` — and the trim needs *all four* of the four
+///   points to match, not just the last one, or this pair would trim too.
+/// - `rtol_boundary_no_split` — two anchors 0.5 apart on a coordinate of 1e6 stay
+///   one subpath, because numpy's `allclose` scales its tolerance by the
+///   coordinate. A port that kept only `atol` splits the path here and then
+///   answers with a different subpath count and a different array length.
+#[test]
+fn align_points_matches() {
+    let fixture = Fixture::load("manim-geometry.json");
+    let mut rec = Recorder::new(&fixture);
+    let pairs: BTreeMap<String, Vec<Vec<Point>>> = fixture.input("align_pairs");
+
+    for (name, pair) in &pairs {
+        assert_eq!(pair.len(), 2, "{name}: a pair of paths");
+        let want: Vec<Vec<Point>> = Vec::from_value(&rec.expect("align_points", name), name);
+        assert_eq!(want.len(), 2, "{name}: the fixture records both outputs");
+        let (got_a, got_b) = bezier::align_points(&pair[0], &pair[1])
+            .unwrap_or_else(|e| panic!("{name}: align_points refused a valid path: {e}"));
+        // Both sides are compared, because the property the animation depends on
+        // is that they agree with *each other* — and a port that padded only one
+        // of them would still match on the side it got right.
+        close_points(&got_a, &want[0], &format!("{name}: first"));
+        close_points(&got_b, &want[1], &format!("{name}: second"));
+    }
+
+    rec.assert_exhaustive(&["align_points"]);
+}
+
 // ---------------------------------------------------------------------------
 // manim-space-ops.json
 // ---------------------------------------------------------------------------
@@ -1143,7 +1183,7 @@ const BEZIER_GROUPS: &[&str] = &[
     "get_smooth_cubic_bezier_handle_points",
 ];
 
-const GEOMETRY_GROUPS: &[&str] = &["get_arc_length", "critical_point"];
+const GEOMETRY_GROUPS: &[&str] = &["get_arc_length", "critical_point", "align_points"];
 
 const SPACE_OPS_GROUPS: &[&str] = &[
     "normalize",
@@ -1173,8 +1213,8 @@ const SPACE_OPS_GROUPS: &[&str] = &[
 #[test]
 fn fixture_case_counts_are_stable() {
     for (file, expected) in [
-        ("manim-bezier.json", 281usize),
-        ("manim-geometry.json", 77),
+        ("manim-bezier.json", 282usize),
+        ("manim-geometry.json", 89),
         ("manim-space-ops.json", 68),
     ] {
         let fixture = Fixture::load(file);

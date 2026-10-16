@@ -296,6 +296,25 @@ def collect_bezier():
     case("is_closed", "two_curve_loop", lambda: B.is_closed(path))
     INPUTS["paths"] = {"two_curve_loop": path.tolist()}
 
+    # `is_closed`'s tolerance is `atol + rtol * |start|`, per axis, so it scales
+    # with the start point. Every other case here lives within a few units of the
+    # origin, where the `rtol` term is at most 1e-4 and a port that dropped it
+    # still agrees by luck. Far out it does not: with `start = (1e6, 0)` the
+    # tolerance is ~10, so an endpoint a whole unit away is still closed, while an
+    # `atol`-only port reports open. The y and z components match exactly, so only
+    # the scaled x comparison can decide this case — which is the point.
+    rtol_path = np.array(
+        [
+            [1e6, 0.0, 0.0],
+            [1e6 + 1.0, 0.0, 0.0],
+            [1e6 + 1.0, 1.0, 0.0],
+            [1e6 + 1.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    case("is_closed", "rtol_scaled_tolerance", lambda: B.is_closed(rtol_path))
+    INPUTS["paths"]["rtol_scaled_tolerance"] = rtol_path.tolist()
+
     # bezier_remap changes the number of curves a path is sampled into; it is the
     # primitive Manim's align_points/morph machinery is built on.
     two = np.array([CURVES["arch"], CURVES["skew"]], dtype=float)
@@ -451,6 +470,132 @@ def vm_cubic(points):
     return vm
 
 
+# --------------------------------------------------------------------------
+# align_points: the morph-alignment core
+# --------------------------------------------------------------------------
+#
+# `align_points` is what makes two differently-shaped paths interpolable at all:
+# it grows (or trims) each side until every pair of corresponding subpaths is
+# described by the same number of control points. Manim calls it once, from
+# `Transform.begin`, and every frame after that is a plain elementwise lerp —
+# which is only meaningful if the two arrays are the same length, so the branches
+# below are chosen for what they *break*, not for what they look like.
+#
+# Three of them are reachable only on inputs no ordinary scene would produce, and
+# each is a way a plausible port goes quietly wrong:
+#
+#   - equal point counts return untouched, *before* any normalisation — including
+#     the over-eager case of two one-point paths with different points, which
+#     upstream flags with a `TODO`;
+#   - a path can come back **shorter**, because trailing curves that fold onto the
+#     point before them are trimmed (manim#1959), repeatedly;
+#   - the predicate that finds subpath boundaries is a numpy `allclose` with its
+#     default `rtol`, so the tolerance is *relative*. `rtol_boundary_no_split`
+#     sits exactly where an `atol`-only port splits and Manim does not.
+#
+# `_ARCH` and `_SKEW` come from `CURVES` rather than being repeated here: `skew` is
+# the reference scene's own 3-4-5 geometry, so a failure on it is one a golden
+# image can also see.
+
+_ARCH = CURVES["arch"]
+_SKEW = CURVES["skew"]
+
+# A second subpath, internally chained — its two curves meet at (8,0) — but not
+# joined to whatever precedes it, because it starts at (5,0).
+_CHAINED = [
+    [5.0, 0.0, 0.0], [6.0, 1.0, 0.0], [7.0, 1.0, 0.0], [8.0, 0.0, 0.0],
+    [8.0, 0.0, 0.0], [9.0, -1.0, 0.0], [10.0, -1.0, 0.0], [11.0, 0.0, 0.0],
+]
+
+# `arch`'s own last point. Repeated, it is a null curve: it folds onto the point
+# before it, which is exactly what the trim exists to remove again.
+_D = list(_ARCH[3])
+
+# A second curve that *is* chained onto `arch` (it starts where `arch` ends), so
+# the pair is one subpath of eight points rather than two of four.
+_ARCH_EXTENDED = _ARCH + [[1.0, 0.0, 0.0], [1.0, -1.0, 0.0], [2.0, -1.0, 0.0], [2.0, 0.0, 0.0]]
+
+ALIGN_PAIRS = {
+    # Equal counts, so the early return. The only case that pins the
+    # zero-difference path through `bezier_remap` as bit-exact.
+    "equal_lengths": [_ARCH, _SKEW],
+    # Equal counts but *different* points, one point each. The shortcut returns
+    # both unchanged; a port without it would answer with two four-point null
+    # curves, which is a different array length and so a different fixture.
+    "single_vs_single_shortcut": [[[1.0, 1.0, 0.0]], [[2.0, 2.0, 0.0]]],
+    # `has_new_path_started`: a lone point becomes a null curve.
+    "single_point_bootstrap": [[[2.0, 3.0, 0.0]], _ARCH],
+    # `has_no_points`: an empty path becomes four points at the origin.
+    "empty_bootstrap": [[], _ARCH],
+    # One subpath against two. The shorter side gains a null path built from its
+    # *own* last point, not from the other shape's — so a missing subpath morphs
+    # into a point rather than into the far side of the other figure.
+    "one_subpath_vs_two": [_ARCH, _ARCH + _SKEW],
+    "two_subpaths_vs_one": [_ARCH + _SKEW, _ARCH],
+    # A real subpath grown from one curve to two — the `1 -> 2` direction, which
+    # the existing `bezier_remap` group does not cover.
+    "real_subpath_growth": [_ARCH, _ARCH_EXTENDED],
+    # A *degenerate* null path grown by one curve: `bezier_remap` over four
+    # identical points, where every split factor still has to come out right.
+    "null_path_grown": [_ARCH + _CHAINED, _SKEW],
+    # The trim: eight points down to four. The result is **shorter** than the
+    # input, which is the property a "grow the shorter one" port gets wrong.
+    "trailing_null_trim": [_ARCH + [_D] * 4, _SKEW],
+    # ...twice over, because the trim is a loop and not an `if`. Twelve to four.
+    "trailing_null_double_trim": [_ARCH + [_D] * 4 + [_D] * 4, _SKEW],
+    # The trim requires *all four* of the last four points to match the one
+    # before them — not merely the last one, and not merely any one. The third of
+    # them is (5,5), so a "last point only" port trims here and this one does not.
+    "trailing_null_partial_no_trim": [
+        [_ARCH[0], _ARCH[1], _ARCH[2], _ARCH[3], _D, [5.0, 5.0, 0.0], _D, _D],
+        _SKEW,
+    ],
+    # Two curves meeting 0.5 apart on a coordinate of 1e6, where `allclose` allows
+    # `1e-6 + 1e-5 * 1e6` — about ten units. Manim therefore does *not* split the
+    # path in two; an `atol`-only port does, and answers with a different subpath
+    # count, a null path and a different array length.
+    "rtol_boundary_no_split": [
+        [
+            [1000000.0, 0.0, 0.0],
+            [1000000.0, 1.0, 0.0],
+            [1000000.5, 1.0, 0.0],
+            [1000000.0, 0.0, 0.0],
+            [1000000.5, 0.0, 0.0],
+            [1000000.5, -1.0, 0.0],
+            [1000001.0, -1.0, 0.0],
+            [1000000.5, 0.0, 0.0],
+        ],
+        _ARCH,
+    ],
+}
+
+
+def vm_path(points):
+    """A bare path, for `align_points`.
+
+    Deliberately **not** `vm_cubic`: that always calls `set_points`, and
+    `set_points(np.array([]))` leaves the array shaped `(0,)` rather than `(0, 3)`,
+    which makes `align_points`' own `start_new_path` bootstrap raise as it
+    broadcasts. A `VMobject` that was never given points is shaped `(0, 3)` and
+    bootstraps to the origin, which is what this case is meant to record.
+    """
+    vm = VMobject()
+    if points:
+        vm.set_points(np.array(points, dtype=float))
+    return vm
+
+
+def aligned(p1, p2):
+    """Both operands after alignment, in the order they were passed in.
+
+    `align_points` mutates in place and returns `self`, so the Rust port returns
+    the pair; the fixture records the same order.
+    """
+    a, b = vm_path(p1), vm_path(p2)
+    a.align_points(b)
+    return [a.points.tolist(), b.points.tolist()]
+
+
 def collect_geometry():
     INPUTS["corner_paths"] = CORNERS
     INPUTS["cubic_paths"] = CUBICS
@@ -492,6 +637,12 @@ def collect_geometry():
                 f"{name}@{dname}",
                 lambda vm=vm, d=np.array(d, dtype=float): vm.get_critical_point(d),
             )
+
+    # One case per pair, named after the input, so the Rust test can iterate the
+    # input map and read the matching expected value without a second table.
+    INPUTS["align_pairs"] = ALIGN_PAIRS
+    for name, (p1, p2) in ALIGN_PAIRS.items():
+        case("align_points", name, lambda p1=p1, p2=p2: aligned(p1, p2))
 
 
 # --------------------------------------------------------------------------
@@ -719,7 +870,7 @@ def main(argv):
             "get_smooth_closed_cubic_bezier_handle_points",
             "get_smooth_cubic_bezier_handle_points",
         ],
-        "manim-geometry.json": ["get_arc_length", "critical_point"],
+        "manim-geometry.json": ["get_arc_length", "critical_point", "align_points"],
         "manim-space-ops.json": [
             "normalize",
             "norm_squared",
@@ -769,6 +920,7 @@ def main(argv):
             "cubic_paths",
             "arc_samples",
             "critical_directions",
+            "align_pairs",
         ],
         "manim-space-ops.json": [
             "vectors",

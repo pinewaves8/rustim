@@ -1171,6 +1171,7 @@
    "folded": false,
    "quartic": false,
    "quintic": false,
+   "rtol_scaled_tolerance": true,
    "skew": false,
    "two_curve_loop": true,
    "wobble": false
@@ -8125,6 +8126,28 @@
    0.0
   ],
   "paths": {
+   "rtol_scaled_tolerance": [
+    [
+     1000000.0,
+     0.0,
+     0.0
+    ],
+    [
+     1000001.0,
+     0.0,
+     0.0
+    ],
+    [
+     1000001.0,
+     1.0,
+     0.0
+    ],
+    [
+     1000001.0,
+     0.0,
+     0.0
+    ]
+   ],
    "two_curve_loop": [
     [
      0.0,

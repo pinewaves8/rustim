@@ -577,11 +577,254 @@ pub fn bezier_remap(
     Ok(out)
 }
 
+/// Manim's `VMobject.tolerance_for_point_equality` default — the `atol` of
+/// [`points_equal`].
+///
+/// **Not** the tolerance [`is_closed`] uses, which is `1e-8`, and the two have to
+/// stay two. The distinction is not cosmetic: the same predicate decides where a
+/// path splits into subpaths and which trailing curves [`align_points`] trims, so
+/// a tolerance that is right for closure and wrong here changes how many curves a
+/// morph animates — silently, since the result is still a well-formed path.
+pub const POINT_EQUALITY_ATOL: f64 = 1e-6;
+
+/// `np.allclose`'s default `rtol`, which `consider_points_equals` inherits by not
+/// passing one.
+pub const POINT_EQUALITY_RTOL: f64 = 1e-5;
+
+/// `VMobject.consider_points_equals` — `np.allclose(p, q, atol=1e-6)`.
+///
+/// The parameters are named `p` and `q` rather than `a` and `b` because numpy's
+/// test is **asymmetric**: it is `|p - q| <= atol + rtol * |q|`, so it is the
+/// *second* argument that supplies the relative scale. Both callers below pass
+/// Manim's own order — `points[n - 1]` then `points[n]`, and the trailing curve
+/// then the single point before it — and naming the parameters is what keeps that
+/// order visible instead of looking interchangeable. (The asymmetry itself is
+/// nearly unobservable: for two points that differ mainly in magnitude the two
+/// orders agree to within `atol`, so no fixture can reasonably expose it.)
+///
+/// What *is* observable is the `rtol` term itself — the same absolute gap counts
+/// as equal near a coordinate of 1e6 and unequal near zero — and dropping it
+/// because `atol` looks like the whole tolerance is the obvious mistake. One
+/// fixture case sits on that boundary on purpose.
+fn points_equal(p: Point, q: Point) -> bool {
+    // numpy's `isclose` falls back to an exact comparison for non-finite
+    // operands; for finite ones `p == q` is already implied by the tolerance,
+    // so the extra term only ever decides the infinite case. Free and exact.
+    let close = |p: f64, q: f64| {
+        (p - q).abs() <= POINT_EQUALITY_ATOL + POINT_EQUALITY_RTOL * q.abs() || p == q
+    };
+    close(p.x, q.x) && close(p.y, q.y)
+}
+
+/// `VMobject.get_subpaths` — split a path into one slice per connected run of
+/// curves.
+///
+/// The split test walks the anchors in strides of [`POINTS_PER_CURVE`] and asks
+/// whether `points[n - 1]` and `points[n]` coincide, i.e. whether a curve's first
+/// point is where the previous curve ended. Runs that are at least one whole
+/// curve are subpaths; a shorter trailing remainder is dropped, which is Manim's
+/// `(i2 - i1) >= nppcc` filter. [`align_points`] rejects a ragged path before it
+/// gets here, so within this module that filter never discards anything.
+///
+/// Borrowing the slices rather than copying keeps the division free; the caller
+/// that needs owned points is the one that also needs to grow them.
+pub fn subpaths(points: &[Point]) -> Vec<&[Point]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for n in (POINTS_PER_CURVE..points.len()).step_by(POINTS_PER_CURVE) {
+        if !points_equal(points[n - 1], points[n]) {
+            out.push(&points[start..n]);
+            start = n;
+        }
+    }
+    if points.len() - start >= POINTS_PER_CURVE {
+        out.push(&points[start..]);
+    }
+    out
+}
+
+/// `VMobject.insert_n_curves_to_point_list` — resample `points` so that it
+/// describes exactly `current + n` curves.
+///
+/// Takes the **new total** onward to [`bezier_remap`], not the increment, which
+/// is Manim's convention too and an easy argument to get backwards.
+///
+/// The `len == 1` branch repeats the lone point `4 * n` times: Manim's way of
+/// turning "a path has been started but has no curve yet" into `n` null curves.
+/// **[`align_points`] can never reach it** — a subpath is never shorter than a
+/// whole curve and the null path it substitutes is four points — so it is pinned
+/// by a unit test rather than by a fixture. It is kept rather than inlined
+/// because Manim's `insert_n_curves` is this same helper under another name.
+fn insert_n_curves_to_point_list(n: usize, points: &[Point]) -> Result<Vec<Point>, CurveError> {
+    if points.len() == 1 {
+        return Ok(vec![points[0]; POINTS_PER_CURVE * n]);
+    }
+    // `get_cubic_bezier_tuples_from_points` drops a ragged remainder, and
+    // `bezier_remap` wants whole curves, so the chunking happens here.
+    let curves: Vec<Vec<Point>> = points
+        .as_chunks::<POINTS_PER_CURVE>()
+        .0
+        .iter()
+        .map(|c| c.to_vec())
+        .collect();
+    let remapped = bezier_remap(&curves, curves.len() + n)?;
+    Ok(remapped.into_iter().flatten().collect())
+}
+
+/// Manim's empty and one-point bootstraps, applied to whichever side needs them.
+///
+/// `has_no_points()` becomes four points at the origin. Manim asks the mobject
+/// for its `get_center()` there, which reads the whole subtree; a bare `VMobject`
+/// has no points to average, so the origin is what that call returns for the case
+/// the fixture can capture. The two differ only for a *family* whose children
+/// carry the points, and `Transform` never aligns such a mobject — it aligns
+/// `family_members_with_points`.
+///
+/// `has_new_path_started()` (`len % 4 == 1`) becomes `add_line_to(last)`: the
+/// lone point is repeated into a null curve rather than dropped.
+fn bootstrap(points: &[Point]) -> Vec<Point> {
+    if points.is_empty() {
+        return vec![Point::new(0.0, 0.0); POINTS_PER_CURVE];
+    }
+    if points.len() % POINTS_PER_CURVE == 1 {
+        let mut v = points.to_vec();
+        v.extend(core::iter::repeat_n(
+            points[points.len() - 1],
+            POINTS_PER_CURVE - 1,
+        ));
+        return v;
+    }
+    points.to_vec()
+}
+
+/// The `n`-th subpath of one side, trimmed of its redundant tail; a null path if
+/// that side has no `n`-th subpath at all.
+///
+/// The null path is four copies of *this side's* own last point — not the other
+/// side's — which is what makes a subpath that exists on one side and not the
+/// other morph into a degenerate point rather than into the far end of the other
+/// shape.
+fn nth_subpath(paths: &[&[Point]], n: usize) -> Vec<Point> {
+    match paths.get(n) {
+        Some(path) => trim_redundant_tail(path),
+        None => {
+            let last = paths
+                .last()
+                .and_then(|p| p.last())
+                .copied()
+                .unwrap_or(Point::new(0.0, 0.0));
+            vec![last; POINTS_PER_CURVE]
+        }
+    }
+}
+
+/// Drop trailing curves that fold onto the point before them (manim#1959).
+///
+/// The test compares the last **four** points against the single point at
+/// `len - 5`: numpy broadcasts a `(4, 3)` array against a `(3,)` one, so the
+/// condition is "every one of the last four equals the preceding point", not
+/// "the last point does". Checking only the last point — the obvious shorthand —
+/// trims different paths. It is a loop rather than an `if` because the tail can
+/// repeat more than once: twelve points can come down to four in two passes.
+///
+/// This is why [`align_points`] is not grow-only. A path carrying a degenerate
+/// trailing curve comes back **shorter** than it went in.
+fn trim_redundant_tail(path: &[Point]) -> Vec<Point> {
+    let mut end = path.len();
+    while end > POINTS_PER_CURVE {
+        let tail = &path[end - POINTS_PER_CURVE..end];
+        let preceding = path[end - POINTS_PER_CURVE - 1];
+        if !tail.iter().all(|&p| points_equal(p, preceding)) {
+            break;
+        }
+        end -= POINTS_PER_CURVE;
+    }
+    path[..end].to_vec()
+}
+
+/// `VMobject.align_points` — grow (or trim) two paths until they have the same
+/// number of subpaths, each pair of corresponding subpaths described by the same
+/// number of points.
+///
+/// This is what makes two differently-shaped mobjects interpolable at all. Manim
+/// calls it once, from `Transform.begin`, and every frame after that is a
+/// straight elementwise lerp of the two arrays — so the guarantee that matters is
+/// the one this function makes and the one the unit tests assert: **the two
+/// outputs always have the same length**. Whenever the inputs differed in length
+/// that length is also a whole number of curves, so a frame can neither produce a
+/// ragged array nor leave [`anchors`] (and so `critical_point`, and so everything
+/// the accessibility layer measures) blank mid-animation. The equal-length
+/// shortcut above is the one way a ragged result comes out, and only for a ragged
+/// input in the first place.
+///
+/// Four behaviours are deliberate, and three of them are easy to "fix" while
+/// porting:
+///
+/// - **Equal point counts are returned untouched**, before any normalisation.
+///   Upstream flags this with a `TODO` — the shortcut is over-eager, since two
+///   paths of equal length can still have different subpath structure. It is
+///   reproduced because a fixture is only worth anything if it is Manim's
+///   behaviour rather than a tidier one.
+/// - **The result can be shorter than the input.** See [`trim_redundant_tail`].
+/// - **Subpaths are paired positionally**, and a subpath present on one side only
+///   becomes a null path on the other — four copies of that side's own last
+///   point. Two shapes with different numbers of holes therefore morph hole
+///   against hole and hole against a point, not hole against outline.
+/// - **A ragged path is refused.** Manim's behaviour on a length that is not a
+///   multiple of four is undefined: it can emit a one-to-three point subpath and
+///   then unpack a zero-row shape. Only `0` or `1` modulo four are accepted here,
+///   and anything else is [`CurveError::RaggedPath`], matching the module's
+///   policy of reporting where Manim raises.
+///
+/// `z` is dropped along with the third coordinate everywhere in this module, and
+/// here that is lossless even for the equality test above: both sides carry
+/// `z = 0.0`, so that component is always within tolerance and can never decide a
+/// comparison.
+pub fn align_points(a: &[Point], b: &[Point]) -> Result<(Vec<Point>, Vec<Point>), CurveError> {
+    for points in [a, b] {
+        if !matches!(points.len() % POINTS_PER_CURVE, 0 | 1) {
+            return Err(CurveError::RaggedPath);
+        }
+    }
+
+    if a.len() == b.len() {
+        return Ok((a.to_vec(), b.to_vec()));
+    }
+
+    let (a, b) = (bootstrap(a), bootstrap(b));
+    let (subpaths_a, subpaths_b) = (subpaths(&a), subpaths(&b));
+
+    let mut out_a = Vec::new();
+    let mut out_b = Vec::new();
+    for n in 0..subpaths_a.len().max(subpaths_b.len()) {
+        let (sp1, sp2) = (nth_subpath(&subpaths_a, n), nth_subpath(&subpaths_b, n));
+        // `max(0, …)` in Manim; `saturating_sub` is the same answer without the
+        // unsigned underflow, and both operands are multiples of four so the
+        // division is exact either way.
+        let diff1 = sp2.len().saturating_sub(sp1.len()) / POINTS_PER_CURVE;
+        let diff2 = sp1.len().saturating_sub(sp2.len()) / POINTS_PER_CURVE;
+        out_a.extend(insert_n_curves_to_point_list(diff1, &sp1)?);
+        out_b.extend(insert_n_curves_to_point_list(diff2, &sp2)?);
+    }
+    Ok((out_a, out_b))
+}
+
 /// Whether a path's last point coincides with its first, within Manim's tolerance.
 ///
 /// Manim compares all three coordinates against `atol + rtol * |start|`. In this 2D
 /// port `z` is identically zero on both sides, so that comparison is always
 /// satisfied and only `x` and `y` can decide the answer.
+///
+/// The tolerance scales with the start point, which is easy to lose: a port that
+/// kept only `atol = 1e-8` agrees with Manim on every path near the origin and
+/// diverges on a distant one. The `rtol_scaled_tolerance` fixture is the case that
+/// separates them — a start at `1e6` has a tolerance of about 10, so an endpoint a
+/// whole unit away is still closed.
+///
+/// The two divergences from Manim here, both deliberate: an empty slice answers
+/// `false`, where Manim indexes `points[0]` and raises `IndexError` (a crash is not
+/// a value, so there is nothing to pin); and a one-point path compares that point
+/// against itself and answers `true`, which is what Manim does too.
 pub fn is_closed(points: &[Point]) -> bool {
     let Some((&start, &end)) = points.first().zip(points.last()) else {
         return false;
@@ -1242,5 +1485,259 @@ mod tests {
     fn points_as_corners_of_one_corner_is_empty() {
         assert!(points_as_corners(&[Point::new(1.0, 2.0)]).is_empty());
         assert!(points_as_corners(&[]).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // align_points
+    // -----------------------------------------------------------------------
+    //
+    // The parity suite replays these against Manim's own numbers. What is here is
+    // the part a fixture cannot state: the invariants across a *battery* of
+    // inputs, the refusals, and one branch the fixtures cannot reach at all.
+
+    fn pt(x: f64, y: f64) -> Point {
+        Point::new(x, y)
+    }
+
+    /// The geometry fixture's plain curve: corners at (0,0) (0,1) (1,1) (1,0).
+    fn arch() -> Vec<Point> {
+        vec![pt(0.0, 0.0), pt(0.0, 1.0), pt(1.0, 1.0), pt(1.0, 0.0)]
+    }
+
+    /// The reference scene's 3-4-5 curve — a single curve, unrelated to `arch`.
+    fn skew() -> Vec<Point> {
+        vec![pt(0.0, 0.0), pt(3.0, 0.0), pt(3.0, 4.0), pt(0.0, 4.0)]
+    }
+
+    /// Two curves in **one** subpath: the second starts where the first ended.
+    fn extended_arch() -> Vec<Point> {
+        let mut v = arch();
+        v.extend([pt(1.0, 0.0), pt(1.0, -1.0), pt(2.0, -1.0), pt(2.0, 0.0)]);
+        v
+    }
+
+    /// The contract the whole morph path rests on: whatever the inputs, the two
+    /// arrays come back the **same length**, and — since the morph only ever sees
+    /// two shapes of different sizes — a whole number of curves. Manim aligns once
+    /// in `Transform.begin` and then lerps elementwise for the rest of the
+    /// animation, so a pair that disagreed would leave the tail of the longer
+    /// array stuck where it started, and a ragged result would blank every
+    /// measured bound on the object for the duration.
+    #[test]
+    fn align_points_outputs_always_have_equal_length() {
+        let d = pt(1.0, 0.0); // `arch`'s own last point
+        let mut one_tail = arch();
+        one_tail.extend([d; 4]);
+        let mut two_tails = arch();
+        two_tails.extend([d; 8]);
+
+        for (what, a, b) in [
+            ("arch against skew", arch(), skew()),
+            ("arch against its own extension", arch(), extended_arch()),
+            ("a lone point against arch", vec![pt(2.0, 3.0)], arch()),
+            ("nothing against arch", Vec::new(), arch()),
+            ("a repeated tail against skew", one_tail, skew()),
+            ("two repeated tails against skew", two_tails, skew()),
+        ] {
+            let (out_a, out_b) = align_points(&a, &b).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(out_a.len(), out_b.len(), "{what}: lengths disagree");
+            assert_eq!(
+                out_a.len() % POINTS_PER_CURVE,
+                0,
+                "{what}: not a whole number of curves"
+            );
+        }
+    }
+
+    /// Running it twice must be the same as running it once, bit for bit. A scene
+    /// that re-targets the same morph would otherwise drift a little on every
+    /// replay — which reads as the animation being subtly wrong rather than as a
+    /// bug in the alignment.
+    #[test]
+    fn align_points_is_idempotent() {
+        let (a, b) = (arch(), extended_arch());
+        let (once_a, once_b) = align_points(&a, &b).unwrap();
+        let (twice_a, twice_b) = align_points(&once_a, &once_b).unwrap();
+        assert_eq!(once_a, twice_a);
+        assert_eq!(once_b, twice_b);
+    }
+
+    /// Equal point counts are returned untouched, before any normalisation — even
+    /// when the two paths have nothing else in common. Upstream carries a `TODO`
+    /// saying the shortcut "can be a bit over eager", and it is: two *one-point*
+    /// paths with different points come back as one-point arrays rather than as
+    /// two null curves. Reproduced deliberately, and pinned against Manim's own
+    /// answer by the `single_vs_single_shortcut` fixture.
+    #[test]
+    fn aligning_equal_length_paths_returns_them_unchanged() {
+        let (a, b) = (arch(), skew());
+        assert_eq!(align_points(&a, &b).unwrap(), (a.clone(), b.clone()));
+
+        let (a, b) = (vec![pt(1.0, 1.0)], vec![pt(2.0, 2.0)]);
+        let (out_a, out_b) = align_points(&a, &b).unwrap();
+        assert_eq!(out_a, a);
+        assert_eq!(out_b, b);
+        assert_eq!(out_a.len(), 1, "the shortcut runs before the bootstrap");
+    }
+
+    /// `has_new_path_started()`: a path one point past a whole number of curves is
+    /// completed into a null curve rather than dropped, so a lone point can still
+    /// take part in a morph instead of vanishing from it.
+    #[test]
+    fn align_points_bootstraps_a_single_point_into_a_null_curve() {
+        let (out_a, out_b) = align_points(&[pt(2.0, 3.0)], &arch()).unwrap();
+        assert_eq!(out_a, vec![pt(2.0, 3.0); 4]);
+        assert_eq!(out_b, arch(), "the other side was already whole");
+    }
+
+    /// `has_no_points()`: with nothing to average, Manim asks the mobject for its
+    /// centre, and a bare one answers the origin. The fixture records the same
+    /// case against Manim; this states the expected points.
+    #[test]
+    fn align_points_bootstraps_the_empty_path_at_the_origin() {
+        let (out_a, out_b) = align_points(&[], &arch()).unwrap();
+        assert_eq!(out_a, vec![Point::new(0.0, 0.0); 4]);
+        assert_eq!(out_b, arch());
+    }
+
+    /// The trim, in both directions — and the reason this function is not
+    /// grow-only: a path carrying a curve that folds onto the point before it comes
+    /// back **shorter** than it went in (manim#1959).
+    ///
+    /// The last third is the sharp one. The source test is
+    /// `np.allclose(path[-4:], path[-5])`, which numpy broadcasts into "**all
+    /// four** of the last four points equal the one before them" — so a tail that
+    /// repeats three times and then steps away is *not* trimmed. An implementation
+    /// that inspected only the last point trims it and changes the array length,
+    /// which is the failure this pins without depending on the order in which the
+    /// parity suite happens to visit its cases.
+    #[test]
+    fn align_points_shrinks_a_path_whose_tail_repeats() {
+        let d = pt(1.0, 0.0);
+
+        let mut one_tail = arch();
+        one_tail.extend([d; 4]);
+        let (out_a, out_b) = align_points(&one_tail, &skew()).unwrap();
+        assert_eq!(out_a, arch(), "8 points down to 4");
+        assert_eq!(out_b, skew());
+
+        let mut two_tails = arch();
+        two_tails.extend([d; 8]);
+        let (out_a, _) = align_points(&two_tails, &skew()).unwrap();
+        assert_eq!(out_a, arch(), "12 points down to 4, in two passes");
+
+        // Three of the last four repeat and the third does not, so there is
+        // nothing to trim and the path keeps its eight points.
+        let mut partial = arch();
+        partial.extend([d, pt(5.0, 5.0), d, d]);
+        let (out_a, out_b) = align_points(&partial, &skew()).unwrap();
+        assert_eq!(
+            out_a, partial,
+            "no trim: the four tail points are not all equal"
+        );
+        // ...and being a curve longer, this side grows the *other* one instead.
+        assert_eq!(out_b.len(), 8);
+    }
+
+    /// A length that is not a whole number of curves, nor one past one, is refused
+    /// rather than quietly truncated. Manim has no defined behaviour there — it can
+    /// emit a one-to-three point subpath and then unpack a zero-row matrix — so
+    /// reporting it is the only honest port.
+    ///
+    /// The tail of the test is the boundary on the other side: five points is one
+    /// whole curve plus one, which is legal and must stay legal, because it is the
+    /// `has_new_path_started()` case. It bootstraps to **eight** points — a whole
+    /// curve plus a null one — and the trim then takes the null curve straight
+    /// back off, so it lands on four. That round trip is worth seeing: the two
+    /// branches that look like they should disagree combine into the shortest
+    /// possible answer.
+    #[test]
+    fn align_points_rejects_a_ragged_path() {
+        for n in [2usize, 3, 6, 7] {
+            let bad = vec![pt(0.0, 0.0); n];
+            assert_eq!(
+                align_points(&bad, &arch()).unwrap_err(),
+                CurveError::RaggedPath,
+                "{n} points"
+            );
+            assert_eq!(
+                align_points(&arch(), &bad).unwrap_err(),
+                CurveError::RaggedPath,
+                "{n} points, arguments reversed"
+            );
+        }
+
+        let (out_a, out_b) = align_points(&[pt(2.0, 3.0); 5], &arch()).unwrap();
+        assert_eq!(out_a, vec![pt(2.0, 3.0); 4], "bootstrapped, then trimmed");
+        assert_eq!(out_b, arch());
+    }
+
+    /// The split test walks anchors in strides of four and asks whether an anchor
+    /// coincides with the one *before* it, so a boundary is where two curves fail
+    /// to meet. The index is the whole point: `points[n - 1]` against `points[n]`,
+    /// not `points[n]` against `points[n + 1]`. Off by one in that direction and
+    /// every single-curve path still looks like one subpath, so the mistake is
+    /// invisible until a path has two.
+    #[test]
+    fn subpaths_splits_only_where_anchors_differ() {
+        assert_eq!(
+            subpaths(&extended_arch()).len(),
+            1,
+            "chained, so one subpath"
+        );
+
+        let mut split = arch();
+        split.extend(skew()); // `skew` starts at the origin, `arch` ends at (1, 0)
+        let parts = subpaths(&split);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], arch().as_slice());
+        assert_eq!(parts[1], skew().as_slice());
+    }
+
+    /// The `len == 1` branch, which [`align_points`] can never reach — a subpath is
+    /// never shorter than one whole curve, and the null path it substitutes is four
+    /// points. That makes this test the only thing standing between the branch and
+    /// being silently wrong, which is why the helper is kept as a named function
+    /// rather than inlined. `n == 0` is its boundary: `np.repeat(point, 0)` is an
+    /// empty array, not one point.
+    #[test]
+    fn insert_n_curves_to_point_list_repeats_a_single_point() {
+        let lone = [pt(2.0, 3.0)];
+        assert_eq!(
+            insert_n_curves_to_point_list(2, &lone).unwrap(),
+            vec![pt(2.0, 3.0); 8]
+        );
+        assert_eq!(
+            insert_n_curves_to_point_list(1, &lone).unwrap(),
+            vec![pt(2.0, 3.0); 4]
+        );
+        assert!(insert_n_curves_to_point_list(0, &lone).unwrap().is_empty());
+    }
+
+    /// The tolerance is **relative**, and this is the fact that decides where a
+    /// path splits into subpaths and which trailing curves get trimmed — not just
+    /// where a path closes. The same absolute gap is equal near a coordinate of
+    /// 1e6 and unequal near zero; a port that kept only `atol` would split such a
+    /// path in two and answer with a different array length, which the
+    /// `rtol_boundary_no_split` fixture pins against Manim's own output.
+    #[test]
+    fn points_equal_scales_its_tolerance_with_the_coordinate() {
+        let gap = 0.5;
+        assert!(
+            points_equal(pt(1.0e6, 0.0), pt(1.0e6 + gap, 0.0)),
+            "0.5 is far inside 1e-5 * 1e6"
+        );
+        assert!(
+            !points_equal(pt(0.0, 0.0), pt(gap, 0.0)),
+            "and far outside the bare 1e-6 at the origin"
+        );
+        assert!(!points_equal(
+            pt(0.0, 0.0),
+            pt(POINT_EQUALITY_ATOL * 2.0, 0.0)
+        ));
+        assert!(points_equal(
+            pt(0.0, 0.0),
+            pt(POINT_EQUALITY_ATOL / 2.0, 0.0)
+        ));
     }
 }

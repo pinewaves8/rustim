@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-16: **222 unit tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-16: **233 unit tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all five golden scenes match their checked-in
@@ -154,7 +154,7 @@ from, which is why `/media` is in `.gitignore`. Render a reference frame with:
 
 **Manim numerical parity (`rustim-math`).** `crates/rustim-math/src/bezier.rs` and `space_ops.rs` are
 literal ports of `manim.utils.bezier` and `manim.utils.space_ops`, and
-`crates/rustim-math/tests/manim_parity.rs` replays **426 recorded Manim results** against them
+`crates/rustim-math/tests/manim_parity.rs` replays **439 recorded Manim results** against them
 (`tests/fixtures/manim-{bezier,geometry,space-ops}.json`, checked in — the suite needs no Python).
 The acceptance rule is `1e-9` absolute on every coordinate, with no "close enough" allowances: the
 ports reproduce Manim's *rounding paths*, not just its formulas, which is the only way the numbers
@@ -627,7 +627,7 @@ weeks later.
 
 | | P1 step | State |
 |---|---|---|
-| 1 | Numerical parity against Manim (426 cases at 1e-9) | done — see "Commands" |
+| 1 | Numerical parity against Manim (439 cases at 1e-9) | done — see "Commands" |
 | 2 | Golden-image suite: five scenes, per-platform baselines, CI job | done — see "Golden images" |
 | 3 | Accessibility: structure + full keyboard + throttled announcements | done — see "Accessibility" |
 | 4 | Text: `parley` end to end (string → glyphs → screen), bundled CJK, measured font size | done — see "Text" |
@@ -733,6 +733,25 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
 
 - **P2** — more mobjects (lines, arrows, axes, function plots) and animations (`Transform`, `Rotate`,
   `Scale`, `FadeOut`); morph via `align_points`.
+  **Step 1, the alignment core, is done**: `rustim_math::bezier::align_points` (with `subpaths`)
+  is a literal port of `VMobject.align_points`, covered by twelve cases in a new `align_points`
+  group in `manim-geometry.json`. It is deliberately **port-ahead-of-consumer** — nothing calls it
+  yet, which is this module's established pattern (`bezier_remap`, `arc_length`, `is_closed` and the
+  `get_smooth_*` family are all in the same position), and the `Mobject`-level wrapper is step 2's
+  decision because it depends on how `Transform` drives it.
+  Three behaviours are worth knowing before touching it, and the module doc is the authority:
+  **the result can be shorter than the input** (trailing curves that fold onto the point before them
+  are trimmed, in a loop, manim#1959 — so "grow the shorter one" is wrong); **equal point counts
+  return untouched before any normalisation**, even when two one-point paths have different points
+  (upstream's own `TODO` calls the shortcut over-eager, and it is reproduced rather than tidied); and
+  **the point-equality tolerance is relative** — `consider_points_equals` is `np.allclose(p, q, atol=1e-6)`
+  with numpy's default `rtol = 1e-5`, so it is a *different constant* from the one `is_closed` uses
+  (`1e-8`) and must not be inherited from it. A port that kept only `atol` splits a path into two
+  subpaths where Manim keeps one, and the `rtol_boundary_no_split` fixture fails.
+  **Carried into step 2:** Manim's stored points *are* world coordinates, so its `align_points` sees
+  world points; here points are local beside a deferred `transform`, so alignment must happen in
+  **local** space and let the transform compose at draw time — the same split `Mobject::materialize`
+  and `to_bez_path` already make.
 - **P3+** — camera (pan/zoom/focus); video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration
