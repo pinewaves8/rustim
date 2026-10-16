@@ -5,6 +5,14 @@
 //! clock. Time lives in the scheduler, and the easing curve lives inside the
 //! animation (`方案建议.md` §4.4).
 //!
+//! Three layers, and the split is the whole timeline design:
+//!
+//! * [`Animation`] — one state change, a pure function of `alpha`.
+//! * [`AnimationScheduler`] — the animations playing *now*, in parallel, on one
+//!   shared clock. This is Manim's `Scene.play(*args)`.
+//! * [`Sequence`] — the beats still to come, one after another. This is Manim's
+//!   `construct()` body, written down as data because our loop cannot block.
+//!
 //! # The tutorial's lifetime problem, resolved
 //!
 //! The tutorial sketches `Create<'a, T>` and `MoveTo<'a, T>` holding
@@ -20,11 +28,13 @@
 //! animation without holding a Rust reference to it.
 
 pub mod ops;
+pub mod sequence;
 
 use rustim_mobject::{NodeId, SceneTree};
 
-pub use ops::{FadeIn, MoveTo, Transform};
+pub use ops::{FadeIn, MoveTo, Transform, Wait};
 pub use rustim_math::rate::{self, RateFunc};
+pub use sequence::Sequence;
 
 /// A state change that plays out over a duration.
 pub trait Animation {
@@ -56,22 +66,64 @@ pub trait Animation {
     }
 }
 
+/// A boxed animation is an animation.
+///
+/// Not decoration: it is what lets a beat of *mixed* animation types be written
+/// down. An array literal's element type is settled from its contents before any
+/// bound is consulted, so `[Box::new(FadeIn::new(a)), Box::new(MoveTo::new(b, t))]`
+/// has two types and coerces to neither — no signature makes that line compile.
+/// With this impl the mixed beat is spelled with the element type written once:
+///
+/// ```ignore
+/// let beat: Vec<Box<dyn Animation>> = vec![Box::new(FadeIn::new(a)), Box::new(MoveTo::new(b, t))];
+/// ctx.play_all(beat);
+/// ```
+///
+/// which works precisely because `Box<dyn Animation>` now satisfies `Animation`.
+/// A homogeneous beat needs none of that: `ctx.play_all([FadeIn::new(a), FadeIn::new(b)])`.
+impl<T: Animation + ?Sized> Animation for Box<T> {
+    fn duration(&self) -> f64 {
+        (**self).duration()
+    }
+
+    fn begin(&mut self, tree: &SceneTree) {
+        (**self).begin(tree)
+    }
+
+    fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
+        (**self).interpolate(alpha, tree)
+    }
+
+    fn rate_func(&self) -> RateFunc {
+        (**self).rate_func()
+    }
+}
+
 /// A running animation plus the scheduler's own clock reading for it.
 struct Running {
     anim: Box<dyn Animation>,
     started: bool,
+    /// The scheduler's clock when this animation was queued.
+    ///
+    /// Progress is read as `elapsed - started_at`, so an animation added to a
+    /// batch already in flight starts from its own zero rather than from wherever
+    /// the batch happens to be. See [`AnimationScheduler::add`] for why that is
+    /// not a refinement.
+    started_at: f64,
 }
 
 /// Plays animations in parallel.
 ///
-/// One shared `start_time`, each animation computing its progress independently
-/// from its own duration — so animations of different lengths play together and
-/// the shortest one simply finishes first. That is Manim's behaviour and it is
-/// worth preserving exactly.
+/// One shared clock, each animation computing its progress independently from its
+/// own duration — so animations of different lengths play together and the
+/// shortest one simply finishes first. That is Manim's behaviour and it is worth
+/// preserving exactly: `Scene.play(*args)` is one flat list whose total is
+/// `max(run_time)` (`scene/scene.py:1184-1186`), with every child advanced by
+/// `alpha = t / animation.run_time` (`:1714-1724`).
 #[derive(Default)]
 pub struct AnimationScheduler {
     running: Vec<Running>,
-    /// Seconds of virtual time since this batch started.
+    /// Seconds of virtual time since this scheduler was created or cleared.
     elapsed: f64,
 }
 
@@ -86,9 +138,20 @@ impl AnimationScheduler {
     /// the call — which is precisely why they address nodes by id instead of
     /// borrowing them.
     pub fn add(&mut self, anim: impl Animation + 'static) {
+        self.add_boxed(Box::new(anim));
+    }
+
+    /// [`Self::add`] for an animation that is already boxed.
+    ///
+    /// Exists for [`Sequence::start_next`], which moves a whole beat across; the
+    /// alternative is an iterator of `impl Animation` with one concrete type per
+    /// call, and a beat is exactly where two animations of *different* types have
+    /// to sit together.
+    pub fn add_boxed(&mut self, anim: Box<dyn Animation>) {
         self.running.push(Running {
-            anim: Box::new(anim),
+            anim,
             started: false,
+            started_at: self.elapsed,
         });
     }
 
@@ -105,15 +168,17 @@ impl AnimationScheduler {
                 r.started = true;
             }
         }
-        // Progress is computed against the batch clock, not accumulated, so a
-        // large dt cannot drift the phase of an animation.
+        // Progress is computed against the clock, not accumulated, so a large dt
+        // cannot drift the phase of an animation.
         for r in &mut self.running {
             let d = r.anim.duration();
-            let raw = if d <= 0.0 { 1.0 } else { self.elapsed / d };
+            let age = self.elapsed - r.started_at;
+            let raw = if d <= 0.0 { 1.0 } else { age / d };
             let alpha = r.anim.ease(raw);
             r.anim.interpolate(alpha, tree);
         }
-        self.running.retain(|r| self.elapsed < r.anim.duration());
+        self.running
+            .retain(|r| self.elapsed - r.started_at < r.anim.duration());
     }
 
     /// True when nothing is left to play.
@@ -294,6 +359,158 @@ mod tests {
                 (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9,
                 "settled at {a:?}, target is {b:?}"
             );
+        }
+    }
+
+    /// **The guard for the scheduler's per-animation start offset.**
+    ///
+    /// Every scene in the workspace calls `animations.update(dt, ..)` and *then*
+    /// `add`s, so before `started_at` existed the clock had always already been
+    /// advanced by one `dt` before the batch existed: the first frame of every
+    /// animation was delivered one frame too far along its own curve. No still
+    /// frame can see that (the end is clamped to 1.0 either way and the goldens
+    /// are captured ten seconds in), which is exactly why it is pinned here.
+    ///
+    /// The counterfactual is stated in the last assertion: without the offset the
+    /// late animation's first `alpha` would be `31/60`, not `1/60`.
+    #[test]
+    fn an_animation_added_late_starts_from_its_own_zero() {
+        let early = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let late = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut sched = AnimationScheduler::new();
+        let (mut tree, _) = scene_with_cube();
+
+        sched.add(Recorder {
+            seen: early.clone(),
+            duration: 1.0,
+        });
+        for _ in 0..30 {
+            sched.update(1.0 / 60.0, &mut tree);
+        }
+        assert!((early.borrow().last().copied().unwrap() - 0.5).abs() < 1e-12);
+
+        sched.add(Recorder {
+            seen: late.clone(),
+            duration: 1.0,
+        });
+        sched.update(1.0 / 60.0, &mut tree);
+
+        let late = late.borrow();
+        assert!(
+            (late[0] - 1.0 / 60.0).abs() < 1e-12,
+            "a late animation starts at its own zero, got {} (31/60 would mean the \
+             offset is gone)",
+            late[0]
+        );
+        assert!(late[0] < 31.0 / 60.0);
+    }
+
+    /// A pause is an animation, and it occupies exactly its own duration — the
+    /// property that makes `SceneContext::wait` a `play` with a `Wait` in it rather
+    /// than a second kind of step for the driver to know about.
+    #[test]
+    fn wait_holds_the_clock_without_touching_the_tree() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        let before = tree.get(id).unwrap().clone();
+
+        let mut sched = AnimationScheduler::new();
+        sched.add(Wait::new(0.5));
+
+        let mut ticks = 0;
+        while !sched.is_empty() {
+            sched.update(1.0 / 60.0, &mut tree);
+            ticks += 1;
+            assert!(ticks < 100, "a pause must end on its own");
+        }
+        // Half a second at 1/60 s per frame, to within the frame that carries it
+        // past the end: 30 ticks of `1/60` sum to just *under* 0.5 in f64, so the
+        // 31st is the one that drains. The range is what makes this a real
+        // assertion — a `Wait` that reported the wrong duration (or zero) would
+        // drain outside it rather than inside.
+        assert!(
+            (0.5..0.5 + 1.0 / 60.0).contains(&sched.elapsed()),
+            "a pause lasts its own duration; drained at {}",
+            sched.elapsed()
+        );
+        assert!((30..=31).contains(&ticks), "took {ticks} ticks");
+
+        let after = tree.get(id).unwrap();
+        assert_eq!(after.points, before.points);
+        assert_eq!(after.transform, before.transform);
+        assert_eq!(after.opacity, before.opacity);
+        assert_eq!(after.style, before.style);
+    }
+
+    /// Manim's `Wait` defaults to `linear` (`animation.py:612`) rather than to the
+    /// `ease_in_out` everything else inherits. Nothing follows from it today — a
+    /// `Wait` writes nothing — but a default that only *looks* arbitrary is one a
+    /// later reader will "simplify" away, so it is pinned.
+    #[test]
+    fn wait_uses_linear_so_a_pause_is_a_pause() {
+        assert_eq!(Wait::new(1.0).ease(0.25), 0.25);
+        // The curve it is *not* using, so the assertion above cannot pass by luck.
+        assert_eq!(rate::ease_in_out(0.25), 0.125);
+    }
+
+    /// The whole point of the three layers, driven the way a scene drives them: a
+    /// beat queued behind another does not start until the first has drained, and
+    /// the sequence plus the scheduler together carry the scene to its final state.
+    #[test]
+    fn a_sequence_driven_through_the_scheduler_settles_the_scene() {
+        let mut tree = SceneTree::new();
+        let source = tree.insert(Mobject::new(rustim_mobject::shapes::right_triangle(
+            3.0, 3.0,
+        )));
+        let target = Mobject::new(rustim_mobject::shapes::circle(1.6));
+
+        let mut seq = Sequence::new();
+        // A `FadeIn` fades from wherever the object *is* (see its `begin`) and a
+        // fresh mobject is opaque, so without this the fade is a no-op and the whole
+        // test measures nothing.
+        tree.get_mut(source).unwrap().opacity = 0.0;
+        let fade: Vec<Box<dyn Animation>> = vec![Box::new(FadeIn::new(source).with_duration(0.3))];
+        let morph: Vec<Box<dyn Animation>> = vec![Box::new(Transform::new(source, target.clone()))];
+        seq.push(fade);
+        seq.push(morph);
+
+        let mut sched = AnimationScheduler::new();
+        let mut frames = 0;
+        let (mut faded_at, mut morphed_at) = (None, None);
+        // The order `SceneContext::advance` uses: start the next beat, then advance.
+        while !seq.is_empty() || !sched.is_empty() {
+            if sched.is_empty() {
+                seq.start_next(&mut sched);
+            }
+            sched.update(1.0 / 60.0, &mut tree);
+            frames += 1;
+            assert!(frames < 1000, "the sequence never drained");
+
+            // Alignment rewrites the point array wholesale, so "16 points" is the
+            // morph having begun and "12" is it not having begun. Comparing the
+            // two frame numbers rather than hard-coding one is what makes this
+            // immune to a float-accumulation off-by-one in the clock.
+            let m = tree.get(source).unwrap();
+            if faded_at.is_none() && m.opacity == 1.0 {
+                faded_at = Some(frames);
+            }
+            if morphed_at.is_none() && m.points.len() == 16 {
+                morphed_at = Some(frames);
+            }
+        }
+        let (faded_at, morphed_at) = (faded_at.unwrap(), morphed_at.unwrap());
+        assert!(faded_at > 1, "the fade took more than one frame to finish");
+        assert!(
+            morphed_at > faded_at,
+            "the second beat began at {morphed_at}, during the first (which finished \
+             at {faded_at})"
+        );
+
+        assert_eq!(tree.get(source).unwrap().opacity, 1.0);
+        let got = &tree.get(source).unwrap().points;
+        assert_eq!(got.len(), target.points.len());
+        for (a, b) in got.iter().zip(target.points.iter()) {
+            assert!((a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9);
         }
     }
 

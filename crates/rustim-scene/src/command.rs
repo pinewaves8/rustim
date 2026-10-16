@@ -2,8 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 
+use rustim_anim::{Animation, FadeIn, MoveTo};
+use rustim_math::Affine2;
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree};
+
+/// How long an animation runs when the command did not say.
+///
+/// Manim's `DEFAULT_ANIMATION_RUN_TIME` (`animation/animation.py:26`), which is
+/// also what `Animation.__init__`'s `run_time` defaults to (`:132`). It matches
+/// the defaults on `FadeIn`/`MoveTo` themselves, so a command that omits
+/// `duration` and a scene that calls the constructor directly agree by
+/// construction rather than by two people picking 1.0.
+const DEFAULT_ANIMATION_RUN_TIME: f64 = 1.0;
 
 /// A mutation requested from outside the engine.
 ///
@@ -151,12 +162,77 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             diff.modified.push(*target);
         }
         Command::Play { .. } => {
-            // Animations are applied by the caller, which owns the scheduler;
-            // this arm exists so the command round-trips and the error surface
-            // is unchanged once it lands.
+            // `SceneContext::handle` answers this one, because playing is the one
+            // command that needs the playback machine and this function is pure.
+            // The arm stays so `apply` is still total over `Command` — a caller
+            // driving `apply` directly gets the round-trip it always got, not a
+            // panic.
         }
     }
     Ok(diff)
+}
+
+/// Build the animation a [`Command::Play`] names.
+///
+/// The wire→animation mapping lives here, beside the wire types, rather than in
+/// `SceneContext`: the refusal vocabulary a language model sees (`NoSuchNode`,
+/// `OutOfRange`) is this module's, and splitting the mapping across the two would
+/// put half of one protocol's error surface in a scheduler's file.
+///
+/// Takes the tree even though it only reads it, because **a `Play` naming a node
+/// that does not exist has to be refused rather than quietly playing nothing** —
+/// the same reason `Remove` and `Set` look their target up before touching it.
+/// `FadeIn` and `MoveTo` both degrade to a no-op on a missing target by design (a
+/// deleted node may race an animation), but that posture is for an animation
+/// *already running*; a command arriving now is a request that can still be
+/// answered.
+///
+/// The refusals, each a value rather than a panic:
+///
+/// * a target that is not in the tree — [`CommandError::NoSuchNode`];
+/// * `MoveTo` with no `to` — [`CommandError::OutOfRange`], because there is no
+///   destination and silently doing nothing would teach a model that `to` is
+///   optional when every `move_to` needs it;
+/// * a negative or non-finite `duration` — [`CommandError::OutOfRange`]. `0.0` is
+///   accepted: Manim refuses only `run_time < 0` (`animation/animation.py:175-181`)
+///   and an instant snap is legitimate — `AnimationScheduler::update` already
+///   defines it (`raw = 1.0` when `duration <= 0.0`).
+///   Non-finite is refused here and *not* upstream, where `run_time = nan` is
+///   accepted: an infinite one holds the clock forever and a NaN one makes
+///   `age < duration` false, so the animation vanishes after a single frame.
+///   Neither is a thing to answer a host with silence about.
+pub fn animation_for(
+    tree: &SceneTree,
+    spec: &AnimationSpec,
+) -> Result<Box<dyn Animation>, CommandError> {
+    if tree.get(spec.target).is_none() {
+        return Err(CommandError::NoSuchNode {
+            target: spec.target,
+        });
+    }
+    if let Some(d) = spec.duration
+        && (!d.is_finite() || d < 0.0)
+    {
+        return Err(CommandError::OutOfRange {
+            property: "duration".into(),
+            detail: format!("{d} is not a finite, non-negative number of seconds"),
+        });
+    }
+    let duration = spec.duration.unwrap_or(DEFAULT_ANIMATION_RUN_TIME);
+
+    Ok(match spec.kind {
+        AnimationKind::FadeIn => Box::new(FadeIn::new(spec.target).with_duration(duration)),
+        AnimationKind::MoveTo => {
+            let Some([x, y]) = spec.to else {
+                return Err(CommandError::OutOfRange {
+                    property: "to".into(),
+                    detail: "a move_to needs a destination".into(),
+                });
+            };
+            let to = Affine2::translate((x, y));
+            Box::new(MoveTo::new(spec.target, to).with_duration(duration))
+        }
+    })
 }
 
 fn remove_subtree(tree: &mut SceneTree, root: NodeId) {
@@ -252,6 +328,15 @@ mod tests {
                 r#"{{"action":"set","target":{id},"property":{{"name":"opacity","value":0.5}}}}"#
             ),
             r#"{"action":"add","type":"circle","params":{"radius":2.0}}"#.to_owned(),
+            // The animation specs round-trip too, which is what lets a host log and
+            // replay a session: `range`'s absent-field rule holds for `duration`
+            // and `to` as well, so neither is written back as `null`.
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"fade_in","duration":0.6}}}}"#
+            ),
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"move_to","to":[1.5,-2.0]}}}}"#
+            ),
         ];
         for json in cases {
             let cmd: Command =
@@ -344,5 +429,129 @@ mod tests {
         )
         .unwrap();
         assert!(diff.is_empty());
+    }
+
+    /// A tree with one object, whose opacity starts at zero so that fading it in is
+    /// observable. `FadeIn::begin` captures `from = m.opacity`, so a fresh mobject —
+    /// opaque by default — would make this a no-op with a duration.
+    fn scene_with_a_blank() -> (SceneTree, NodeId) {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        tree.get_mut(id).unwrap().opacity = 0.0;
+        (tree, id)
+    }
+
+    fn spec(id: NodeId, kind: AnimationKind) -> AnimationSpec {
+        AnimationSpec {
+            target: id,
+            kind,
+            duration: None,
+            to: None,
+        }
+    }
+
+    /// The mapping itself: the wire spec becomes an animation that runs for the
+    /// stated time and reaches the right end state.
+    #[test]
+    fn a_fade_in_command_builds_a_fade_in() {
+        let (mut tree, id) = scene_with_a_blank();
+        let mut what = spec(id, AnimationKind::FadeIn);
+        what.duration = Some(0.25);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        assert_eq!(anim.duration(), 0.25);
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().opacity, 1.0);
+    }
+
+    /// The destination is applied as a *transform*, the same way
+    /// `Property::Position` applies one — so the animation interpolates toward it
+    /// rather than snapping to it.
+    #[test]
+    fn a_move_to_command_moves_to_the_given_point() {
+        let (mut tree, id) = scene_with_a_blank();
+        let mut what = spec(id, AnimationKind::MoveTo);
+        what.to = Some([3.0, -4.0]);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(
+            tree.get(id).unwrap().transform,
+            Affine2::translate((3.0, -4.0))
+        );
+    }
+
+    /// A duration the command did not give is Manim's `DEFAULT_ANIMATION_RUN_TIME`,
+    /// which is also what `FadeIn::new`/`MoveTo::new` pick — so a command and a
+    /// scene calling the constructor agree without either restating 1.0.
+    #[test]
+    fn an_omitted_duration_is_manims_default() {
+        let (tree, id) = scene_with_a_blank();
+        assert_eq!(DEFAULT_ANIMATION_RUN_TIME, 1.0);
+        for kind in [AnimationKind::FadeIn, AnimationKind::MoveTo] {
+            let mut what = spec(id, kind);
+            if kind == AnimationKind::MoveTo {
+                what.to = Some([0.0, 0.0]);
+            }
+            assert_eq!(animation_for(&tree, &what).unwrap().duration(), 1.0);
+        }
+    }
+
+    /// A `Play` naming a node that is not there is refused, like `Set` and
+    /// `Remove`. The animations themselves degrade to no-ops on a missing target by
+    /// design — that posture is for one already running — but a command arriving now
+    /// is a request that can still be answered, and answering it with silence
+    /// teaches a model that the id it invented was fine.
+    #[test]
+    fn playing_a_missing_node_is_refused() {
+        let mut tree = SceneTree::new();
+        let ghost = tree.insert(Mobject::new(vec![]));
+        tree.remove(ghost);
+        // `matches!` rather than `assert_eq!(.., Err(..))`: the `Ok` arm is a
+        // `Box<dyn Animation>`, which is neither `Debug` nor `PartialEq`, so the
+        // comparison has to be one-sided.
+        assert!(matches!(
+            animation_for(&tree, &spec(ghost, AnimationKind::FadeIn)),
+            Err(CommandError::NoSuchNode { target }) if target == ghost
+        ));
+    }
+
+    /// A `move_to` with no `to` has no destination, and the refusal says so rather
+    /// than playing nothing.
+    #[test]
+    fn a_move_to_without_a_destination_is_refused() {
+        let (tree, id) = scene_with_a_blank();
+        assert!(matches!(
+            animation_for(&tree, &spec(id, AnimationKind::MoveTo)),
+            Err(CommandError::OutOfRange { property, .. }) if property == "to"
+        ));
+    }
+
+    /// `duration: 0.0` is a legitimate instant snap and is accepted — Manim refuses
+    /// only `run_time < 0` (`animation/animation.py:175-181`). Negative is refused,
+    /// and so is non-finite, which Manim *does* accept and which has no honest
+    /// answer: an infinite duration holds the clock forever, and a NaN one makes
+    /// `age < duration` false, so the animation vanishes after a single frame.
+    #[test]
+    fn a_duration_that_is_negative_or_not_a_number_is_refused() {
+        let (tree, id) = scene_with_a_blank();
+        let with = |d: f64| {
+            let mut what = spec(id, AnimationKind::FadeIn);
+            what.duration = Some(d);
+            animation_for(&tree, &what)
+        };
+
+        assert!(with(0.0).is_ok(), "an instant snap is legitimate");
+        for bad in [-1.0, f64::INFINITY, f64::NAN] {
+            assert!(
+                matches!(
+                    with(bad),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == "duration"
+                ),
+                "{bad} must be refused"
+            );
+        }
     }
 }

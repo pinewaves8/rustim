@@ -33,14 +33,14 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-16: **246 unit tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **269 unit tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all six golden scenes match their checked-in
 baselines, and `rustim-app --png out.png` reproduces the Manim reference frame with an **identical
 content bounding box** (`343,90,936,629`); only 0.012% of pixels differ by more than 2/255, and none
 by more than 8. See `方案建议.md` §5.2. The count is not decoration — every one of those claims is
-re-run by the commands below, and the P1 rows in the roadmap say which step last moved it.
+re-run by the commands below, and the P2 rows in the roadmap say which step last moved it.
 
 ## What rustim is
 
@@ -244,7 +244,7 @@ last property.
 | `rustim-math` | Points, `Affine2`, rate functions, the `Viewport` world→screen transform, and literal ports of Manim's `bezier` / `space_ops` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree`, stable `NodeId`, shape builders, `critical_point`, `world_anchors` | Real |
-| `rustim-anim` | `Animation` trait, `AnimationScheduler`, `FadeIn`, `MoveTo`, `Transform` | Real |
+| `rustim-anim` | `Animation` trait, `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `MoveTo`, `Transform`, `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait, `DrawList`, the `vello_cpu` backend | Real (CPU only) |
@@ -257,13 +257,38 @@ if the renderer ever grows a heavier surface, `DrawList` should move down instea
 ### The frame
 
 ```text
-winit event loop → Scene::update(dt) → SceneContext::build_draw_list(&mut DrawList)
+winit event loop → Scene::update(dt) → SceneContext::advance(dt) → AnimationScheduler::update
+                 → SceneContext::build_draw_list(&mut DrawList)
                  → Renderer::render(&DrawList) → softbuffer → screen
 ```
 
 `SceneContext::build_draw_list` is the only place world coordinates are materialised. Everything
 upstream mutates *local* points and an `Affine2`; the flattening step folds each mobject's transform
 together with its ancestors' and emits paths.
+
+### The timeline: three layers
+
+| Layer | Type | What it is |
+|---|---|---|
+| One state change | `Animation` | A pure function of `alpha` in `0.0..=1.0`; owns no clock |
+| What plays **now** | `AnimationScheduler` | Animations in parallel on one shared clock — Manim's `Scene.play(a, b)` |
+| What plays **later** | `Sequence` | A queue of beats, one after another — Manim's `construct()` body |
+
+The third layer exists only because rustim's loop cannot block. Manim's `construct()` *is* a list of
+`self.play(...)` calls (`scene/scene.py:1234-1240`) and each one renders its whole segment
+synchronously before returning (`manager.py:259-261`), so the blocking frame loop is the timeline.
+Here `construct` returns, so the same script has to be written down as data: `ctx.play(anim)` /
+`ctx.play_all([..])` / `ctx.wait(seconds)` append a beat, and `SceneContext::advance` plays them one
+at a time. `Wait` is a no-op `Animation`, exactly as upstream
+(`Scene.wait(d) == play(Wait(d))`, `scene.py:1242-1276`), which keeps "a beat is a set of
+animations" uniform — no separate gap type, and `is_playing` stays true *across* a pause.
+
+`AnimationScheduler`'s "one flat list, total `max(run_time)`, each child at `alpha = t /
+its own run_time`" (`scene.py:1017-1026`, `:1184-1186`, `:1714-1724`) **is** Manim's `play(*args)`
+semantics, so a beat reimplements nothing. What is not ported is `AnimationGroup` / `Succession`:
+Manim expresses sequence by *composing* animations into one whose `alpha` sweeps a rescaled internal
+timeline (`animation/composition.py:198-236`), which is a different feature (`lag_ratio` staggering)
+and would rescale the durations of the beats this engine plays at face value.
 
 ### The two structural changes relative to Manim
 
@@ -280,17 +305,31 @@ together with its ancestors' and emits paths.
 
 ### Core traits
 
-`Scene` — `construct(&mut self, ctx: &mut SceneContext)` declares the initial state;
-`update(&mut self, dt: f64, ctx: &mut SceneContext)` runs once per frame and may sequence stages by
-hand (the reference scene reveals one square per stage, gated on `ctx.animations.is_empty()`). This
-split is the real-time-loop architecture: Manim's `construct()` returns and the timeline is fixed;
-ours is called every frame forever.
+`Scene` — `construct(&mut self, ctx: &mut SceneContext)` declares the objects and scripts the opening
+beats with `ctx.play(..)`; `update(&mut self, dt: f64, ctx: &mut SceneContext)` runs once per frame.
+This split is the real-time-loop architecture: Manim's `construct()` blocks, so its timeline is fixed
+by the time it returns; ours is called once, and the loop then runs forever.
+
+`Scene::update`'s default is `ctx.advance(dt)` and a scene that overrides it **must still call
+`advance`** — draining the queue is the playback machine's one job, and a scene that called
+`ctx.animations.update(..)` directly instead would leave the queue undrained: a script that stalls on
+its first beat, which reads as a frozen frame. `TransformScene` is the canonical override: advance
+first, then react to `!ctx.is_playing()` (it relabels once the morph has *settled*, which is not the
+moment the morph was *queued* — that distinction was a bug in P2 step 2).
 
 `Animation` — `duration()`, `begin(&SceneTree)` (called once at start, so an animation can capture
 where its target actually is), `interpolate(alpha, &mut SceneTree)` with `alpha` in `0.0..=1.0`, and
 `rate_func()`. Easing is applied **inside** the animation, never by the scheduler.
 `AnimationScheduler` holds one shared clock and computes each animation's progress independently, so
 durations may differ and the shortest simply finishes first.
+
+**The clock is shared; the start is not.** `Running::started_at` records the clock when an animation
+was queued and progress is read as `elapsed - started_at`, so an animation added to a batch already
+in flight starts from its own zero. This is a bug fix, not a refinement: every scene used to call
+`animations.update(dt, ..)` and *then* `add`, so the first frame of every animation was delivered one
+frame too far along its own curve (`2·dt/d` instead of `dt/d`). No golden can see it — both ends clamp
+to 1.0 and the still is ten seconds in — which is why `an_animation_added_late_starts_from_its_own_zero`
+exists and states the counterfactual.
 
 `Renderer` — `resize`, `render(&DrawList)`, `pixels()`. The vello CPU and GPU backends expose an
 identical scene API, which is what makes this trait nearly free.
@@ -624,6 +663,12 @@ Issues the tutorial's sketches leave open, and where each stands now:
   unchanged. Refusals are `CommandError` values, never panics — a language model can reach every one
   of these code paths, so "that node does not exist" and "that value is out of range" have to be
   reportable.
+- **`Scene::update` calls `ctx.advance(dt)` first**, always. See "Core traits" for what a scene that
+  skips it does to the script.
+- **A scene owns no timeline state.** No `stage: usize`, no copy of "which beat are we on" — the
+  playback machine knows, and a second answer is a second thing to get wrong. What a scene keeps is
+  state the *machine cannot express*: `TransformScene`'s `settled`, which is about the beat being
+  over rather than about it being queued.
 - **No `Box::leak`, no global mutable state, no `unwrap()` on a size that came from a window.**
 
 ## Roadmap
@@ -735,7 +780,7 @@ Deferred, deliberately, and reported rather than dropped: `Formula::skipped_shap
 stroker) and any `FrameItem::Image`; per-run colour is not carried over (every glyph takes the
 engine's colour), link annotations are ignored, and `GroupItem::clip` is not applied — math nests
 groups for layout but does not clip them. macOS and Windows `formula` baselines are bootstrapped
-from the CI artifact like the other four scenes'.
+from the CI artifact like the other five scenes'.
 
 The two commands that catch the failure modes above are
 `cargo tree -p rustim-text -i skrifa@0.44.0` and `cargo tree -i ttf-parser` — **and the version is
@@ -798,6 +843,23 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   "两条直角边长 3.2 和 3.2 的直角三角形，面积 5.12" and the settled triangle as a 2.6-square of area
   6.76 — sizes measured honestly from the geometry, and both false. The kind is invisible in pixels
   (the two renders were byte-identical), so a golden can never catch it; `--inspect` is the tool.
+  **Step 3, `play()` — the sequence state machine — is done**, and it is the step that made the
+  pipeline above *writable*: `Sequence` (`rustim-anim::sequence`) queues beats, `SceneContext::play` /
+  `play_all` / `wait` append them, `SceneContext::advance` runs one at a time, and `Wait` makes a
+  pause an animation. Both hand-sequenced scenes were rewritten onto it and their `stage` counters
+  deleted; **the six goldens passed without reblessing**, which is the claim that sequencing moved
+  and the settled picture did not. Three things are worth carrying forward. **`Command::Play` became
+  real** — `SceneContext::handle` intercepts it (the tree-mutating commands stay in the pure
+  `command::apply`), `command::animation_for` does the wire→animation mapping and refuses a missing
+  node, a `move_to` with no `to`, and a negative or non-finite `duration` (`0.0` is a legitimate
+  instant snap; Manim refuses only `run_time < 0`). **`is_playing` is not `!animations.is_empty()`**:
+  the scheduler is empty for every frame a beat spends queued — including the frame right after
+  `construct` — so the `ANIMATION_DONE` announcement would have fired before the scene began.
+  **`AnimationScheduler` gained a per-animation `started_at`**, which fixed a real off-by-one frame
+  (see "Core traits"). Deliberately not ported: `AnimationGroup` / `Succession` / `lag_ratio` (a
+  *group* is one animation whose alpha sweeps a rescaled child timeline — sequential playback here is
+  a driver concept, and a beat's duration means what it says), and interrupting a running beat (a
+  command can only append; "stop that and do this instead" is a different, explicit command).
 - **P3+** — camera (pan/zoom/focus); video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration
@@ -808,6 +870,7 @@ The product is an AI explainer assistant, so the engine exposes a JSON command i
 ```json
 { "action": "add", "type": "circle", "params": { "radius": 2.0, "label": "leg a" } }
 { "action": "set", "target": 4294967299, "property": { "name": "opacity", "value": 0.5 } }
+{ "action": "play", "animation": { "target": 4294967299, "type": "fade_in", "duration": 0.6 } }
 ```
 
 `target` is a `NodeId`: an **opaque 64-bit integer**, not a small index (see the `slotmap` note above
@@ -817,6 +880,13 @@ optional human-readable `label`, which is what the accessibility layer speaks an
 may address instead of the opaque id. Every command returns a `StateDiff` (`created` / `modified` /
 `removed`), so a host learns the id of what it just added and a renderer learns exactly what to
 invalidate.
+
+`play` is the one command that **appends rather than mutates**: it queues an animation as the next
+beat of the same timeline a scene's own `ctx.play` writes into, which is what makes the picture a pure
+function of the command log — a host logs, replays and diffs a session, and gets the same frames. It
+therefore returns an **empty** `StateDiff`, and honestly so: a diff describes the tree, and queueing a
+beat does not change the tree, it changes what will happen to it. An interruption would be a *different*
+command, spelled out in the data; `play` cannot preempt what is already playing.
 
 Two wire-format invariants are load-bearing, both pinned by tests:
 - **Commands round-trip byte-for-byte.** `to_string(parse(json)) == json`. A host logs, replays and

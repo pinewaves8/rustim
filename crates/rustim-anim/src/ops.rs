@@ -5,11 +5,15 @@
 //! transform ([`MoveTo`]) — where the deferred transform pays off directly — and
 //! one that interpolates *point arrays* ([`Transform`], the morph), which is what
 //! puts Manim's `align_points` machinery to work.
+//!
+//! [`Wait`] is the fourth and has no shape at all: it writes nothing and only
+//! occupies the clock, which is exactly what makes a pause an animation like any
+//! other.
 
 use rustim_math::{Affine2, Point, bezier};
 use rustim_mobject::{Mobject, NodeId, SceneTree, Style};
 
-use crate::Animation;
+use crate::{Animation, RateFunc, rate};
 
 /// Fades an object in by driving its opacity.
 ///
@@ -279,6 +283,46 @@ impl Animation for Transform {
         m.opacity = lerp_scalar(start.from_opacity, self.target.opacity, alpha);
         m.style = Style::lerp(start.from_style, self.target.style, alpha);
         m.dirty.style = true;
+    }
+}
+
+/// A pause. It writes nothing; it only occupies the clock.
+///
+/// Manim's `Wait` (`animation/animation.py:584-638`), and `Scene.wait` is nothing
+/// but `play(Wait(run_time=duration))` (`scene/scene.py:1242-1276`). That is the
+/// whole reason this is an `Animation` rather than a scheduling special case: it
+/// keeps a beat uniformly "a set of animations", so the driver needs no separate
+/// notion of a gap, and "is something playing?" stays true *across* a pause rather
+/// than flickering to "finished" between the beats on either side of it.
+///
+/// `rate_func` is `linear`, Manim's default for this type (`:612`). Nothing
+/// observable follows from that — `interpolate` is empty, so every curve gives the
+/// same result — but it is the choice upstream made, and pinning it with one
+/// assertion is cheaper than leaving a future reader to work out whether the
+/// omission was meant.
+#[derive(Debug, Clone)]
+pub struct Wait {
+    duration: f64,
+}
+
+impl Wait {
+    /// A pause of `seconds` of virtual time. Manim's default is 1.0
+    /// (`DEFAULT_WAIT_TIME`, `constants.py:178`), which is also what
+    /// `Scene.wait()` uses when called with no argument.
+    pub fn new(seconds: f64) -> Self {
+        Self { duration: seconds }
+    }
+}
+
+impl Animation for Wait {
+    fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    fn interpolate(&mut self, _alpha: f64, _tree: &mut SceneTree) {}
+
+    fn rate_func(&self) -> RateFunc {
+        rate::linear
     }
 }
 

@@ -119,23 +119,14 @@ fn fit_and_centre(objects: &mut [Mobject]) {
 ///
 /// The same figure the Manim reference renders (see `p0-spikes/`), which is what
 /// makes the two output images directly comparable.
-struct PythagoreanScene {
-    /// Which square is being revealed. The tutorial drives its stages off a
-    /// `state` + `timer` pair rather than a real timeline; keeping that here is
-    /// deliberate — it is the *real-time* sequencing model, and it is the part
-    /// that has no Manim equivalent.
-    stage: usize,
-    nodes: Vec<NodeId>,
-}
-
-impl PythagoreanScene {
-    fn new() -> Self {
-        Self {
-            stage: 0,
-            nodes: Vec::new(),
-        }
-    }
-}
+///
+/// The reveal is a list of `ctx.play` calls in `construct` — Manim's
+/// `construct()` body, written down — and no state at all: the playback machine
+/// knows which beat is playing, and a scene that kept its own copy would have two
+/// answers to one question. The tutorial drives this off a `state` + `timer` pair,
+/// which is what that split cost.
+#[derive(Default)]
+struct PythagoreanScene;
 
 impl Scene for PythagoreanScene {
     fn construct(&mut self, ctx: &mut SceneContext) {
@@ -186,22 +177,16 @@ impl Scene for PythagoreanScene {
         // Note this is all world-space arithmetic in Manim units — no pixel
         // constants anywhere in scene code, which is the fix for the tutorial's
         // unhandled coordinate system.
+        //
+        // One square per beat, in the group's own order, each starting where the
+        // last finished — so a slow frame makes the sequence *later*, never wrong.
+        // The reveal is `FadeIn` on an object that starts at `opacity = 0`
+        // (Manim's `FadeIn` draws the object from nothing, which is what this
+        // engine's opacity-driven fade reproduces).
         for mut obj in figure {
             obj.opacity = 0.0;
-            self.nodes.push(ctx.add(obj));
-        }
-    }
-
-    fn update(&mut self, dt: f64, ctx: &mut SceneContext) {
-        ctx.animations.update(dt, &mut ctx.tree);
-
-        // Reveal one square per 0.6 s, but only once the previous reveal has
-        // finished — so a slow frame makes the sequence *later*, never wrong.
-        if ctx.animations.is_empty() && self.stage < self.nodes.len() {
-            let id = self.nodes[self.stage];
-            ctx.animations
-                .add(rustim_anim::FadeIn::new(id).with_duration(0.6));
-            self.stage += 1;
+            let id = ctx.add(obj);
+            ctx.play(rustim_anim::FadeIn::new(id).with_duration(0.6));
         }
     }
 }
@@ -276,7 +261,14 @@ struct TransformScene {
     /// The donors, held so the scene owns them long enough to hand them over.
     /// Nothing about rendering reads them back.
     targets: Vec<Mobject>,
-    stage: usize,
+    /// Whether the post-timeline relabel has happened.
+    ///
+    /// The one piece of state this scene cannot do without: the relabel belongs to
+    /// the moment the morph *settles*, not to the moment it was queued — the same
+    /// distinction that made a bug in step 2, where the semantic tree was rebuilt
+    /// from the pre-morph state. A `play` call cannot express it, so it stays in
+    /// `update` and is guarded by [`SceneContext::is_playing`].
+    settled: bool,
 }
 
 impl TransformScene {
@@ -284,7 +276,7 @@ impl TransformScene {
         Self {
             sources: Vec::new(),
             targets: Vec::new(),
-            stage: 0,
+            settled: false,
         }
     }
 }
@@ -332,50 +324,51 @@ impl Scene for TransformScene {
             .with_label("直角三角形"),
         ];
 
-        self.sources.push(ctx.add(tri));
-        self.sources.push(ctx.add(sq));
+        let (a, b) = (ctx.add(tri), ctx.add(sq));
+        self.sources = vec![a, b];
+
+        // Two beats, each parallel: both shapes fade together, then both morph
+        // together. The second starts only once the first has drained, so a slow
+        // frame makes the sequence later and never starts a morph from a
+        // half-faded shape.
+        ctx.play_all(
+            self.sources
+                .iter()
+                .map(|id| rustim_anim::FadeIn::new(*id).with_duration(0.4)),
+        );
+        ctx.play_all(
+            self.sources
+                .iter()
+                .zip(self.targets.iter())
+                .map(|(id, target)| {
+                    rustim_anim::Transform::new(*id, target.clone()).with_duration(1.5)
+                }),
+        );
     }
 
     fn update(&mut self, dt: f64, ctx: &mut SceneContext) {
-        ctx.animations.update(dt, &mut ctx.tree);
+        // `advance` first, always: draining the queue is the playback machine's one
+        // job and a scene that skipped it would stall the whole script behind a
+        // frozen frame. Everything after this line is this scene reacting to the
+        // machine having finished.
+        ctx.advance(dt);
 
-        // Sequenced by hand, like the reference scene: the morph starts only once
-        // both fades have finished, so a slow frame makes the sequence later and
-        // never starts a morph from a half-faded shape.
-        if !ctx.animations.is_empty() {
+        // Reached once the morph has *settled*, not when it was queued — the
+        // difference step 2's relabel bug was made of, and one `play` call cannot
+        // express. `is_playing` rather than `animations.is_empty()`: the scheduler
+        // is momentarily empty between the two beats, and the fades alone would
+        // otherwise trip this.
+        if self.settled || ctx.is_playing() {
             return;
         }
-        match self.stage {
-            0 => {
-                for id in &self.sources {
-                    ctx.animations
-                        .add(rustim_anim::FadeIn::new(*id).with_duration(0.4));
-                }
-                self.stage = 1;
+        for (id, (label, kind)) in self.sources.iter().zip(SETTLED) {
+            if let Some(m) = ctx.tree.get_mut(*id) {
+                m.label = Some((*label).to_owned());
+                m.kind = kind;
+                m.dirty.semantic = true;
             }
-            1 => {
-                for (id, target) in self.sources.iter().zip(self.targets.iter()) {
-                    ctx.animations
-                        .add(rustim_anim::Transform::new(*id, target.clone()).with_duration(1.5));
-                }
-                self.stage = 2;
-            }
-            // Reached once the morph has finished, not when it was queued — the
-            // `is_empty` guard above is what makes that true.
-            2 => {
-                for (id, (label, kind)) in self.sources.iter().zip(SETTLED) {
-                    if let Some(m) = ctx.tree.get_mut(*id) {
-                        m.label = Some((*label).to_owned());
-                        m.kind = kind;
-                        m.dirty.semantic = true;
-                    }
-                }
-                self.stage = 3;
-            }
-            // Everything after that is the settled frame — which is what the
-            // headless `--png` path captures, ten seconds in.
-            _ => {}
         }
+        self.settled = true;
     }
 }
 
@@ -910,7 +903,7 @@ const DEFAULT_SCENE: &str = "pythagorean";
 /// comparisons against Manim still line up.
 fn scene_by_name(name: &str) -> Option<Box<dyn Scene>> {
     match name {
-        "pythagorean" => Some(Box::new(PythagoreanScene::new())),
+        "pythagorean" => Some(Box::new(PythagoreanScene)),
         "primitives" => Some(Box::new(PrimitivesScene)),
         "composite" => Some(Box::new(CompositeScene)),
         "text" => Some(Box::new(TextScene::new())),
@@ -1306,7 +1299,13 @@ impl ApplicationHandler<AppEvent> for App {
 
                 // An animation ending is the one change a blind user cannot poll
                 // for: the scene is identical on either side of it.
-                let animating = !self.ctx.animations.is_empty();
+                //
+                // `is_playing`, not the scheduler: the scheduler is empty for every
+                // frame a beat spends queued — including the frame right after
+                // `construct`, and the frame between two beats — and each of those
+                // would otherwise announce that the scene had finished before it
+                // had started. See `SceneContext::is_playing`.
+                let animating = self.ctx.is_playing();
                 if self.was_animating
                     && !animating
                     && let Some(w) = self.windowed.as_mut()
