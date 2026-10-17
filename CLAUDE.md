@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **919 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **938 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -65,7 +65,9 @@ pixel, a scripted `add` of `text` / `formula` / `group` builds real objects thro
 `Typesetter` (the desktop `hello` advertises all **12** shapes; the plain browser page advertises
 ten, the formula page eleven), `check` answers a clean scene with an empty `findings` array and a
 broken one with the findings that names the node and the timeline problem it measured (see "The
-linter"), and `rustim-app --png out.png` reproduces the
+linter"), a lecture plan is pre-flighted before its first sentence, stepped, rewound to any boundary
+and reported on — through the real binary, over the wire (see "Scene plans"), and `rustim-app --png
+out.png` reproduces the
 Manim reference frame with an **identical content bounding box** (`343,90,936,629`); only 0.012% of
 pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The browser host
 builds both ways (with and without Typst) and was **run in Chrome 151**, where its canvas matches the
@@ -376,7 +378,7 @@ last property.
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it), `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts), `templates` (the `explain.*` thick tools: one group, addressable pieces, a declared box and an atomic rollback) and `check` (the linter: pure frame checks plus timeline pacing — see "The linter") | Real |
-| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the linter lives in `rustim-scene::check` for the same reason `handle` owns the arm — only the context holds the viewport and the queued timeline. `ScenePlan` is deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; all six templates live one crate up) |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the linter lives in `rustim-scene::check` for the same reason `handle` owns the arm — only the context holds the viewport and the queued timeline. `ScenePlan` also lives in `rustim-scene` (`plan.rs` for the document, `context.rs` for the executor), because a plan step runs commands and queues beats and both of those are the context's. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; all six templates and the plan executor live one crate up) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -738,6 +740,72 @@ contrast floor, a camera zoom clearing an out-of-frame finding, a child overlapp
 being reported, a fully faded object reporting nothing, and the report's field order), five context
 tests, a conformance case through the real binary, and — the point of the whole feature — **all
 eight goldens unchanged**: a read draws nothing.
+
+### Scene plans
+
+A lecture an AI composes is not a bag of commands — it is an ordered set of **steps**, each saying
+something, arranging something and moving something. `rustim_scene::plan` makes that a **document**
+the engine can pre-flight, return to, replay and be asked "where are we?" about. That is the four
+capabilities `贾维斯集成方案.md` §5.3 named — 可预演、可回退、可重放、可被实时模型导航 — and they
+are the difference between a command log and a plan.
+
+The wire is four actions: `plan.load` (a document), `plan.next`, `plan.goto` (an index) and
+`plan.status`. A step is `say` (a line, queued on the narration track due now — so it reaches the
+live region, the caption band and the `.srt` for free), `ops` (primitive commands applied in order,
+the same vocabulary a `batch` accepts, including layout and the six `explain.*` templates) and
+`beats` (animation specs queued as successive beats; parallel motion inside one beat is one
+`group`, which is how the timeline has always spelled it). Every part is optional, but a step with
+none of them is refused: it does nothing, and a model that generated one has a bug worth hearing
+before the lecture runs.
+
+Five properties are load-bearing:
+
+- **`plan.load` is a pre-flight, not a stored blob.** `Plan::check_shape` refuses a non-empty
+  document with an empty step, a `say` that trims to nothing, and any read command (`query`,
+  `check`, `hello`, `batch`, `validate`, `plan.*`) inside an `ops` list — reusing `member_refusal`,
+  so "what can be in a batch" has one answer. Every step is then **dry-run** against a scratch
+  copy of the session through the same `handle` a live command reaches, so a label no earlier step
+  created, a malformed animation or a missing `into` is refused under `steps[i].ops[j]` /
+  `steps[i].beats[j]` **before the first sentence**. What the dry run cannot see is an animation's
+  *end state* — a `fade_out`'s removal lives in `finish`, not in its spec — and that refusal
+  arrives at `plan.next` instead, at the same path. The blind spot is documented rather than
+  papered over, and a test drives it.
+- **Loading stops the timeline and baselines the settled picture.** The baseline is
+  `{ tree, clock }` as they are after `stop()`; a beat captured a tree the restore would replace,
+  so leaving one running would make `goto` meaningless. Loading **replaces** any previous plan and
+  its baseline, and the undo stack is deliberately not consulted — a checkpoint taken before a load
+  knows nothing of the plan, so the two histories stay independent.
+- **`plan.next` is not a transaction**, for `batch`'s reason: ops run in order, beats are built
+  only after them (a beat may name a label a step's own op creates), a refusal leaves the earlier
+  ops applied and the cursor where it was — and `plan.goto(cursor)` is the recovery, rebuilding
+  the step's boundary from the baseline. The reply is the net diff, empty for a step that only
+  speaks and animates, because queueing is not a tree mutation.
+- **`plan.goto(n)` is a function of `n` and the plan.** It restores the baseline tree (retiring
+  the abandoned present's ids, so a stale handle is `no_such_node` rather than a different object
+  wearing the id), restores the clock, and replays steps `0..n` with every beat driven through
+  the **reduced-motion path** — `begin`, `ease(1.0)`, `interpolate`, `finish`. Using the
+  scheduler's own settled path rather than spelling those four calls here is what makes a
+  `FadeOut`/`Uncreate` actually remove its target during a replay; hand-rolled settling would
+  leave ghost nodes. It is **silent** (a restore is not a re-performance, so a replay's `say`s are
+  dropped and the narration track is put back), it interrupts playback, and it leaves pause,
+  tempo, motion mode, event subscription and the checkpoint stack alone — those are the viewer's
+  policy, not the lecture's position. `goto(0)` is the baseline; `goto(total)` is the end. A
+  refusal mid-replay rolls the picture, the clock and the narration back and answers
+  `InPlanStep`; the cursor does not move.
+- **`plan.status` never refuses.** "There is no plan" is `loaded: false` — the answer the caller
+  asked for — not an error, so a host can poll it from the first frame. `say` is the *next* step's
+  line, and `playing` is `is_playing()` (the queue's or the scheduler's), which is the honest
+  answer to "is the picture still moving" while a step's beats play out.
+
+The reply shape is the sixth presence, `plan` (see "The feed"); `plan.load`, `plan.next` and
+`plan.goto` answer a `diff` like every mutating command. The three refusals are `no_plan`,
+`plan_finished` and `in_plan_step { step, member }`; an out-of-range `goto` is `OutOfRange` under
+`step`, and a malformed document is `OutOfRange` under `plan.steps` / `steps[i].say` /
+`steps[i].ops[j]` / `steps[i].beats[j]`, so the index names the mistake rather than the verb.
+
+Deliberately not a plan: **named cues** (`at_ms` marks for a host's event loop — a step boundary is
+already observable through `plan.status` and the event stream already reports `beat_started`), and
+narrating a `goto` replay.
 
 ### The timeline: three layers
 
@@ -2169,9 +2237,10 @@ case through the real binary that reads the group, the caption and a tick label 
 two-piece count. `ACTIONS` 26 → 27. **All eight goldens are unchanged**, and the count moved
 846 → 856.
 
-Deferred, and named so they are not rediscovered as gaps: labels that *follow* their subject, the
-linter (out of frame, overlap, size, contrast, pacing) and `ScenePlan`. All six `explain.*`
-templates have landed (`algorithm` was the last). Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
+Deferred, and named so they are not rediscovered as gaps: labels that *follow* their subject. The
+linter (out of frame, overlap, size, contrast, pacing) and the declarative `ScenePlan` were on this
+list and have both since landed (see "The linter" and "Scene plans"); all six `explain.*`
+templates landed too (`algorithm` was the last). Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
 arrow is a static node placed once; re-placing it is a `point_at` again, and following would need a
 per-frame constraint the tree does not have), and spotlight-beyond-opacity (a true mask over the
 rest of the scene). Several subjects at once is a `group` — `target` names one node, and the group's
@@ -3014,8 +3083,8 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   tests, two round-trip fixtures and the extended conformance case; `ACTIONS` 24 → 25. **All eight
   goldens are unchanged**, and the count moved 836 → 842.
   Deliberately deferred at the time: labels that follow their subject, the remaining `explain.*`
-  templates, the linter and `ScenePlan`. The templates and the linter have all since landed;
-  `ScenePlan` has not.
+  templates, the linter and `ScenePlan`. The templates, the linter and `ScenePlan` have all since
+  landed; only following labels remain deferred.
 - **Phase 2's fifth slice — the first template, `explain.equation` — is done.** The `explain.*` thick
   tools now exist as a layer (`rustim-scene::templates`), and the first one compiles a formula, styles
   it, measures its world bottom and hangs an optional typeset caption one `DEFAULT_GAP` below it, all
@@ -3187,6 +3256,28 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   off-frame plus a 0.05 s beat and two narration lines, all named, with a following `query` still a
   tree), and the round-trip fixture; `ACTIONS` 31 → 32. **All eight goldens unchanged** — a linter
   reads the frame and draws nothing — count 892 → 919.
+- **Phase 2's final slice — the declarative lecture plan (`plan.*`) — is done**, and it is the item
+  that makes a lecture a *document* rather than a command log. `rustim_scene::plan` holds `Plan`,
+  `PlanStep`, `PlanStatus` and the shape check; `SceneContext` holds the executor
+  (`plan_load`/`plan_next`/`plan_goto`/`plan_status`); `handle` answers `plan.status` with the sixth
+  reply presence, `CommandOutcome::Planned`, while the other three reply a diff like any mutating
+  command. See "Scene plans" for the contract. Three semantics are the point. **Loading is a
+  pre-flight**: every step is dry-run against a scratch session through the same `handle` a live
+  command reaches, so a bad label, a malformed beat or a read verb inside `ops` is refused under
+  `steps[i].ops[j]` before the first sentence — with the documented blind spot that an animation's
+  *end state* is not simulated, so a removal a later op depends on surfaces at `plan.next` instead.
+  **`plan.goto` replays through the reduced-motion path**, `begin`/`ease(1.0)`/`interpolate`/`finish`
+  via a drained queue, so it is a function of its index, it restores the clock, and a `FadeOut`
+  during a replay really removes its node rather than leaving a ghost. **A refused `goto` rolls the
+  tree, clock and narration back and leaves the cursor**; `plan.next` is not a transaction and says
+  so. Evidence: seven `plan.rs` shape/fixture tests, ten `context.rs` execution tests (the dry run's
+  blind spot reaching `InPlanStep` at `goto`, rollback, the settled removal, a settled
+  baseline taken from a stopped beat, a beat naming a label its own op created, `reset` dropping the
+  plan with the tree), a client test reading the sixth half, four round-trip fixtures, and a
+  conformance case through the real binary that walks a two-step plan — load, next, status, goto
+  back and forward, `plan_finished`, an out-of-range step, and a refused reload that leaves the
+  running plan intact. `ACTIONS` 32 → 36. **All eight goldens unchanged** — a plan drives the
+  timeline and draws nothing new — count 919 → 938.
 
 ## AI integration
 
@@ -3212,7 +3303,7 @@ the AI surface" below.
 session. It does not touch the tree; it answers with a `capabilities` document — the protocol version,
 the engine's version string, and the exact action / shape / animation / property / rate names this
 build accepts, plus its limits and two advisory profiles. The lists are **derived from serde over the
-same enums the parser uses** — `actions` from `Command::action_name` (32 verbs), `PROPERTY_NAMES`,
+same enums the parser uses** — `actions` from `Command::action_name` (36 verbs), `PROPERTY_NAMES`,
 `AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` for the nouns — so an advertised name is
 accepted by construction, and a conformance test feeds every advertised word back through the binary
 (see `crates/rustim-app/tests/conformance.rs`). A new variant that misses its `ALL`/name table fails a
@@ -3432,12 +3523,13 @@ success and the identical error on failure. The scheduler and narration track ar
 copied — a queued animation captured its start and is not replayable data, and a dry run must not
 speak.
 
-`CommandOutcome` is the in-memory vocabulary that keeps the four answers apart —
-`Applied(StateDiff)`, `Queried(SemanticTree)`, `Checked(CheckReport)` and `Greeted(Capabilities)` —
-and `reply_line` is the only thing that turns it into JSON, so the desktop feed and the browser
-bridge cannot answer one command two different ways. The hook fires only for `Applied`: a scene that
-re-fitted itself on every read would do work the question did not ask for, a lint changes nothing,
-and a greeting changes nothing at all.
+`CommandOutcome` is the in-memory vocabulary that keeps the five answers apart —
+`Applied(StateDiff)`, `Queried(SemanticTree)`, `Checked(CheckReport)`, `Planned(PlanStatus)` and
+`Greeted(Capabilities)` — and `reply_line` is the only thing that turns it into JSON, so the desktop
+feed and the browser bridge cannot answer one command two different ways. The hook fires only for
+`Applied`: a scene that re-fitted itself on every read would do work the question did not ask for, a
+lint changes nothing, a plan status is a read of the planner rather than of the tree, and a greeting
+changes nothing at all.
 
 Two wire-format invariants are load-bearing, both pinned by tests:
 - **Commands round-trip byte-for-byte.** `to_string(parse(json)) == json`. A host logs, replays and
@@ -3663,13 +3755,14 @@ of I/O and of a JSON parser (it compiles to wasm).
   every human-facing line the binary prints (`wrote out.png (1280x720)`, the frame-rate line) moves to
   stderr (`main::note`). A host cannot skip a line it did not expect.
   `{"seq":1,"diff":{"created":[4294967297],"modified":[],"removed":[]}}` — **exactly one of `diff`,
-  `tree`, `report`, `capabilities` and `error` is present**, and the presence is the discriminant.
-  `created` is the only way to learn the id of what was just created; a `play` gets a
+  `tree`, `report`, `plan`, `capabilities` and `error` is present**, and the presence is the
+  discriminant. `created` is the only way to learn the id of what was just created; a `play` gets a
   present-but-**empty** diff, because queueing a beat changes nothing in the tree; a `query` gets a
   `tree` and no diff at all, because an empty diff would read as a mutation that did nothing; a
   `check` gets a `report` — the empty-findings array is itself the clean answer, so “checked and
-  clean” is distinguishable from “did not ask”; a `hello` gets `capabilities` and none of the other
-  four, because a handshake is not a read of the tree.
+  clean” is distinguishable from “did not ask”; a `plan.status` gets a `plan`, and `loaded: false`
+  is a legal answer for the same reason; a `hello` gets `capabilities` and none of the other five,
+  because a handshake is not a read of the tree.
 - **`seq` is the 1-based *physical* line number**, blank lines included, so a human reading a log and a
   host reading the stream count the same way. A blank line is skipped silently and produces no reply.
 - **Every reply is flushed before the next line is read.** A file source is read whole; `-` is stdin,

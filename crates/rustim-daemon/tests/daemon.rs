@@ -113,12 +113,12 @@ fn code(frame: &Value) -> i64 {
         .unwrap_or_else(|| panic!("no transport error: {frame}"))
 }
 
-/// The protocol's reply half of a result: exactly one of the five keys.
+/// The protocol's reply half of a result: exactly one of the six keys.
 fn half(result: &Value) -> &'static str {
-    ["diff", "tree", "report", "capabilities", "error"]
+    ["diff", "tree", "report", "plan", "capabilities", "error"]
         .into_iter()
         .find(|key| result.get(*key).is_some())
-        .unwrap_or_else(|| panic!("a reply carries one of five halves: {result}"))
+        .unwrap_or_else(|| panic!("a reply carries one of six halves: {result}"))
 }
 
 async fn attach(client: &mut Client, id: u64, params: Value) -> Value {

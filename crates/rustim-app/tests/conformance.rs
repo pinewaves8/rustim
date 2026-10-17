@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (32 actions, 12 shapes, 11 animations, 10
+//!    the build actually has (36 actions, 12 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -25,6 +25,9 @@
 //! 7. a command list is one command: `batch` answers with its net diff,
 //!    `validate` with an empty one, and a refusal in the middle names the
 //!    member without stopping the feed.
+//! 8. a lecture plan is a document: `plan.load` validates it, `plan.next` runs
+//!    one step, `plan.goto` restores a boundary, and `plan.status` answers in
+//!    its own reply half — navigable by position, not by replaying commands.
 //!
 //! Each test owns a distinct PNG path: two tests must never render to the same
 //! artifact path (the golden suite learned this the hard way — see `CLAUDE.md`),
@@ -119,10 +122,11 @@ fn expect_diff(client: &mut StdioClient, line: &str) -> rustim_scene::command::S
     let Some(diff) = reply.diff else {
         panic!(
             "{line} was not answered with a diff (reply seq {}, tree {}, report {}, \
-             capabilities {})",
+             plan {}, capabilities {})",
             reply.seq,
             reply.tree.is_some(),
             reply.report.is_some(),
+            reply.plan.is_some(),
             reply.capabilities.is_some()
         );
     };
@@ -157,7 +161,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 32, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 36, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -394,6 +398,155 @@ fn check_reports_what_the_frame_and_the_timeline_get_wrong() {
         .send_raw(r#"{"action":"query","target":"方块"}"#)
         .expect("a query is a reply");
     assert!(after.tree.is_some());
+
+    finish(client, &png);
+}
+
+/// A lecture plan is a document the wire can preview, navigate and report on:
+/// `plan.load` validates every step before the first sentence, `plan.next`
+/// runs one, `plan.goto` restores a boundary, and `plan.status` answers in a
+/// half of its own.
+///
+/// The four capabilities are asserted where a client sees them — in replies and
+/// in the tree a `query` reads back — because the point of the plan is that an
+/// assistant can drive a lecture by position rather than by replaying a log.
+#[test]
+fn a_plan_is_loaded_navigated_and_reported_through_the_wire() {
+    let (mut client, png) = client("plan");
+
+    // No plan is a report, not a refusal: the sixth reply presence exists so
+    // that "where are we?" has an answer before anything is loaded.
+    let reply = client
+        .send_raw(r#"{"action":"plan.status"}"#)
+        .expect("a status is a reply");
+    let status = reply.plan.expect("a plan status");
+    assert!(!status.loaded);
+    assert_eq!((status.steps, status.cursor), (0, 0));
+    assert!(status.say.is_none() && status.label.is_none());
+    assert!(reply.diff.is_none() && reply.tree.is_none() && reply.error.is_none());
+
+    // Driven with no plan, the two mutating verbs answer two different
+    // mistakes: there is nothing to advance and nothing to restore.
+    let reply = client
+        .send_raw(r#"{"action":"plan.next"}"#)
+        .expect("a refusal is a reply");
+    assert!(
+        matches!(reply.error, Some(rustim_client::CommandError::NoPlan)),
+        "{reply:?}"
+    );
+    let reply = client
+        .send_raw(r#"{"action":"plan.goto","step":0}"#)
+        .expect("a refusal is a reply");
+    assert!(matches!(
+        reply.error,
+        Some(rustim_client::CommandError::NoPlan)
+    ));
+
+    // A load is a pre-flight, and its reply is an empty diff: a plan is
+    // navigation over the tree, not a node in it.
+    let diff = expect_diff(
+        &mut client,
+        concat!(
+            r#"{"action":"plan.load","plan":{"label":"渐入","steps":["#,
+            r#"{"say":"先放一个方块","ops":[{"action":"add","type":"square","params":{"label":"方块"}}]},"#,
+            r#"{"say":"再让它出现","beats":[{"target":"方块","type":"fade_in","duration":0.5}]}"#,
+            r#"]}}"#,
+        ),
+    );
+    assert!(diff.is_empty(), "loading is navigation: {diff:?}");
+
+    let reply = client
+        .send_raw(r#"{"action":"plan.status"}"#)
+        .expect("a status is a reply");
+    let status = reply.plan.expect("a plan status");
+    assert!(status.loaded);
+    assert_eq!(status.label.as_deref(), Some("渐入"));
+    assert_eq!((status.steps, status.cursor), (2, 0));
+    assert_eq!(status.say.as_deref(), Some("先放一个方块"));
+    assert!(!status.playing);
+
+    // `next` runs step 0: its op creates the square, and the diff names it —
+    // a step's ops are the one plan mutation that returns ids.
+    let diff = expect_diff(&mut client, r#"{"action":"plan.next"}"#);
+    assert_eq!(diff.created.len(), 1, "{diff:?}");
+    assert!(diff.modified.is_empty() && diff.removed.is_empty());
+
+    // The label the step created resolves through the ordinary query, and the
+    // status has moved on to the next step's line.
+    let reply = client
+        .send_raw(r#"{"action":"query","target":"方块"}"#)
+        .expect("a query is a reply");
+    assert!(reply.tree.is_some(), "step 0's op was applied: {reply:?}");
+    let reply = client
+        .send_raw(r#"{"action":"plan.status"}"#)
+        .expect("a status is a reply");
+    let status = reply.plan.expect("a plan status");
+    assert_eq!(status.cursor, 1);
+    assert_eq!(status.say.as_deref(), Some("再让它出现"));
+
+    // `goto(0)` is the baseline: the creation is undone, and the answer says
+    // so in the diff rather than only in the picture.
+    let diff = expect_diff(&mut client, r#"{"action":"plan.goto","step":0}"#);
+    assert_eq!(diff.removed.len(), 1, "{diff:?}");
+    let reply = client
+        .send_raw(r#"{"action":"query","target":"方块"}"#)
+        .expect("a refusal is a reply");
+    assert!(reply.error.is_some(), "goto(0) undid step 0");
+
+    // `goto(2)` replays both steps with their beats settled, so the lecture's
+    // end is reachable without waiting for it to play.
+    let diff = expect_diff(&mut client, r#"{"action":"plan.goto","step":2}"#);
+    assert_eq!(diff.created.len(), 1, "{diff:?}");
+    let reply = client
+        .send_raw(r#"{"action":"query","target":"方块"}"#)
+        .expect("a query is a reply");
+    assert!(reply.tree.is_some(), "the replay recreated the square");
+    let status = client
+        .send_raw(r#"{"action":"plan.status"}"#)
+        .expect("a status is a reply")
+        .plan
+        .expect("a plan status");
+    assert_eq!((status.steps, status.cursor), (2, 2));
+    assert!(status.say.is_none(), "the lecture is over");
+
+    // Past the end: finished and out of range are different answers.
+    let reply = client
+        .send_raw(r#"{"action":"plan.next"}"#)
+        .expect("a refusal is a reply");
+    assert!(matches!(
+        reply.error,
+        Some(rustim_client::CommandError::PlanFinished)
+    ));
+    let reply = client
+        .send_raw(r#"{"action":"plan.goto","step":3}"#)
+        .expect("a refusal is a reply");
+    match reply.error.expect("a step past the end") {
+        rustim_client::CommandError::OutOfRange { property, detail } => {
+            assert_eq!(property, "step");
+            assert!(detail.contains('3'), "{detail}");
+        }
+        other => panic!("a range error names its field: {other:?}"),
+    }
+
+    // A bad plan is refused at load time, under the path the client wrote, and
+    // the lecture already loaded is left exactly where it was.
+    let reply = client
+        .send_raw(
+            r#"{"action":"plan.load","plan":{"steps":[{"say":"一","beats":[{"target":"不存在","type":"fade_in"}]}]}}"#,
+        )
+        .expect("a refusal is a reply");
+    let error = format!("{}", reply.error.expect("a missing label"));
+    assert!(error.contains("steps[0].beats[0]"), "{error}");
+    let status = client
+        .send_raw(r#"{"action":"plan.status"}"#)
+        .expect("a status is a reply")
+        .plan
+        .expect("a plan status");
+    assert_eq!(
+        (status.label.as_deref(), status.cursor),
+        (Some("渐入"), 2),
+        "a refused load replaced the running lecture"
+    );
 
     finish(client, &png);
 }

@@ -3,8 +3,8 @@
 //! This crate is the *client half* of [`rustim_scene::command`], and nothing
 //! else. It turns a [`Command`] into one JSON line, reads the one reply line
 //! back, and checks the two framing rules the protocol states — one reply per
-//! command line, exactly one of `diff` / `tree` / `report` / `capabilities` /
-//! `error` present — so every consumer gets the same conformance check rather than each
+//! command line, exactly one of `diff` / `tree` / `report` / `plan` /
+//! `capabilities` / `error` present — so every consumer gets the same conformance check rather than each
 //! reimplementing it.
 //!
 //! **Why it exists.** The AI layer is not in this repository (see
@@ -45,6 +45,7 @@ pub use rustim_scene::command::{
     Capabilities, Command, CommandError, CommandOutcome, CommandReply, PROTOCOL_VERSION,
     parse_command, reply_line,
 };
+pub use rustim_scene::{Plan, PlanStatus, PlanStep};
 
 /// Read exactly one reply line.
 ///
@@ -83,6 +84,7 @@ pub fn read_reply<R: BufRead>(reader: &mut R) -> io::Result<CommandReply> {
             reply.diff.is_some(),
             reply.tree.is_some(),
             reply.report.is_some(),
+            reply.plan.is_some(),
             reply.capabilities.is_some(),
             reply.error.is_some(),
         ]
@@ -93,7 +95,8 @@ pub fn read_reply<R: BufRead>(reader: &mut R) -> io::Result<CommandReply> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "a reply must carry exactly one of diff/tree/report/capabilities/error: {text}"
+                    "a reply must carry exactly one of \
+                     diff/tree/report/plan/capabilities/error: {text}"
                 ),
             ));
         }
@@ -323,8 +326,9 @@ mod tests {
         assert_eq!(reply.capabilities, Some(caps));
     }
 
-    /// A lint is the fifth half, and an empty report is a legal answer: the
-    /// reader counts the *field*, not how much is in it.
+    /// A lint is the fifth half and a plan status the sixth, and both are legal
+    /// answers with nothing in them: the reader counts the *field*, not how
+    /// much is in it.
     #[test]
     fn a_check_is_read_as_a_report() {
         let line =
@@ -333,5 +337,24 @@ mod tests {
         let reply = read_reply(&mut input).unwrap();
         assert_eq!(reply.report, Some(CheckReport::default()));
         assert!(reply.diff.is_none() && reply.tree.is_none());
+    }
+
+    /// A plan status is the sixth half, and `loaded: false` is a legal answer:
+    /// "there is no plan" is a report, not a refusal.
+    #[test]
+    fn a_plan_status_is_read_as_a_plan() {
+        let status = PlanStatus {
+            loaded: false,
+            label: None,
+            steps: 0,
+            cursor: 0,
+            say: None,
+            playing: false,
+        };
+        let line = serde_json::to_string(&CommandReply::planned(1, status.clone())).unwrap();
+        let mut input = Cursor::new(format!("{line}\n"));
+        let reply = read_reply(&mut input).unwrap();
+        assert_eq!(reply.plan, Some(status));
+        assert!(reply.diff.is_none() && reply.tree.is_none() && reply.report.is_none());
     }
 }

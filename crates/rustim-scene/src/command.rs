@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::a11y::SemanticTree;
 use crate::check::CheckReport;
 use crate::event::EventKind;
+use crate::plan::{Plan, PlanStatus};
 use rustim_anim::{
     Animate, Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale,
     StyleProperty, Succession, TransformGroup, Uncreate, WithRate,
@@ -796,11 +797,13 @@ pub enum Command {
     /// or a [`Command::Validate`] of the same list first.
     ///
     /// Only primitive commands may be members. `hello` (which answers with
-    /// capabilities), `query` (a tree), and `batch` / `validate` themselves (a
-    /// reply cannot carry a list of replies) are refused **before anything
-    /// runs**, so a structurally invalid batch is atomic: nothing is applied.
-    /// An empty `commands` is refused under that field, because "do nothing" is
-    /// spelled by sending nothing.
+    /// capabilities), `query` (a tree), `check` (a report), `plan.status` (a
+    /// plan), and `batch` / `validate` themselves (a reply cannot carry a list
+    /// of replies) are refused **before anything runs**, so a structurally
+    /// invalid batch is atomic: nothing is applied. The table is
+    /// [`member_refusal`], shared with a plan step's `ops`. An empty `commands`
+    /// is refused under that field, because "do nothing" is spelled by sending
+    /// nothing.
     Batch { commands: Vec<Command> },
     /// Dry-run a command list: apply it to a copy, report only what would fail.
     ///
@@ -960,6 +963,51 @@ pub enum Command {
     /// it measured, so a host that disagrees can filter the report; a second
     /// configurable threshold table would be a second answer to one question.
     Check,
+    /// Load a declarative lecture plan, replacing any loaded one.
+    ///
+    /// Loading is a **pre-flight**: the document's shape is checked and every
+    /// step is dry-run against a scratch copy of the session, so a bad label, a
+    /// malformed animation or an op with no reply is refused before the lecture
+    /// starts. See [`crate::plan`] for what is and is not simulated.
+    ///
+    /// The tree does not change, so the reply is a present-but-empty
+    /// [`StateDiff`] — the same answer a `play` gets. Playback is **stopped**,
+    /// for the same reason an `undo` interrupts: the loaded plan owns the
+    /// timeline from here, and the baseline `plan.goto` returns to is taken
+    /// now. The baseline is the plan's own, independent of `checkpoint`/`undo`.
+    #[serde(rename = "plan.load")]
+    PlanLoad { plan: Plan },
+    /// Run the plan's next step: apply its ops, say its line, queue its beats.
+    ///
+    /// The cursor advances only if everything succeeded; a refusal leaves the
+    /// cursor where it was and is located by
+    /// [`CommandError::InPlanStep`]. A step's ops are not a transaction, for
+    /// `batch`'s reason — ops before the refusal stay applied, and
+    /// `plan.goto(cursor)` rebuilds the boundary.
+    ///
+    /// With no plan loaded the answer is [`CommandError::NoPlan`]; with the
+    /// cursor at the end, [`CommandError::PlanFinished`].
+    #[serde(rename = "plan.next")]
+    PlanNext,
+    /// Rebuild the picture at the start of step `step`, without saying anything.
+    ///
+    /// The tree is the load-time baseline plus steps `0..step` replayed with
+    /// their beats settled instantly, and the clock is restored to the
+    /// baseline's — so the result is a function of the argument and the plan,
+    /// not of what the session was doing. `step == steps` is the lecture's end.
+    /// The pause, the tempo and the motion mode are the viewer's policy and are
+    /// left alone. See [`crate::plan`] for the full contract.
+    #[serde(rename = "plan.goto")]
+    PlanGoto { step: usize },
+    /// Report where the lecture is: loaded, steps, cursor, the next `say`, and
+    /// whether the timeline is busy.
+    ///
+    /// The sixth reply presence: answered with a [`PlanStatus`] rather than a
+    /// diff or a tree, because neither describes a lecture's position. It is a
+    /// report and not a refusal when no plan is loaded — "there is no plan" is
+    /// the answer to the question.
+    #[serde(rename = "plan.status")]
+    PlanStatus,
 }
 
 /// Every action name the wire accepts, alphabetically.
@@ -995,6 +1043,10 @@ pub const ACTIONS: &[&str] = &[
     "narrate",
     "next_to",
     "pause",
+    "plan.goto",
+    "plan.load",
+    "plan.next",
+    "plan.status",
     "play",
     "point_at",
     "query",
@@ -1050,6 +1102,10 @@ impl Command {
             Self::Events { .. } => "events",
             Self::Query { .. } => "query",
             Self::Check => "check",
+            Self::PlanLoad { .. } => "plan.load",
+            Self::PlanNext => "plan.next",
+            Self::PlanGoto { .. } => "plan.goto",
+            Self::PlanStatus => "plan.status",
         }
     }
 }
@@ -1599,10 +1655,9 @@ pub struct Limits {
 ///   **every** build, because they are tree work that needs no external
 ///   provider: the layout actions (`next_to`, `arrange`, `fit`), the attention
 ///   actions (`highlight`, `point_at`, `annotate`), the six `explain.*`
-///   templates and the linter (`check`). A template that needs a typesetter
-///   refuses under `text` rather than disappearing from the list. `ScenePlan`
-///   is the one tool still planned; a client checks `actions` for it, where it
-///   is absent today, and the profile's meaning only grows.
+///   templates, the linter (`check`) and the declarative plan
+///   (`plan.load`/`next`/`goto`/`status`). A template that needs a typesetter
+///   refuses under `text` rather than disappearing from the list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     /// The protocol version this reply describes — the same
@@ -1758,6 +1813,35 @@ pub enum CommandError {
     /// [`CommandError::NoSuchNode`]: a host reading a log has to tell a model's
     /// mistake from the session's history.
     NoCheckpoint,
+    /// There is no scene plan to play, rewind or report on.
+    ///
+    /// A *state* error, like [`CommandError::NoCheckpoint`]: the sender asked a
+    /// reasonable question about a lecture that was never loaded. It is kept
+    /// apart from [`CommandError::OutOfRange`] because the fix is `plan.load`,
+    /// not a different value — and `plan.status` is the one plan verb that
+    /// answers this situation with a report (`loaded: false`) instead, because
+    /// "where are we?" has an honest answer when nothing is loaded.
+    NoPlan,
+    /// The plan is loaded but its cursor is past the last step.
+    ///
+    /// The state-based sibling of [`CommandError::NoCheckpoint`]: `plan.next`
+    /// at the end of a lecture is a caller that lost count, and the reply says
+    /// so rather than re-running the last step or silently succeeding.
+    /// `plan.goto` back to any index is the recovery.
+    PlanFinished,
+    /// A plan step was refused while it ran, with the step, the member and the
+    /// cause.
+    ///
+    /// `step` is **0-based**, matching the index the client wrote in `steps`, and
+    /// `member` says which part refused — `ops[1]`, `beats[0]`, or the step
+    /// itself (`steps[2]`). The wrapper exists for the same reason
+    /// [`CommandError::InBatch`] does: a refusal from deep inside a lecture has
+    /// to be locatable in the document the caller can edit.
+    InPlanStep {
+        step: usize,
+        member: String,
+        cause: Box<CommandError>,
+    },
     /// A command list was refused at one of its members, with that member's
     /// position.
     ///
@@ -1817,6 +1901,15 @@ impl std::fmt::Display for CommandError {
             }
             Self::Typeset { detail } => write!(f, "typesetting failed: {detail}"),
             Self::NoCheckpoint => write!(f, "no checkpoint to restore"),
+            Self::NoPlan => write!(f, "no scene plan is loaded"),
+            Self::PlanFinished => write!(f, "the plan has no steps left to play"),
+            Self::InPlanStep {
+                step,
+                member,
+                cause,
+            } => {
+                write!(f, "step {step}, {member} was refused: {cause}")
+            }
             // Position first, for the same reason a compiler prints the line
             // before the message: the number is what the caller edits.
             Self::InBatch { index, cause } => {
@@ -1857,10 +1950,11 @@ impl StateDiff {
 ///
 /// `Applied` covers everything that mutated (including the host-answered
 /// commands whose diff is present and empty: `play`, `camera`, `motion`,
-/// `narrate`), `Queried` carries the document a `query` asked for, `Checked`
-/// carries the findings a `check` reports, and `Greeted` carries the
-/// vocabulary description a `hello` asks for. None of the four is a tree
-/// change, so only `Applied` has a diff at all.
+/// `narrate`, and a `plan.next` that queued beats), `Queried` carries the
+/// document a `query` asked for, `Checked` carries the findings a `check`
+/// reports, `Planned` carries the position a `plan.status` asks for, and
+/// `Greeted` carries the vocabulary description a `hello` asks for. None of the
+/// five is a tree change, so only `Applied` has a diff at all.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandOutcome {
     /// The command ran. The diff describes the tree change, which may be empty.
@@ -1869,6 +1963,8 @@ pub enum CommandOutcome {
     Queried(SemanticTree),
     /// The command linted the frame and timeline, changing nothing.
     Checked(CheckReport),
+    /// The command reported where a lecture plan is, changing nothing.
+    Planned(PlanStatus),
     /// The command asked what the build can do.
     Greeted(Capabilities),
 }
@@ -1878,17 +1974,17 @@ impl CommandOutcome {
     pub fn diff(&self) -> Option<&StateDiff> {
         match self {
             Self::Applied(diff) => Some(diff),
-            Self::Queried(_) | Self::Checked(_) | Self::Greeted(_) => None,
+            Self::Queried(_) | Self::Checked(_) | Self::Planned(_) | Self::Greeted(_) => None,
         }
     }
 }
 
 /// What a host gets back for one line of a command feed.
 ///
-/// **Exactly one of `diff`, `tree`, `report`, `capabilities` and `error` is
-/// present, and the presence is the discriminant.** The absent ones are omitted
-/// rather than written as `null`, the same rule the commands themselves follow —
-/// these are a model's output too.
+/// **Exactly one of `diff`, `tree`, `report`, `plan`, `capabilities` and
+/// `error` is present, and the presence is the discriminant.** The absent ones
+/// are omitted rather than written as `null`, the same rule the commands
+/// themselves follow — these are a model's output too.
 ///
 /// A host that sent a `play` gets a `diff` that is present and *empty*: queueing
 /// a beat changes nothing in the tree, and saying so is more useful than saying
@@ -1900,8 +1996,9 @@ impl CommandOutcome {
 /// nothing". A host that sent a `check` gets a `report`: what the linter found,
 /// which is present even when the list is empty — "checked and clean" is an
 /// answer, and an absent field would read as "did not ask". A host that sent a
-/// `hello` gets `capabilities`: the vocabulary of this build, not the state of
-/// this session.
+/// `plan.status` gets a `plan`: where the lecture is, including a report that no
+/// plan is loaded. A host that sent a `hello` gets `capabilities`: the
+/// vocabulary of this build, not the state of this session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandReply {
     /// The 1-based *physical* line the command came from, so a human reading a
@@ -1915,6 +2012,9 @@ pub struct CommandReply {
     /// What a `check` found; see [`CheckReport`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<CheckReport>,
+    /// Where a lecture plan is, for a `plan.status`; see [`PlanStatus`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanStatus>,
     /// What the build can do, for a `hello`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Capabilities>,
@@ -1930,6 +2030,7 @@ impl CommandReply {
             diff: Some(diff),
             tree: None,
             report: None,
+            plan: None,
             capabilities: None,
             error: None,
         }
@@ -1942,6 +2043,7 @@ impl CommandReply {
             diff: None,
             tree: Some(tree),
             report: None,
+            plan: None,
             capabilities: None,
             error: None,
         }
@@ -1955,6 +2057,23 @@ impl CommandReply {
             diff: None,
             tree: None,
             report: Some(report),
+            plan: None,
+            capabilities: None,
+            error: None,
+        }
+    }
+
+    /// The reply to a `plan.status`: where the lecture is, and nothing about
+    /// the tree — a status read changes nothing. A status with no plan loaded
+    /// is still this constructor: "there is no plan" is the answer, not a
+    /// refusal.
+    pub fn planned(seq: u64, plan: PlanStatus) -> Self {
+        Self {
+            seq,
+            diff: None,
+            tree: None,
+            report: None,
+            plan: Some(plan),
             capabilities: None,
             error: None,
         }
@@ -1968,6 +2087,7 @@ impl CommandReply {
             diff: None,
             tree: None,
             report: None,
+            plan: None,
             capabilities: Some(capabilities),
             error: None,
         }
@@ -1981,6 +2101,7 @@ impl CommandReply {
             diff: None,
             tree: None,
             report: None,
+            plan: None,
             capabilities: None,
             error: Some(error),
         }
@@ -2017,6 +2138,7 @@ pub fn reply_line(seq: u64, outcome: Result<CommandOutcome, CommandError>) -> St
         Ok(CommandOutcome::Applied(diff)) => CommandReply::applied(seq, diff),
         Ok(CommandOutcome::Queried(tree)) => CommandReply::queried(seq, tree),
         Ok(CommandOutcome::Checked(report)) => CommandReply::checked(seq, report),
+        Ok(CommandOutcome::Planned(plan)) => CommandReply::planned(seq, plan),
         Ok(CommandOutcome::Greeted(capabilities)) => CommandReply::greeted(seq, capabilities),
         Err(error) => CommandReply::refused(seq, error),
     };
@@ -2074,6 +2196,35 @@ pub(crate) fn layout_error(
                 id.raw()
             ),
         },
+    }
+}
+
+/// Why a command cannot be a member of a list, if it cannot.
+///
+/// The membership table for both list-shaped commands — [`Command::Batch`] and
+/// [`Command::Validate`] — and for a plan step's `ops`, so the three cannot
+/// disagree about which verbs are *primitives*. A verb that answers with
+/// something other than a diff has no place in a list whose reply is one diff:
+/// `hello`, `query`, `check` and `plan.status`. The list-shaped commands
+/// themselves cannot nest. `None` means "this one is a member".
+///
+/// The caller names the position (`commands[2]`, `steps[1].ops[0]`); this
+/// function only says what is wrong, because the two lists count differently.
+pub(crate) fn member_refusal(member: &Command) -> Option<&'static str> {
+    match member {
+        Command::Hello { .. } => Some("hello answers with capabilities, not a diff"),
+        Command::Query { .. } => Some("query answers with a tree, not a diff"),
+        Command::Check => Some("check answers with a report, not a diff"),
+        Command::PlanStatus => Some("plan.status answers with a plan, not a diff"),
+        // The other plan verbs *do* answer with a diff, so the reason they are
+        // refused here is different: a plan drives playback and baselines the
+        // session, which a member of a list cannot express — the list would run
+        // on a lecture whose starting picture it just changed underneath.
+        Command::PlanLoad { .. } | Command::PlanNext | Command::PlanGoto { .. } => {
+            Some("a plan cannot be driven from inside a command list")
+        }
+        Command::Batch { .. } | Command::Validate { .. } => Some("a command list cannot be nested"),
+        _ => None,
     }
 }
 
@@ -2376,6 +2527,16 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // and one more: "inside the frame" needs the viewport, and the
             // pacing checks need the queued beats and pending narration, which
             // live on the context. It has no diff to give either.
+        }
+        Command::PlanLoad { .. }
+        | Command::PlanNext
+        | Command::PlanGoto { .. }
+        | Command::PlanStatus => {
+            // The plan lives on the `SceneContext` beside the playback machine
+            // it stops and the baseline it restores; `plan.status` answers with
+            // a document, which is not a diff either. Keeping the arms is what
+            // lets a direct `apply` caller replay a log that navigates a plan
+            // without a panic.
         }
         Command::Batch { .. } | Command::Validate { .. } => {
             // Answered by `SceneContext::handle` because a list may contain
@@ -3144,6 +3305,20 @@ mod tests {
             format!(r#"{{"action":"query","target":{id}}}"#),
             // The linter: a unit variant like `stop`, so it is the bare tag.
             r#"{"action":"check"}"#.to_owned(),
+            // The lecture plan. A step's parts are `say`, `ops`, `beats` in
+            // declaration order and each is omitted when absent, so the second
+            // step below — one line and nothing else — must not come back with
+            // two empty arrays. The dotted tag is the wire's spelling, not
+            // `snake_case`'s.
+            format!(
+                r#"{{"action":"plan.load","plan":{{"label":"勾股定理","steps":[{{"say":"先看这个三角形","ops":[{{"action":"set","target":{id},"property":{{"name":"opacity","value":0.5}}}}],"beats":[{{"target":{id},"type":"fade_in","duration":0.6}}]}},{{"say":"结束"}}]}}}}"#
+            ),
+            r#"{"action":"plan.load","plan":{"steps":[{"say":"你好"}]}}"#.to_owned(),
+            // `plan.next` and `plan.status` are unit variants; `plan.goto`
+            // carries the 0-based step index and nothing else.
+            r#"{"action":"plan.next"}"#.to_owned(),
+            r#"{"action":"plan.goto","step":2}"#.to_owned(),
+            r#"{"action":"plan.status"}"#.to_owned(),
             // The interrupt: a unit variant, so it is the bare tag and nothing
             // else. An implementation that serialised an empty object or a
             // `null` payload here would change what a relayed log says.

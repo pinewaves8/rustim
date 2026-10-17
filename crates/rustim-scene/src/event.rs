@@ -11,8 +11,8 @@
 //! # An event line is not a reply
 //!
 //! A reply carries `seq` and exactly one of `diff` / `tree` / `report` /
-//! `capabilities` / `error` ([`crate::CommandReply`]). An event line carries
-//! neither:
+//! `plan` / `capabilities` / `error` ([`crate::CommandReply`]). An event line
+//! carries neither:
 //!
 //! ```text
 //! {"event":{"kind":"beat_started","beat":1,"members":2,"duration":1.5,"clock":0.25}}

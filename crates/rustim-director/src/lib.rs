@@ -66,10 +66,13 @@
 //! rather than approximated by parenting (a parent's transform would carry the
 //! label through a rotation, which is not what a caption does).
 //!
+//! The teaching tier above that geometry — the six `explain.*` templates, the
+//! linter (out of frame, overlap, size, contrast, pacing) and the declarative
+//! `ScenePlan` — lives one crate up, in `rustim-scene`, because each of them
+//! needs the viewport, the queued timeline or the host's typesetter.
+//!
 //! Deferred, deliberately, and named so they are not rediscovered as gaps:
-//! labels that follow their subject, the six `explain.*` templates, the linter
-//! (out of frame, overlap, size, contrast, pacing) and the declarative
-//! `ScenePlan`.
+//! labels that follow their subject.
 //!
 //! `rustim-text` is not a dependency and will not become one without a separate
 //! crate: see this module's note on the wasm kernel.

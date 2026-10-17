@@ -15,6 +15,7 @@ use crate::a11y;
 use crate::check::{self, CheckReport};
 use crate::command::{self, Capabilities, Command, CommandError, CommandOutcome, StateDiff};
 use crate::event::{Event, EventKind, MAX_EVENTS};
+use crate::plan::{Plan, PlanStatus, PlanStep};
 use crate::typeset::{TextSpec, Typesetter, typeset_error};
 
 /// A scene: the user-facing entry point, mirroring Manim's `construct()`.
@@ -79,6 +80,30 @@ struct Checkpoint {
     motion: Motion,
 }
 
+/// The picture a loaded [`Plan`] starts from: the tree, and the clock it is at.
+///
+/// Deliberately narrower than [`Checkpoint`]: a plan rewind restores the
+/// *picture*, not the viewer's policy. Pause, tempo and motion are the person
+/// watching, and `plan.goto` has no business changing them — see
+/// [`SceneContext::plan_goto`].
+#[derive(Clone)]
+struct Baseline {
+    tree: SceneTree,
+    clock: f64,
+}
+
+/// A loaded plan and where the lecture is in it.
+///
+/// Private because the cursor is only meaningful beside the baseline that
+/// `goto` replays from; a host that moved one without the other would get a
+/// lecture whose picture and index disagree.
+struct PlanState {
+    plan: Plan,
+    /// The index of the next step `plan.next` runs, in `0..=plan.steps.len()`.
+    cursor: usize,
+    baseline: Baseline,
+}
+
 /// The net difference between two trees, as a [`StateDiff`].
 ///
 /// One function for the two places that report a **computed** change — an
@@ -107,6 +132,19 @@ fn diff_trees(before: &SceneTree, after: &SceneTree) -> StateDiff {
         }
     }
     diff
+}
+
+/// Locate a refusal inside a plan step.
+///
+/// One constructor for the two runtime routes ([`SceneContext::plan_next`] and
+/// [`SceneContext::plan_goto`]), so both name the step and the member the same
+/// way — the same reason `run_batch` owns the `InBatch` wrapper.
+fn in_plan_step(step: usize, member: String, cause: CommandError) -> CommandError {
+    CommandError::InPlanStep {
+        step,
+        member,
+        cause: Box::new(cause),
+    }
 }
 
 /// Everything a scene is allowed to touch.
@@ -209,6 +247,16 @@ pub struct SceneContext {
     /// diff rules itself, and a second copy of "what an undo means" is the thing
     /// this layer is meant to own.
     checkpoints: Vec<Checkpoint>,
+    /// The lecture plan this session is driving, if any.
+    ///
+    /// Private for the same reason `checkpoints` is: the plan's cursor is only
+    /// meaningful beside the baseline it rewinds to, and the four `plan.*`
+    /// verbs are the only routes in ([`SceneContext::plan_load`],
+    /// [`SceneContext::plan_next`], [`SceneContext::plan_goto`],
+    /// [`SceneContext::plan_status`]). Independent of the checkpoint stack by
+    /// design — a plan keeps its own starting picture, and an `undo` is the
+    /// viewer stepping back, not the lecture.
+    plan: Option<PlanState>,
     /// Whatever this host typesets with, or nothing at all.
     ///
     /// The shaper is not a kernel dependency (see [`crate::typeset`]), so the
@@ -243,6 +291,7 @@ impl SceneContext {
             current_beat: None,
             published: None,
             checkpoints: Vec::new(),
+            plan: None,
             typesetter: None,
         }
     }
@@ -657,10 +706,12 @@ impl SceneContext {
     ///   is spelled by sending nothing, and a model that generated an empty
     ///   array has a bug worth hearing about.
     /// * **Primitive members only.** `hello` answers with capabilities, `query`
-    ///   with a tree, and a batch replies with one diff — a reply has no field
-    ///   for a list of replies, so nesting them would silently drop the
-    ///   document the member asked for. `batch` and `validate` cannot nest for
-    ///   the same reason.
+    ///   with a tree, `check` with a report and `plan.status` with a plan, and
+    ///   a batch replies with one diff — a reply has no field for a list of
+    ///   replies, so nesting them would silently drop the document the member
+    ///   asked for. `batch` and `validate` cannot nest for the same reason.
+    ///   The table lives in [`command::member_refusal`], because a plan step's
+    ///   `ops` are a list under the same rule.
     ///
     /// The position is named as `commands[i]`, the same field spelling every
     /// other refusal uses, so a model reads the index it wrote.
@@ -672,19 +723,12 @@ impl SceneContext {
             });
         }
         for (index, member) in commands.iter().enumerate() {
-            let why = match member {
-                Command::Hello { .. } => "hello answers with capabilities, not a diff",
-                Command::Query { .. } => "query answers with a tree, not a diff",
-                Command::Check => "check answers with a report, not a diff",
-                Command::Batch { .. } | Command::Validate { .. } => {
-                    "a command list cannot be nested"
-                }
-                _ => continue,
-            };
-            return Err(CommandError::OutOfRange {
-                property: format!("commands[{index}]"),
-                detail: why.to_owned(),
-            });
+            if let Some(why) = command::member_refusal(member) {
+                return Err(CommandError::OutOfRange {
+                    property: format!("commands[{index}]"),
+                    detail: why.to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -725,6 +769,312 @@ impl SceneContext {
         scratch.checkpoints = self.checkpoints.clone();
         scratch.typesetter = self.typesetter.take();
         scratch
+    }
+
+    /// Load a lecture plan, after checking that it can run at all.
+    ///
+    /// Loading is a **pre-flight**, not a stored blob (see [`crate::plan`] for
+    /// the whole contract):
+    ///
+    /// 1. The document's shape is checked by [`Plan::check_shape`] — a step
+    ///    exists, none of them is empty, every `say` says something, and only
+    ///    primitive commands are in an `ops` list.
+    /// 2. Every step is then **dry-run** against a throwaway copy of this
+    ///    session: its ops are applied in order through the same
+    ///    [`SceneContext::handle`] a live command reaches, and each beat is built
+    ///    by the same [`command::animation_for`] the live `play` uses. A label no
+    ///    earlier step created, a malformed animation, a missing `into` — all are
+    ///    refused here, under `steps[i].ops[j]` or `steps[i].beats[j]`, before
+    ///    the lecture says its first sentence.
+    ///
+    /// What the dry run does **not** simulate is an animation's *end state*: a
+    /// later op that renames a node a `fade_out` will remove validates, because
+    /// the removal happens in the animation's `finish` and not in its spec. That
+    /// refusal arrives at [`SceneContext::plan_next`] instead, at the same path.
+    ///
+    /// On success the plan becomes the session's, the timeline is stopped (the
+    /// baseline must be a settled picture, not one mid-animation), and the
+    /// baseline — the tree and the clock as they are now — is taken. Loading
+    /// **replaces** any previous plan; the previous baseline is not restored.
+    ///
+    /// The reply is an empty diff: a plan is navigation, not a node. The
+    /// baseline is also why an `undo` taken before a load cannot rewind into it
+    /// — the checkpoint stack copied the old tree and knows nothing of the plan.
+    pub fn plan_load(&mut self, plan: Plan) -> Result<(), CommandError> {
+        plan.check_shape()?;
+        // The scratch copy carries the tree, clock, pause, tempo and the
+        // typesetter (moved in and out), so a `text` op in a step is checked by
+        // the provider that would really build it. The scheduler and narration
+        // track are fresh; a dry run checks what a step *builds*, not how it
+        // looks when it plays.
+        let mut scratch = self.scratch();
+        let result = scratch.dry_run_plan(&plan);
+        self.typesetter = scratch.typesetter.take();
+        result?;
+
+        self.stop();
+        self.plan = Some(PlanState {
+            plan,
+            cursor: 0,
+            baseline: Baseline {
+                tree: self.tree.clone(),
+                clock: self.clock,
+            },
+        });
+        Ok(())
+    }
+
+    /// Run the next step of the loaded plan.
+    ///
+    /// The step's `ops` are applied in order, each beat is queued as one beat
+    /// ([`SceneContext::play_all`]), and its `say` is put on the narration track
+    /// due now. The cursor advances **only after everything succeeded**, so a
+    /// refusal leaves the index pointing at the step whose effect is partial —
+    /// which is the state [`SceneContext::plan_goto`] was built to repair.
+    ///
+    /// **Not a transaction**, for [`SceneContext::batch`]'s reason: a refusal at
+    /// op 2 leaves ops 0 and 1 applied, and nothing after it runs. Beats are
+    /// built only after the ops, because a beat may name a label that a step's
+    /// own op creates. The reply is the net tree change (empty for a step that
+    /// only speaks and animates), because queueing is not a tree mutation.
+    ///
+    /// Refusals: [`CommandError::NoPlan`] with nothing loaded,
+    /// [`CommandError::PlanFinished`] past the last step, and
+    /// [`CommandError::InPlanStep`] locating a failing op or beat.
+    pub fn plan_next(&mut self) -> Result<StateDiff, CommandError> {
+        let (step_index, step) = {
+            let Some(state) = self.plan.as_mut() else {
+                return Err(CommandError::NoPlan);
+            };
+            if state.cursor >= state.plan.steps.len() {
+                return Err(CommandError::PlanFinished);
+            }
+            (state.cursor, state.plan.steps[state.cursor].clone())
+        };
+
+        let before = self.tree.clone();
+        for (member, op) in step.ops.iter().enumerate() {
+            self.handle(op)
+                .map_err(|cause| in_plan_step(step_index, format!("ops[{member}]"), cause))?;
+        }
+        let mut beats: Vec<Box<dyn Animation>> = Vec::with_capacity(step.beats.len());
+        for (member, spec) in step.beats.iter().enumerate() {
+            beats
+                .push(command::animation_for(&self.tree, spec).map_err(|cause| {
+                    in_plan_step(step_index, format!("beats[{member}]"), cause)
+                })?);
+        }
+        if let Some(say) = step.say {
+            // The same rule `narrate` applies, and it is not a formality: a
+            // step's line is the payload a model most easily sends as spaces.
+            let _ = self.queue_narration(&say, 0.0);
+        }
+        for beat in beats {
+            self.play_all([beat]);
+        }
+        if let Some(state) = self.plan.as_mut() {
+            state.cursor += 1;
+        }
+        Ok(diff_trees(&before, &self.tree))
+    }
+
+    /// Restore the picture at the start of step `step`, silently.
+    ///
+    /// The baseline's tree is put back, its steps `0..step` are replayed with
+    /// every beat driven straight to its **settled** state — the reduced-motion
+    /// path (`begin`, `ease(1.0)`, `interpolate`, `finish`), which is a
+    /// function's end state rather than its journey — and the clock is put back
+    /// to the baseline's. So `goto(0)` is the baseline, `goto(steps)` is the
+    /// lecture's end, and the same plan and baseline give the same tree **and
+    /// clock** however the session arrived; that is what makes "preview the end
+    /// before playing it" an honest claim.
+    ///
+    /// Deliberate limits, all of them shared with the plan's doc:
+    ///
+    /// * **Silent.** No `say` is queued — a restore is not a re-performance, so
+    ///   the narration track is restored too, dropping whatever the replay's ops
+    ///   queued.
+    /// * **Playback is interrupted**, for [`SceneContext::undo`]'s reason: a
+    ///   queued beat captured a tree that the restore replaces. The pause, the
+    ///   tempo, the motion mode, the event subscription and the checkpoint stack
+    ///   are untouched — they are the viewer's policy and history, not the
+    ///   lecture's position.
+    /// * **The abandoned present is retired.** Every id the current tree handed
+    ///   out is remembered by the restored one, so a host still holding one is
+    ///   answered `no_such_node` rather than by a different object wearing the
+    ///   id ([`SceneContext::undo`]'s generational promise, kept here too).
+    ///
+    /// A refusal during the replay puts the pre-`goto` picture and clock back
+    /// and answers [`CommandError::InPlanStep`]; the cursor does not move, so
+    /// the plan stays where it was. `step` may equal the plan's length (the
+    /// end); anything past it is [`CommandError::OutOfRange`] under `step`.
+    pub fn plan_goto(&mut self, step: usize) -> Result<StateDiff, CommandError> {
+        let (total, baseline) = {
+            let Some(state) = self.plan.as_ref() else {
+                return Err(CommandError::NoPlan);
+            };
+            (state.plan.steps.len(), state.baseline.clone())
+        };
+        if step > total {
+            return Err(CommandError::OutOfRange {
+                property: "step".to_owned(),
+                detail: format!("{step} is past the plan's {total} steps"),
+            });
+        }
+
+        let before = self.tree.clone();
+        let rollback = Baseline {
+            tree: self.tree.clone(),
+            clock: self.clock,
+        };
+        // The replay's own lines are not spoken and its beats are not events:
+        // a state restore is invisible to both tracks.
+        let narration = self.narration.clone();
+
+        self.stop();
+        let mut restored = baseline.tree;
+        restored.retire_ids_of(&self.tree);
+        self.tree = restored;
+        self.clock = baseline.clock;
+
+        for index in 0..step {
+            let step_doc = self
+                .plan
+                .as_ref()
+                .expect("checked above and never cleared here")
+                .plan
+                .steps[index]
+                .clone();
+            if let Err(cause) = self.settle_plan_step(&step_doc, index) {
+                // Put the picture and the clock back where they were; the plan
+                // and its cursor were never touched, so nothing else needs
+                // undoing. The replay's narration lines go with it.
+                let mut tree = rollback.tree;
+                tree.retire_ids_of(&self.tree);
+                self.tree = tree;
+                self.clock = rollback.clock;
+                self.narration = narration;
+                return Err(cause);
+            }
+        }
+        self.narration = narration;
+        if let Some(state) = self.plan.as_mut() {
+            state.cursor = step;
+        }
+        Ok(diff_trees(&before, &self.tree))
+    }
+
+    /// Where the lecture is: the cursor, the next line and whether the picture
+    /// is still moving.
+    ///
+    /// This is the one plan verb that **never refuses** — "there is no plan" is
+    /// [`PlanStatus::loaded`] being false, which is the answer the caller asked
+    /// for. It reads and changes nothing.
+    pub fn plan_status(&self) -> PlanStatus {
+        let (loaded, label, steps, cursor, say) = match &self.plan {
+            None => (false, None, 0, 0, None),
+            Some(state) => (
+                true,
+                state.plan.label.clone(),
+                state.plan.steps.len(),
+                state.cursor,
+                state
+                    .plan
+                    .steps
+                    .get(state.cursor)
+                    .and_then(|step| step.say.clone()),
+            ),
+        };
+        PlanStatus {
+            loaded,
+            label,
+            steps,
+            cursor,
+            say,
+            playing: self.is_playing(),
+        }
+    }
+
+    /// Put a line on the narration track, trimmed, due after `delay` seconds of
+    /// lecture time.
+    ///
+    /// Shared by [`Command::Narrate`] and a plan step's `say`, so the two cannot
+    /// drift about what a line is. A line that trims to nothing is not queued
+    /// and answers `false`; the callers report that in their own field's words.
+    fn queue_narration(&mut self, text: &str, delay: f64) -> bool {
+        let text = text.trim();
+        if text.is_empty() {
+            return false;
+        }
+        self.narration.push((self.clock + delay, text.to_owned()));
+        true
+    }
+
+    /// Check a whole plan against a scratch session, without touching this one.
+    ///
+    /// Applies each step's ops through [`SceneContext::handle`] and builds each
+    /// beat with [`command::animation_for`], so the document is checked against
+    /// the tree it will actually start from, plus the effects of its own earlier
+    /// steps. Builds only: nothing is settled, which is why the end state of an
+    /// animation is not checked (see [`SceneContext::plan_load`]).
+    fn dry_run_plan(&mut self, plan: &Plan) -> Result<(), CommandError> {
+        for (index, step) in plan.steps.iter().enumerate() {
+            for (member, op) in step.ops.iter().enumerate() {
+                self.handle(op).map_err(|cause| CommandError::OutOfRange {
+                    property: format!("steps[{index}].ops[{member}]"),
+                    detail: cause.to_string(),
+                })?;
+            }
+            for (member, spec) in step.beats.iter().enumerate() {
+                command::animation_for(&self.tree, spec).map_err(|cause| {
+                    CommandError::OutOfRange {
+                        property: format!("steps[{index}].beats[{member}]"),
+                        detail: cause.to_string(),
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replay one step of a plan with its beats settled.
+    ///
+    /// The ops go through the ordinary [`SceneContext::handle`]; the beats are
+    /// queued and then **drained to their end states** by the reduced-motion
+    /// path, which is the documented meaning of "settled": `begin`, `ease(1.0)`,
+    /// `interpolate`, `finish`. Draining the queue rather than calling the three
+    /// methods by hand is not a shortcut — it also settles what an *op* queued (a
+    /// `camera` with a `duration`, a `play`), so the replay cannot drift from
+    /// what the same step does live.
+    fn settle_plan_step(&mut self, step: &PlanStep, index: usize) -> Result<(), CommandError> {
+        for (member, op) in step.ops.iter().enumerate() {
+            self.handle(op)
+                .map_err(|cause| in_plan_step(index, format!("ops[{member}]"), cause))?;
+        }
+        for (member, spec) in step.beats.iter().enumerate() {
+            let anim = command::animation_for(&self.tree, spec)
+                .map_err(|cause| in_plan_step(index, format!("beats[{member}]"), cause))?;
+            self.play_all([anim]);
+        }
+        self.settle_queued();
+        Ok(())
+    }
+
+    /// Drive every queued beat to its end state, in order, without a clock.
+    ///
+    /// [`Motion::Reduced`] is the scheduler's own settled path, so this reuses
+    /// it instead of re-spelling `begin`/`ease`/`interpolate`/`finish` here — and
+    /// inherits its correctness for `FadeOut`/`Uncreate`, whose removal lives in
+    /// `finish` and would otherwise be skipped, leaving a ghost node behind. The
+    /// `Wait` each reduced beat leaves on the scheduler is dropped: nothing is
+    /// being timed.
+    fn settle_queued(&mut self) {
+        while self
+            .playback
+            .start_next(&mut self.animations, &mut self.tree, Motion::Reduced)
+            .is_some()
+        {}
+        self.animations.clear();
     }
 
     /// Play the timeline at a different speed from now on.
@@ -933,6 +1283,10 @@ impl SceneContext {
         // whose ids the new scene has already retired, and the host asking for
         // that intended `reset`, not time travel across a rewrite.
         self.checkpoints.clear();
+        // A plan is a lecture about the scene it was loaded onto. Rewriting the
+        // scene ends that lecture: its baseline describes a picture the new
+        // script never built, so playing it would replay steps into strangers.
+        self.plan = None;
         // A fresh run plays: a scene rewritten while the previous one was held
         // must not come up frozen at a speed nobody asked for. The pause and the
         // tempo belong to the *run*, like the clock they scale.
@@ -1164,7 +1518,7 @@ impl SceneContext {
             // `at` is relative to arrival, and the clock is where the timeline
             // already is: a file feed applies every line at t = 0, so the delay
             // is the only thing that keeps the lecture in order.
-            self.narration.push((self.clock + delay, text.to_owned()));
+            self.queue_narration(text, delay);
             return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Annotate {
@@ -1615,6 +1969,24 @@ impl SceneContext {
         if let Command::Check = cmd {
             return Ok(CommandOutcome::Checked(self.check()));
         }
+        if let Command::PlanLoad { plan } = cmd {
+            // A pre-flight, and the diff is empty: a plan is navigation over the
+            // tree, not a node in it.
+            self.plan_load(plan.clone())?;
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::PlanNext = cmd {
+            // The one plan verb whose diff can name nodes: a step's ops mutate
+            // the tree, and a host has to learn what they created.
+            return self.plan_next().map(CommandOutcome::Applied);
+        }
+        if let Command::PlanGoto { step } = cmd {
+            return self.plan_goto(*step).map(CommandOutcome::Applied);
+        }
+        if let Command::PlanStatus = cmd {
+            // The sixth reply presence: a position, not a diff.
+            return Ok(CommandOutcome::Planned(self.plan_status()));
+        }
         if let Command::Add {
             kind,
             params,
@@ -1918,6 +2290,7 @@ mod tests {
             CommandOutcome::Applied(diff) => diff,
             CommandOutcome::Queried(_) => panic!("a query is not a mutation"),
             CommandOutcome::Checked(_) => panic!("a check is not a mutation"),
+            CommandOutcome::Planned(_) => panic!("a plan status is not a mutation"),
             CommandOutcome::Greeted(_) => panic!("a greeting is not a mutation"),
         }
     }
@@ -5366,6 +5739,7 @@ mod tests {
             CommandOutcome::Applied(diff) => diff,
             CommandOutcome::Queried(_) => panic!("narration is not a query"),
             CommandOutcome::Checked(_) => panic!("narration is not a check"),
+            CommandOutcome::Planned(_) => panic!("narration is not a plan status"),
             CommandOutcome::Greeted(_) => panic!("narration is not a greeting"),
         })
     }
@@ -6663,5 +7037,335 @@ mod playback_control_tests {
 
         applied_diff(&mut ctx, &add_text());
         assert_eq!(ctx.tree.len(), 1, "the provider came back");
+    }
+
+    // ---------------------------------------------------------------- plans
+
+    use crate::command::{AnimationKind, AnimationSpec, Target};
+
+    fn say(text: &str) -> PlanStep {
+        PlanStep {
+            say: Some(text.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn plan_of(steps: Vec<PlanStep>) -> Plan {
+        Plan {
+            label: Some("测试讲解".to_owned()),
+            steps,
+        }
+    }
+
+    fn fade(id: NodeId) -> AnimationSpec {
+        spec(id.into(), AnimationKind::FadeIn)
+    }
+
+    fn fade_out(id: NodeId) -> AnimationSpec {
+        spec(id.into(), AnimationKind::FadeOut)
+    }
+
+    fn spec(target: Target, kind: AnimationKind) -> AnimationSpec {
+        AnimationSpec {
+            target: Some(target),
+            kind,
+            duration: None,
+            to: None,
+            angle: None,
+            factor: None,
+            property: None,
+            about_point: None,
+            into: None,
+            path_arc: None,
+            animations: None,
+            lag_ratio: None,
+            rate: None,
+        }
+    }
+
+    fn opacity_op(id: NodeId, value: f64) -> Command {
+        Command::Set {
+            target: id.into(),
+            property: command::Property::Opacity(value),
+        }
+    }
+
+    /// A load is a pre-flight: a step naming a node that is not there is refused
+    /// **before** the lecture starts, under the path the client wrote, and the
+    /// session is untouched — not even the plan is installed.
+    #[test]
+    fn plan_load_refuses_a_bad_step_before_the_lecture_starts() {
+        let mut ctx = scene();
+        let id = square(&mut ctx);
+        let plan = plan_of(vec![PlanStep {
+            say: None,
+            ops: vec![opacity_op(NodeId::from_raw(999), 0.5)],
+            beats: vec![],
+        }]);
+
+        let error = ctx.plan_load(plan).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CommandError::OutOfRange { property, .. } if property == "steps[0].ops[0]"
+            ),
+            "{error:?}"
+        );
+        assert!(
+            !ctx.plan_status().loaded,
+            "a refused load installed the plan"
+        );
+        assert_eq!(opacity(&ctx, id), 1.0, "the dry run wrote to the live tree");
+    }
+
+    /// A beat is checked against the tree the step's own ops produced, so a
+    /// label created in `ops` resolves in `beats`. The reply is the net tree
+    /// change — empty for a step that only speaks and animates — and the line
+    /// reaches the narration track.
+    #[test]
+    fn plan_next_applies_its_ops_says_its_line_and_queues_its_beats() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        let plan = plan_of(vec![PlanStep {
+            say: Some("先看这个正方形".to_owned()),
+            ops: vec![opacity_op(id, 0.2)],
+            beats: vec![fade(id)],
+        }]);
+        assert_eq!(
+            applied_diff(&mut ctx, &Command::PlanLoad { plan }),
+            StateDiff::default(),
+            "a plan is navigation, not a node"
+        );
+
+        let status = ctx.plan_status();
+        assert!(status.loaded);
+        assert_eq!((status.steps, status.cursor), (1, 0));
+        assert_eq!(status.say.as_deref(), Some("先看这个正方形"));
+        assert!(!status.playing);
+
+        let diff = applied_diff(&mut ctx, &Command::PlanNext);
+        assert_eq!(diff.modified, vec![id], "the op's write is the diff");
+        assert!(ctx.is_playing(), "the beat was queued");
+        assert_eq!(opacity(&ctx, id), 0.2, "the op runs before the beat begins");
+        assert_eq!(ctx.take_narration(), vec!["先看这个正方形".to_owned()]);
+
+        let status = ctx.plan_status();
+        assert_eq!(status.cursor, 1);
+        assert!(status.say.is_none(), "the last step has no next line");
+    }
+
+    /// The status is the sixth reply presence and the only plan verb that never
+    /// refuses: "there is no plan" is a report, not an error.
+    #[test]
+    fn plan_status_answers_without_a_plan_rather_than_refusing() {
+        let mut ctx = scene();
+        let status = ctx.plan_status();
+        assert!(!status.loaded);
+        assert_eq!((status.steps, status.cursor), (0, 0));
+        assert!(status.label.is_none() && status.say.is_none());
+        assert!(!status.playing);
+
+        match ctx.handle(&Command::PlanStatus).expect("a status") {
+            CommandOutcome::Planned(status) => assert!(!status.loaded),
+            other => panic!("a status is not a diff: {other:?}"),
+        }
+    }
+
+    /// `goto(n)` is the picture at the start of step `n`: the baseline plus
+    /// steps `0..n` replayed with their beats settled. It is silent, it puts the
+    /// clock back, and settling takes no virtual time — which is what makes
+    /// "same plan, same baseline, same tree and clock" true however the session
+    /// arrived.
+    #[test]
+    fn plan_goto_restores_the_baseline_and_replays_steps_settled() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        let plan = plan_of(vec![
+            PlanStep {
+                say: Some("第一步：亮起来".to_owned()),
+                ops: vec![opacity_op(id, 0.4)],
+                beats: vec![],
+            },
+            PlanStep {
+                say: Some("第二步：完全显示".to_owned()),
+                ops: vec![],
+                beats: vec![fade(id)],
+            },
+        ]);
+        ctx.plan_load(plan).expect("a well-formed plan");
+        let baseline_clock = ctx.clock();
+        assert_eq!(ctx.plan_status().label.as_deref(), Some("测试讲解"));
+
+        tick(&mut ctx, 10);
+        assert!(ctx.clock() > baseline_clock);
+
+        applied_diff(&mut ctx, &Command::PlanGoto { step: 0 });
+        assert_eq!(ctx.clock(), baseline_clock, "goto restores the clock");
+        assert_eq!(opacity(&ctx, id), 0.0);
+        assert_eq!(ctx.plan_status().cursor, 0);
+        assert!(!ctx.is_playing());
+        assert!(
+            ctx.take_narration().is_empty(),
+            "a restore is not a re-performance"
+        );
+
+        applied_diff(&mut ctx, &Command::PlanGoto { step: 1 });
+        assert_eq!(opacity(&ctx, id), 0.4);
+        assert_eq!(ctx.plan_status().cursor, 1);
+
+        applied_diff(&mut ctx, &Command::PlanGoto { step: 2 });
+        assert_eq!(opacity(&ctx, id), 1.0, "a settled fade is its end state");
+        assert_eq!(
+            ctx.clock(),
+            baseline_clock,
+            "settling takes no virtual time"
+        );
+        assert_eq!(ctx.plan_status().cursor, 2);
+        assert!(ctx.take_narration().is_empty());
+
+        applied_diff(&mut ctx, &Command::PlanGoto { step: 0 });
+        assert_eq!(opacity(&ctx, id), 0.0, "and back to the beginning");
+    }
+
+    /// The one hole the dry run cannot see — an animation's end state — arrives
+    /// at `goto` instead, and a refused replay puts the pre-`goto` picture and
+    /// clock back without moving the cursor.
+    #[test]
+    fn a_refused_goto_puts_the_picture_back_and_leaves_the_cursor() {
+        let mut ctx = scene();
+        let id = square(&mut ctx);
+        let plan = plan_of(vec![
+            PlanStep {
+                say: Some("消失".to_owned()),
+                ops: vec![],
+                beats: vec![fade_out(id)],
+            },
+            PlanStep {
+                say: Some("再设置它".to_owned()),
+                ops: vec![opacity_op(id, 0.5)],
+                beats: vec![],
+            },
+        ]);
+        ctx.plan_load(plan)
+            .expect("the dry run does not settle, so the square is still there");
+
+        applied_diff(&mut ctx, &opacity_op(id, 0.5));
+        let clock = ctx.clock();
+        let before = ctx.tree.len();
+
+        let error = ctx.plan_goto(2).unwrap_err();
+        assert!(
+            matches!(&error, CommandError::InPlanStep { step: 1, member, .. } if member == "ops[0]"),
+            "{error:?}"
+        );
+        assert_eq!(ctx.tree.len(), before, "the pre-goto picture came back");
+        assert!(ctx.tree.get(id).is_some());
+        assert_eq!(opacity(&ctx, id), 0.5);
+        assert_eq!(ctx.clock(), clock);
+        assert_eq!(
+            ctx.plan_status().cursor,
+            0,
+            "a refused replay does not move the cursor"
+        );
+    }
+
+    /// The three ways a plan verb can be premature are three different answers,
+    /// because they are three different mistakes.
+    #[test]
+    fn the_plan_refusals_name_which_mistake_it_was() {
+        let mut ctx = scene();
+        assert!(matches!(ctx.plan_next(), Err(CommandError::NoPlan)));
+        assert!(matches!(ctx.plan_goto(0), Err(CommandError::NoPlan)));
+
+        ctx.plan_load(plan_of(vec![say("只有一步")]))
+            .expect("a well-formed plan");
+        ctx.plan_next().expect("the only step");
+        assert!(matches!(ctx.plan_next(), Err(CommandError::PlanFinished)));
+
+        let error = ctx.plan_goto(2).unwrap_err();
+        assert!(
+            matches!(&error, CommandError::OutOfRange { property, .. } if property == "step"),
+            "{error:?}"
+        );
+    }
+
+    /// A replay that settles a `FadeOut` really runs its `finish`: the removal
+    /// lives there, and a replay that only interpolated would leave a ghost.
+    #[test]
+    fn a_settled_fade_out_removes_its_target_under_goto() {
+        let mut ctx = scene();
+        let id = square(&mut ctx);
+        ctx.plan_load(plan_of(vec![PlanStep {
+            say: Some("消失".to_owned()),
+            ops: vec![],
+            beats: vec![fade_out(id)],
+        }]))
+        .expect("a well-formed plan");
+
+        applied_diff(&mut ctx, &Command::PlanGoto { step: 1 });
+        assert!(ctx.tree.get(id).is_none(), "the settle path ran finish");
+        assert_eq!(ctx.plan_status().cursor, 1);
+    }
+
+    /// Loading stops the timeline first, because a baseline has to be a settled
+    /// picture: the frozen frame is what `goto(0)` returns to.
+    #[test]
+    fn loading_a_plan_stops_a_running_beat_and_baselines_the_frozen_picture() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(2.0));
+        tick(&mut ctx, 30);
+        let held = opacity(&ctx, id);
+        assert!(held > 0.0 && held < 1.0, "half a second into a 2 s fade");
+
+        ctx.plan_load(plan_of(vec![say("开始")]))
+            .expect("a well-formed plan");
+        assert!(!ctx.is_playing(), "the baseline is a still picture");
+        assert_eq!(opacity(&ctx, id), held);
+
+        applied_diff(&mut ctx, &Command::PlanGoto { step: 0 });
+        assert_eq!(opacity(&ctx, id), held, "goto(0) is the frozen frame");
+    }
+
+    /// A beat may name a label its own step's `ops` created, because the beats
+    /// are built after the ops run — against the tree the step just produced.
+    #[test]
+    fn a_beat_may_name_a_label_its_own_step_created() {
+        let mut ctx = scene();
+        let plan = plan_of(vec![PlanStep {
+            say: Some("加一个圆".to_owned()),
+            ops: vec![Command::Add {
+                kind: ShapeKind::Circle,
+                params: ShapeParams {
+                    label: Some("圆".to_owned()),
+                    ..Default::default()
+                },
+                children: None,
+            }],
+            beats: vec![spec(Target::Label("圆".to_owned()), AnimationKind::FadeIn)],
+        }]);
+
+        ctx.plan_load(plan).expect("the label is created first");
+        let diff = applied_diff(&mut ctx, &Command::PlanNext);
+        assert_eq!(diff.created.len(), 1, "the op created the circle");
+        assert!(ctx.is_playing());
+    }
+
+    /// A rewritten scene has no lecture: `reset` drops the plan with the tree,
+    /// the same way it puts the camera back.
+    #[test]
+    fn reset_drops_the_plan_with_the_tree() {
+        let mut ctx = scene();
+        square(&mut ctx);
+        ctx.plan_load(plan_of(vec![say("一")]))
+            .expect("a well-formed plan");
+        assert!(ctx.plan_status().loaded);
+
+        ctx.reset();
+        assert!(
+            !ctx.plan_status().loaded,
+            "a rewritten scene has no lecture"
+        );
+        assert!(matches!(ctx.plan_next(), Err(CommandError::NoPlan)));
     }
 }
