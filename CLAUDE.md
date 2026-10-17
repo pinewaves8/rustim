@@ -33,12 +33,13 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **552 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **575 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
-baselines, a script replays to a byte-identical frame, and `rustim-app --png out.png` reproduces the
+baselines, a script replays to a byte-identical frame, an exported frame equals the still pixel for
+pixel, and `rustim-app --png out.png` reproduces the
 Manim reference frame with an **identical content bounding box** (`343,90,936,629`); only 0.012% of
 pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The count is not
 decoration — every one of those claims is re-run by the commands below, and the P2 rows in the
@@ -100,6 +101,9 @@ cargo run -p rustim-app -- --scene axes --png out.png  # axes, ticks, a plot and
 cargo run -p rustim-app -- --motion reduced  # ignore the platform "reduce motion" preference
 cargo run -p rustim-app -- --captions --png out.png  # ...and draw the live region's sentence on it
 cargo run -p rustim-app -- --speak --frames 300      # self-voicing (windowed only)
+cargo run --release -p rustim-app -- --video out.mp4 --srt out.srt   # export 10 s via ffmpeg
+cargo run --release -p rustim-app -- --video-png frames/ --srt out.srt  # ...or numbered PNGs
+cargo run -p rustim-export --bin rustim-compare -- a.png b.png   # exit 0 pass / 1 fail / 2 cannot
 cargo run -p rustim-app -- --script sessions/intro.jsonl --reply  # drive it with JSON commands
 cargo run -p rustim-app -- --script - --reply --png out.png       # ...from stdin, answering each
 cargo run -p rustim-app -- --script crates/rustim-app/tests/fixtures/script/session.jsonl --inspect
@@ -111,6 +115,8 @@ BLESS=1 cargo test -p rustim-app --test goldens # ...and rewrite them (review th
 cargo test -p rustim-app --test script          # the command feed, end to end, through the binary
 cargo test -p rustim-app --test captions        # the band is in the bottom of the still, and replays
 cargo test -p rustim-app --test speech          # --speak refuses the headless flags (no backend needed)
+cargo test -p rustim-app --test export          # the export loop, the sinks and the .srt timings
+cargo test -p rustim-export --test compare_cli  # the visual-regression CLI's exit codes
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
@@ -136,7 +142,10 @@ it would silently put a desktop accessibility binding inside the kernel. Checked
 so it cannot pass vacuously if the dependency is ever renamed away.
 
 Always benchmark in `--release`. The debug profile is not meaningfully representative for a
-rasteriser.
+rasteriser — and *not at all* for an **export**: `--video-png` in a debug build spends ~0.6 s per
+1280×720 frame in the unoptimised `flate2` (the whole 600-frame default is six minutes), against
+~8 ms per frame under `--release` end to end. That is why `tests/export.rs` stays at a few dozen
+frames, and why the commands above name `--release` for the export examples.
 
 **`rust-toolchain.toml` pins `stable`, deliberately not an exact version — do not "restore" a `1.92`
 pin there.** Every channel named there has to be fetched whole from `static.rust-lang.org`, which on
@@ -214,7 +223,8 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   this machine.
 - **The thresholds are §5.2's measured ones and are not to be relaxed**: identical content bounding
   boxes, zero pixels differing by more than 8, maximum channel error 3. The comparison lives in
-  `rustim_export::compare` (not in the test) because P5's visual-regression CLI reuses it.
+  `rustim_export::compare` (not in the test), and the `rustim-compare` CLI is a thin shell over the
+  same function — so the suite and a host cannot drift onto two notions of "the same image".
   `rustim-app`'s `--png` renders *the scene after a fixed 10 s of virtual time*, not "as many frames
   as the scene happens to need" — otherwise a duration change would silently rebless a golden as a
   capture of a half-faded frame.
@@ -284,8 +294,8 @@ last property.
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
-| `rustim-export` | PNG encoding, and the `compare` module that scores two frames | Real; ffmpeg pipe not written |
-| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — eight `--scene` entries, the golden, script and caption suites | Real |
+| `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
+| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead.
@@ -956,6 +966,61 @@ The dependency is one-directional and worth stating: captions and speech consume
 `live_text()` the adapter pushes, so there is no second source of truth about what was said. The cost
 is one frame of latency (the band is read after the update that produced the sentence) and the
 announcer's merge window for announcements — which is why narration does not go through it.
+
+### Video export and subtitles
+
+`rustim-export` owns both halves of "get this out of the process": the frame comparison and the
+**sink**. `VideoSink` is the seam (`write_frame(rgba, w, h)` and `finish`), and the two
+implementations are the two honest answers:
+
+- **`FfmpegSink`** pipes raw RGBA to an `ffmpeg` binary on `PATH` — `-f rawvideo -pixel_format rgba`
+  in, `libx264`/`yuv420p` out. It is `--video out.mp4`.
+- **`PngSequenceSink`** writes `frame-00000.png`, … with this crate's own encoder. It needs no
+  external program, so it is the one that works on every platform the engine targets, and it is the
+  artifact a determinism claim can be made about (an mp4's bytes move with the encoder's build; the
+  frame stream does not). It is `--video-png DIR`.
+
+**The frames are premultiplied and the sinks disagree about what to do with that.** `Renderer::pixels`
+is premultiplied RGBA8; every scene fills the background first, so every frame is opaque and
+premultiplied == straight. `PngSequenceSink` un-premultiplies anyway (`straight_rgba`, a no-op for
+`a == 255`), because a PNG of a transparent frame should be right; `FfmpegSink` pipes the bytes
+through as they are, because converting 600 frames of alpha the engine never produces would be a
+per-frame allocation for nothing. A scene that ever drew onto a transparent background would make
+that visible here and nowhere else.
+
+**`finish` is a method, not `Drop`, and the difference is the report.** `Drop` closes the pipe so the
+encoder flushes, but only `finish` can wait and return a non-zero exit as an error — a truncated file
+must not look like a successful export. The app resolves `ffmpeg` before the first frame (the same
+`speech::find` PATH search), so "not installed" is one line and no render was spent on it.
+
+**One loop feeds both sinks** (`main::export_timeline`), so an mp4 and a frame sequence are the same
+frames. It builds each frame with `build_frame(.., STEP)` — exactly what `settle` does — so a
+600-frame export ends on the frame `--png` captures, and the test asserts `max == 0` rather than a
+golden tolerance. Every frame is a **full** render: damage rectangles exist to avoid recomputing what
+is already on screen, and there is no screen. Three properties are decisions:
+
+- **An export is `Motion::Full` unless `--motion` says otherwise.** Reduced motion is a *player's*
+  preference; a video rendered on a machine with it enabled would be a different film from the same
+  command elsewhere — the same reason the golden suite passes `--motion full` explicitly.
+- **The default is `STILL_SECONDS` worth of frames (600) at `1/STEP` = 60 fps**, so `--video` and
+  `--png` describe the same span. `--frames 0` is refused rather than writing an empty file.
+- **`--srt` writes the narration track timed by `SceneContext::clock()`** — virtual time, because
+  wall time in a headless run is how long the machine took to draw (`take_narration_timed` keeps each
+  line's due time for exactly this). A new line **ends the cue it replaces** (that is when the band
+  changes text), and the last cue stops at the end of the file rather than running past it. With
+  `--srt` alone the opening summary is included, so a scene with no narration still yields a track;
+  with `--captions` the same lines are also drawn into the frames.
+
+`--video-png` **reports stale frames rather than deleting them**: exporting a shorter timeline into a
+directory a longer one filled would otherwise read as a longer sequence, and the path came from the
+caller. `--video`, `--video-png`, `--png`, `--inspect`, `--a11y-probe` and `--speak` are mutually
+exclusive pair by pair with a message naming the pair; `--srt` without a video mode is refused.
+
+**`rustim-compare`** is the visual-regression CLI over `compare`: `rustim-compare [--bbox-any] A B`,
+exit 0 pass / 1 fail / 2 cannot compare (missing file, size mismatch, wrong argument count), printing
+`ImageDiff::report`. `--bbox-any` relaxes **only** the identical-content-box rule; the per-pixel
+thresholds are the golden suite's and are not relaxed by any flag. The golden suite calls
+`compare_png_files` directly, so the CLI cannot drift into a different notion of "the same image".
 
 ### Text
 
@@ -1856,13 +1921,25 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   the transform that keeps `glifo` hinting — and its integration test asserts the *only* pixels that
   differ from a plain still are in the bottom band. Step 16 added `--speak` on `espeak-ng` / `say` /
   PowerShell's `System.Speech`, with the sentence on stdin, a speaker thread so the frame loop never
-  blocks, and the built-in voice yielding to a screen reader that has ever attached. Deliberately
-  deferred: `.srt` export (it belongs with video export, where the frame timeline exists — item 9 of
-  the development list), a user-selectable voice (the default is the distribution's; hard-coding
-  `-v cmn` breaks machines without that voice), `piper`, and captions that follow the camera or
-  scale with DPI — 24 px is the determinism promise.
-- **P3+** — video export and the visual-regression CLI; MathML flattening; the AI
-  command surface at full width; Web (WASM).
+  blocks, and the built-in voice yielding to a screen reader that has ever attached. The `.srt`
+  export it deferred landed with video export (the next bullet). Still deferred: a user-selectable
+  voice (the default is the distribution's; hard-coding `-v cmn` breaks machines without that
+  voice), `piper`, and captions that follow the camera or scale with DPI — 24 px is the determinism
+  promise.
+- **P3's video export and the visual-regression CLI are done**, and the split is the design:
+  `rustim-export` gained the `VideoSink` seam with an `ffmpeg` pipe and a PNG-sequence fallback, the
+  `srt` writer, and the `rustim-compare` binary over the existing `compare`; `rustim-app` gained
+  `--video` / `--video-png` / `--srt` and one `export_timeline` loop feeding either sink. The claims
+  are the loop's: a one-frame export of a static scene is **pixel-identical** to the `--png` still
+  (`max == 0`, empty diff box), twelve frames of `rotate` differ from each other and repeat pixel
+  for pixel across runs, the cue track is timed on the virtual clock (0.0/0.1/0.2 over half a second
+  yields three exact cues), and a missing `ffmpeg` is one line and exit 2 before a frame is rendered.
+  **No golden
+  moved** — the export path draws through `build_frame`, so it adds a retirement of the timeline and
+  not a second picture. Deliberately deferred: audio muxing (the engine has no audio), a damage-based
+  export renderer (every frame is a new artifact, so a region render would save nothing), resumable
+  or streaming exports, and subtitle styling/RTL.
+- **P3+** — MathML flattening; the AI command surface at full width; Web (WASM).
 
 ## AI integration
 
