@@ -439,6 +439,62 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// Show a matrix: a grid of cells with brackets, optional row and column
+    /// labels, a left-hand side and a caption.
+    ///
+    /// The fourth `explain.*` template. `rows` is the cell table, row by row;
+    /// every cell is a number or a string ([`Cell`]), every row must have the
+    /// same number of cells, and the grid is at least 1×1 and at most 16×16.
+    /// A blank cell is refused: an empty entry in a matrix is a mistake, not a
+    /// blank space.
+    ///
+    /// Cells are **plain text**, not formulas: numbers and words are what a
+    /// matrix entry normally is, and a symbolic entry (`x^2`) renders literally.
+    /// A lesson that needs typeset algebra in a cell uses `add` of `formula`.
+    ///
+    /// `brackets` (default `"square"`) selects `"square"` `[…]`, `"round"` `(…)`,
+    /// `"bars"` `|…|` for a determinant, or `"none"`. `column_labels` and
+    /// `row_labels` name the columns and rows; `lhs` is text placed left of the
+    /// whole matrix (`"A ="`). The matrix's own cells and brackets take `color`;
+    /// the labels, the `lhs` and the caption stay foreground, because `color`
+    /// names the matrix.
+    ///
+    /// **The bracketed matrix is centred on `position`** — the labels hang around
+    /// it — so the same slot means the same thing it means in every template.
+    /// Column widths and row heights are each the largest cell in that column or
+    /// row, so the grid is rectangular without the caller padding strings.
+    ///
+    /// The reply's `created` is `[group, brackets…, cell…, column label…, row
+    /// label…, lhs?, caption?]`, cells row-major. Every cell is addressable and
+    /// labelled by its own text, so repeated values are `ambiguous_label` — the
+    /// same rule `explain.plot`'s tick labels follow. Answered by
+    /// [`crate::SceneContext::handle`] because the text is typeset; without a
+    /// text typesetter the command is [`CommandError::Unsupported`] under `text`,
+    /// since there is no matrix without text.
+    #[serde(rename = "explain.matrix")]
+    ExplainMatrix {
+        rows: Vec<Vec<Cell>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        column_labels: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row_labels: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brackets: Option<MatrixBrackets>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lhs: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<[u8; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Dim everything but an object for a moment, then bring it back.
     ///
     /// The attention helper a spoken explanation needs and `point_at` does not
@@ -781,6 +837,7 @@ pub const ACTIONS: &[&str] = &[
     "events",
     "explain.equation",
     "explain.geometry",
+    "explain.matrix",
     "explain.plot",
     "fit",
     "hello",
@@ -823,6 +880,7 @@ impl Command {
             Self::Annotate { .. } => "annotate",
             Self::ExplainEquation { .. } => "explain.equation",
             Self::ExplainGeometry { .. } => "explain.geometry",
+            Self::ExplainMatrix { .. } => "explain.matrix",
             Self::ExplainPlot { .. } => "explain.plot",
             Self::Highlight { .. } => "highlight",
             Self::Play { .. } => "play",
@@ -976,6 +1034,97 @@ impl<'de> Deserialize<'de> for Target {
         // JSON shapes in one field.
         d.deserialize_any(TargetVisitor)
     }
+}
+
+/// A matrix cell: a number the template renders in its shortest spelling, or a
+/// string it renders verbatim.
+///
+/// Both spellings exist because both are natural. A model writing a numeric
+/// matrix sends `[[1, 2], [3, 4]]`; a matrix of symbols or of exact values
+/// (`"a"`, `"1/2"`, `"−2"`) sends strings, which is also the only way to choose
+/// the glyphs. A number is serialised back as a JSON number, so the protocol's
+/// canonical spelling of `1` is `1.0` (serde_json writes an `f64` with its
+/// decimal point) — a host that needs `1` exactly sends `"1"`.
+///
+/// Hand-written for [`Target`]'s reason: an untagged enum's "did not match any
+/// variant" would tell a client that put an object in a cell nothing useful.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cell {
+    Number(f64),
+    Text(String),
+}
+
+impl std::fmt::Display for Cell {
+    /// The glyphs the cell is rendered from. Rust's shortest round-trip
+    /// spelling of a number, so `1.0` displays as `1` and `0.5` as `0.5`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Number(value) => write!(f, "{value}"),
+            Self::Text(text) => f.write_str(text),
+        }
+    }
+}
+
+impl Serialize for Cell {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Number(value) => s.serialize_f64(*value),
+            Self::Text(text) => s.serialize_str(text),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Cell {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, Visitor};
+
+        struct CellVisitor;
+
+        impl Visitor<'_> for CellVisitor {
+            type Value = Cell;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a matrix cell (a number or a string)")
+            }
+
+            fn visit_u64<E: Error>(self, v: u64) -> Result<Cell, E> {
+                Ok(Cell::Number(v as f64))
+            }
+
+            fn visit_i64<E: Error>(self, v: i64) -> Result<Cell, E> {
+                Ok(Cell::Number(v as f64))
+            }
+
+            fn visit_f64<E: Error>(self, v: f64) -> Result<Cell, E> {
+                Ok(Cell::Number(v))
+            }
+
+            fn visit_str<E: Error>(self, v: &str) -> Result<Cell, E> {
+                Ok(Cell::Text(v.to_owned()))
+            }
+        }
+
+        d.deserialize_any(CellVisitor)
+    }
+}
+
+/// The bracket style a matrix is drawn with.
+///
+/// A serde enum, so an unknown spelling is a parse error rather than an
+/// `out_of_range` — the same rule [`crate::Rate`] follows: a name that is not in
+/// the vocabulary never becomes a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixBrackets {
+    /// `[…]` — the default, and the notation for a matrix.
+    #[default]
+    Square,
+    /// `(…)` — a matrix written as a tuple of columns.
+    Round,
+    /// `|…|` — a determinant.
+    Bars,
+    /// Nothing around the entries — a table that is not yet a matrix.
+    None,
 }
 
 /// The wire spelling of [`rustim_anim::Motion`].
@@ -2014,6 +2163,11 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // bare figure needs none, but `apply` cannot know which spelling
             // arrived without duplicating the template's own validation.
         }
+        Command::ExplainMatrix { .. } => {
+            // Answered by `SceneContext::handle`: every cell is typeset, so there
+            // is no matrix `apply` could build — the template has nothing to fall
+            // back to without fonts.
+        }
         Command::Narrate { .. } => {
             // Answered by `SceneContext::handle`, because scheduling narration
             // needs the virtual clock and the narration track — neither of which
@@ -2879,6 +3033,11 @@ mod tests {
             r#"{"action":"explain.plot","coefficients":[1.0,0.0,-1.0]}"#.to_owned(),
             r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[3.0,0.0],[0.0,4.0]],"side_labels":["a","b","c"],"vertex_labels":["A","B","C"],"right_angle":true,"fill_opacity":0.3,"color":[100,181,246],"label_size":0.4,"position":[0.0,0.5],"caption":"直角三角形","caption_size":0.5,"label":"图形"}"#.to_owned(),
             r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[2.0,0.0],[1.0,2.0]]}"#.to_owned(),
+            // The third template's cells are numbers *or* strings, and a number
+            // is written back as a JSON `f64` — the canonical spelling of `1`
+            // is `1.0`, which is why the fixture says so.
+            r#"{"action":"explain.matrix","rows":[[1.0,2.0],[3.0,4.0]],"column_labels":["列一","列二"],"row_labels":["行一","行二"],"brackets":"bars","lhs":"A =","cell_size":0.4,"color":[100,181,246],"position":[0.0,0.5],"caption":"行列式","caption_size":0.5,"label":"矩阵"}"#.to_owned(),
+            r#"{"action":"explain.matrix","rows":[["a","b"],["c","d"]]}"#.to_owned(),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for json in cases {
@@ -2991,6 +3150,19 @@ mod tests {
                 fill_opacity: None,
                 color: None,
                 label_size: None,
+                position: None,
+                caption: None,
+                caption_size: None,
+                label: None,
+            },
+            Command::ExplainMatrix {
+                rows: vec![vec![Cell::Number(1.0), Cell::Number(2.0)]],
+                column_labels: None,
+                row_labels: None,
+                brackets: None,
+                lhs: None,
+                cell_size: None,
+                color: None,
                 position: None,
                 caption: None,
                 caption_size: None,

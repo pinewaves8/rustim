@@ -1374,6 +1374,50 @@ impl SceneContext {
             return crate::templates::geometry(&mut self.tree, typesetter, args)
                 .map(CommandOutcome::Applied);
         }
+        if let Command::ExplainMatrix {
+            rows,
+            column_labels,
+            row_labels,
+            brackets,
+            lhs,
+            cell_size,
+            color,
+            position,
+            caption,
+            caption_size,
+            label,
+        } = cmd
+        {
+            // Every cell is text, so unlike a figure there is no bare spelling
+            // to fall back to. The same check is `templates::matrix`'s first
+            // act; this one keeps the refusal beside the capability query a
+            // host reads from `hello`.
+            if !self.supports_text() {
+                return Err(CommandError::Unsupported {
+                    feature: "text".to_owned(),
+                });
+            }
+            let Some(typesetter) = self.typesetter.as_mut() else {
+                return Err(CommandError::Unsupported {
+                    feature: "text".to_owned(),
+                });
+            };
+            let args = crate::templates::Matrix {
+                rows,
+                column_labels: column_labels.as_deref(),
+                row_labels: row_labels.as_deref(),
+                brackets: (*brackets).unwrap_or_default(),
+                lhs: lhs.as_deref(),
+                cell_size: *cell_size,
+                color: *color,
+                position: *position,
+                caption: caption.as_deref(),
+                caption_size: *caption_size,
+                label: label.as_deref(),
+            };
+            return crate::templates::matrix(&mut self.tree, typesetter.as_mut(), args)
+                .map(CommandOutcome::Applied);
+        }
         if let Command::Highlight {
             target,
             dim,
@@ -1743,6 +1787,7 @@ mod tests {
     use rustim_mobject::{Mobject, NodeKind, TextBlock, TextRun};
     use rustim_render::TextGlyph;
 
+    use crate::command::Cell;
     use crate::typeset::{TypesetError, TypesetFormula};
 
     /// The frame grid. Virtual time, never wall-clock — the same `1/60` the app's
@@ -3964,6 +4009,340 @@ mod tests {
             ctx.tree.len(),
             before,
             "a refused figure left pieces behind"
+        );
+    }
+
+    // ---- explain.matrix ---------------------------------------------------
+
+    /// A bare matrix command: every optional slot defaulted.
+    fn explain_matrix(rows: Vec<Vec<Cell>>) -> Command {
+        Command::ExplainMatrix {
+            rows,
+            column_labels: None,
+            row_labels: None,
+            brackets: None,
+            lhs: None,
+            cell_size: None,
+            color: None,
+            position: None,
+            caption: None,
+            caption_size: None,
+            label: None,
+        }
+    }
+
+    /// The default spelling: square brackets, measured columns, row-major
+    /// cells each labelled by the text it renders.
+    #[test]
+    fn a_bare_matrix_has_square_brackets_and_addressable_cells() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"action":"explain.matrix","rows":[[1,2],[3,4]]}"#)
+                .expect("a wire matrix");
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &cmd);
+
+        // Group, two brackets, four cells.
+        assert_eq!(diff.created.len(), 7, "{:?}", diff.created);
+        let group = diff.created[0];
+        assert_eq!(ctx.tree.get(group).unwrap().kind, NodeKind::Group);
+        assert_eq!(
+            ctx.tree.get(diff.created[1]).unwrap().label.as_deref(),
+            Some("左括号")
+        );
+        assert_eq!(
+            ctx.tree.get(diff.created[1]).unwrap().kind,
+            NodeKind::Unknown,
+            "a bracket is scenery, not a small figure with an area"
+        );
+        assert_eq!(
+            ctx.tree.get(diff.created[2]).unwrap().label.as_deref(),
+            Some("右括号")
+        );
+
+        // Two 1×1 cells, a 0.4 column gap and a 0.25 row gap: the grid is 2.4
+        // wide and 2.25 tall. The square bracket is 0.1 clear of it and 0.3
+        // deep (0.15 of the height, clamped to the 0.3 cap).
+        let bracket = ctx.tree.world_bounds(diff.created[1]).unwrap();
+        assert!((bracket.x0 + 1.6).abs() < 1e-12, "{bracket:?}");
+        assert!((bracket.x1 + 1.3).abs() < 1e-12, "{bracket:?}");
+        assert!((bracket.y0 + 1.125).abs() < 1e-12, "{bracket:?}");
+        assert!((bracket.y1 - 1.125).abs() < 1e-12, "{bracket:?}");
+
+        // Cells run row-major and carry their own shortest spelling.
+        for (id, (label, centre)) in diff.created[3..7].iter().zip([
+            ("1", [-0.7, 0.625]),
+            ("2", [0.7, 0.625]),
+            ("3", [-0.7, -0.625]),
+            ("4", [0.7, -0.625]),
+        ]) {
+            let m = ctx.tree.get(*id).unwrap();
+            assert_eq!(m.kind, NodeKind::Text);
+            assert_eq!(m.label.as_deref(), Some(label));
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            assert!((bounds.center().x - centre[0]).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.center().y - centre[1]).abs() < 1e-12, "{bounds:?}");
+        }
+
+        // The group declares the union of its pieces, brackets included.
+        let declared = ctx.tree.get(group).unwrap().local_bounds.unwrap();
+        assert!((declared.x0 + 1.6).abs() < 1e-12, "{declared:?}");
+        assert!((declared.x1 - 1.6).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y0 + 1.125).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y1 - 1.125).abs() < 1e-12, "{declared:?}");
+    }
+
+    /// Every optional slot filled, on a grid whose columns differ in width.
+    ///
+    /// The fake shaper is one unit tall and one unit per character wide, so the
+    /// 3-wide `"1/2"` makes the first column 3 wide while the second stays 1 —
+    /// a template that used one cell's width for the whole grid, or that
+    /// measured the un-typeset strings, lands somewhere else.
+    #[test]
+    fn a_matrix_measures_its_columns_and_hangs_its_labels_outside() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.matrix","rows":[[1.0,"x"],["1/2",4.0]],"column_labels":["列一","列二"],"row_labels":["甲","乙"],"brackets":"bars","lhs":"A =","position":[1.0,2.0],"caption":"行列式","label":"矩阵"}"#,
+        )
+        .expect("a wire matrix");
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &cmd);
+
+        // Group, two bars, four cells, two column labels, two row labels, the
+        // lhs and the caption.
+        assert_eq!(diff.created.len(), 13, "{:?}", diff.created);
+        assert_eq!(
+            ctx.tree.get(diff.created[0]).unwrap().label.as_deref(),
+            Some("矩阵")
+        );
+
+        // The grid is 4.4 wide (3 + 0.4 + 1) and 2.25 tall; the bars stand
+        // 0.1 clear of it and the group moves everything by (1, 2).
+        for (id, x) in diff.created[1..3].iter().zip([-2.3, 2.3]) {
+            assert_eq!(ctx.tree.get(*id).unwrap().kind, NodeKind::Line);
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            assert!((bounds.center().x - (x + 1.0)).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.center().y - 2.0).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.height() - 2.25).abs() < 1e-12, "{bounds:?}");
+        }
+
+        // Cells: the first column is 3 wide, so its centre is at local -0.7;
+        // the second column starts at 1.2 and is centred at 1.7.
+        for (id, (label, centre)) in diff.created[3..7].iter().zip([
+            ("1", [0.3, 2.625]),
+            ("x", [2.7, 2.625]),
+            ("1/2", [0.3, 1.375]),
+            ("4", [2.7, 1.375]),
+        ]) {
+            assert_eq!(
+                ctx.tree.get(*id).unwrap().label.as_deref(),
+                Some(label),
+                "a number renders in its shortest spelling, a string verbatim"
+            );
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            assert!((bounds.center().x - centre[0]).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.center().y - centre[1]).abs() < 1e-12, "{bounds:?}");
+        }
+
+        // Column labels sit one gap above the grid's top (local 1.125), and are
+        // centred over their own column.
+        let first = centres(&ctx, &diff, "列一");
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!((first[0].x - 0.3).abs() < 1e-12, "{:?}", first[0]);
+        assert!((first[0].y - 3.975).abs() < 1e-12, "{:?}", first[0]);
+        let second = centres(&ctx, &diff, "列二");
+        assert!((second[0].x - 2.7).abs() < 1e-12, "{:?}", second[0]);
+
+        // Row labels are right-aligned against the left bar, one small gap
+        // away: local x = -2.3 - 0.12 - 0.5.
+        let row = centres(&ctx, &diff, "甲");
+        assert_eq!(row.len(), 1, "{row:?}");
+        assert!((row[0].x + 1.92).abs() < 1e-12, "{:?}", row[0]);
+        assert!((row[0].y - 2.625).abs() < 1e-12, "{:?}", row[0]);
+
+        // The lhs clears the widest row label by the same gap and is centred
+        // vertically on the grid.
+        let lhs = centres(&ctx, &diff, "A =");
+        assert_eq!(lhs.len(), 1, "{lhs:?}");
+        assert!((lhs[0].x + 4.04).abs() < 1e-12, "{:?}", lhs[0]);
+        assert!((lhs[0].y - 2.0).abs() < 1e-12, "{:?}", lhs[0]);
+
+        // The caption hangs under the lowest piece (the bottom cell), not off
+        // the grid's nominal height.
+        let caption = *diff.created.last().unwrap();
+        let text = ctx.tree.world_bounds(caption).unwrap();
+        assert_eq!(ctx.tree.get(caption).unwrap().kind, NodeKind::Text);
+        assert!((text.center().x - 1.0).abs() < 1e-12, "{text:?}");
+        assert!((text.center().y - 0.025).abs() < 1e-12, "{text:?}");
+
+        // The group's declared box is the union, which reaches further left
+        // for the lhs and right for the column labels than the grid does.
+        let declared = ctx.tree.get(diff.created[0]).unwrap().local_bounds.unwrap();
+        assert!((declared.x0 + 6.54).abs() < 1e-12, "{declared:?}");
+        assert!((declared.x1 - 2.7).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y0 + 2.475).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y1 - 2.475).abs() < 1e-12, "{declared:?}");
+    }
+
+    /// The four bracket spellings, and the gap each one leaves.
+    #[test]
+    fn each_bracket_style_is_its_own_spelling() {
+        let parse = |extra: &str| -> Command {
+            serde_json::from_str(&format!(
+                r#"{{"action":"explain.matrix","rows":[[1.0]]{extra}}}"#
+            ))
+            .expect("a wire matrix")
+        };
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+
+        let none = applied(&mut ctx, &parse(r#","brackets":"none""#));
+        assert_eq!(
+            none.created.len(),
+            2,
+            "the group and one cell, nothing else"
+        );
+
+        // A round bracket is a stroked half-ellipse: it opens 0.1 clear of the
+        // entry and bulges another 0.12 (0.12 of the height, clamped) outward.
+        let round = applied(&mut ctx, &parse(r#","brackets":"round""#));
+        assert_eq!(round.created.len(), 4, "group, two arcs, one cell");
+        let left = round.created[1];
+        assert_eq!(ctx.tree.get(left).unwrap().kind, NodeKind::Plot);
+        assert_eq!(ctx.tree.get(left).unwrap().label.as_deref(), Some("左括号"));
+        let bounds = ctx.tree.world_bounds(left).unwrap();
+        assert!((bounds.x0 + 0.72).abs() < 1e-9, "{bounds:?}");
+        assert!((bounds.x1 + 0.6).abs() < 1e-9, "{bounds:?}");
+
+        // A determinant bar is a stroked line, not a filled rectangle.
+        let bars = applied(&mut ctx, &parse(r#","brackets":"bars""#));
+        assert_eq!(bars.created.len(), 4);
+        for (id, x) in bars.created[1..3].iter().zip([-0.6, 0.6]) {
+            assert_eq!(ctx.tree.get(*id).unwrap().kind, NodeKind::Line);
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            assert!((bounds.center().x - x).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.height() - 1.0).abs() < 1e-12, "{bounds:?}");
+        }
+    }
+
+    /// Every refusal names its own field and leaves the tree exactly as it
+    /// found it.
+    #[test]
+    fn a_matrix_refuses_before_creating_anything() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let before = ctx.tree.len();
+        for (json, field) in [
+            (r#"{"action":"explain.matrix","rows":[]}"#, "rows"),
+            (r#"{"action":"explain.matrix","rows":[[]]}"#, "rows"),
+            (
+                r#"{"action":"explain.matrix","rows":[[1.0],[2.0,3.0]]}"#,
+                "rows",
+            ),
+            (r#"{"action":"explain.matrix","rows":[["a"," "]]}"#, "rows"),
+            (
+                r#"{"action":"explain.matrix","rows":[[1.0]],"column_labels":["a","b"]}"#,
+                "column_labels",
+            ),
+            (
+                r#"{"action":"explain.matrix","rows":[[1.0]],"row_labels":[]}"#,
+                "row_labels",
+            ),
+            (
+                r#"{"action":"explain.matrix","rows":[[1.0]],"row_labels":[" "]}"#,
+                "row_labels",
+            ),
+            (
+                r#"{"action":"explain.matrix","rows":[[1.0]],"lhs":"  "}"#,
+                "lhs",
+            ),
+            (
+                r#"{"action":"explain.matrix","rows":[[1.0]],"cell_size":0.0}"#,
+                "cell_size",
+            ),
+            (
+                r#"{"action":"explain.matrix","rows":[[1.0]],"caption":" "}"#,
+                "caption",
+            ),
+            (
+                r#"{"action":"explain.matrix","rows":[[1.0]],"caption_size":-2.0}"#,
+                "caption_size",
+            ),
+        ] {
+            let cmd: Command = serde_json::from_str(json).expect("a wire matrix");
+            assert!(
+                matches!(
+                    ctx.handle(&cmd),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == field
+                ),
+                "{json} refused as the wrong field"
+            );
+            assert_eq!(ctx.tree.len(), before, "{json} left nodes behind");
+        }
+
+        // The caps and the non-finite spellings have no JSON spelling of their
+        // own here, so these are built directly.
+        let wide = explain_matrix(vec![vec![Cell::Number(1.0); 17]]);
+        assert!(matches!(
+            ctx.handle(&wide),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "rows"
+        ));
+        let tall = explain_matrix(vec![vec![Cell::Number(1.0)]; 17]);
+        assert!(matches!(
+            ctx.handle(&tall),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "rows"
+        ));
+        for cell in [Cell::Number(f64::NAN), Cell::Number(f64::INFINITY)] {
+            let mut bad = explain_matrix(vec![vec![cell.clone()]]);
+            if let Command::ExplainMatrix { rows, .. } = &mut bad {
+                rows[0][0] = cell;
+            }
+            assert!(matches!(
+                ctx.handle(&bad),
+                Err(CommandError::OutOfRange { ref property, .. }) if property == "rows"
+            ));
+        }
+        let mut off_world = explain_matrix(vec![vec![Cell::Number(1.0)]]);
+        if let Command::ExplainMatrix { position, .. } = &mut off_world {
+            *position = Some([f64::INFINITY, 0.0]);
+        }
+        assert!(matches!(
+            ctx.handle(&off_world),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "position"
+        ));
+        assert_eq!(ctx.tree.len(), before);
+    }
+
+    /// A matrix is nothing but text, so a build with no typesetter refuses it
+    /// rather than drawing an empty grid.
+    #[test]
+    fn a_matrix_needs_a_text_typesetter() {
+        let mut ctx = scene();
+        let before = ctx.tree.len();
+        assert!(matches!(
+            ctx.handle(&explain_matrix(vec![vec![Cell::Number(1.0)]])),
+            Err(CommandError::Unsupported { ref feature }) if feature == "text"
+        ));
+        assert_eq!(ctx.tree.len(), before);
+    }
+
+    /// A typesetter that fails part-way — after the brackets and some cells are
+    /// already in the tree — rolls the whole matrix back.
+    #[test]
+    fn a_failed_cell_rolls_the_matrix_back() {
+        let mut ctx = with_typesetter(FakeTypesetter {
+            refuse: Some(TypesetError::failed("assets/fonts is missing")),
+            ..FakeTypesetter::both()
+        });
+        let before = ctx.tree.len();
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.matrix","rows":[[1.0,2.0],[3.0,4.0]],"column_labels":["a","b"]}"#,
+        )
+        .expect("a wire matrix");
+        assert!(matches!(
+            ctx.handle(&cmd),
+            Err(CommandError::Typeset { .. })
+        ));
+        assert_eq!(
+            ctx.tree.len(),
+            before,
+            "a refused matrix left pieces behind"
         );
     }
 

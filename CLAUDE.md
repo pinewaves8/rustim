@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **870 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **879 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -373,7 +373,7 @@ last property.
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it), `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) and `templates` (the `explain.*` thick tools: one group, addressable pieces, a declared box and an atomic rollback) | Real |
-| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the remaining three templates, the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; the first three templates live one crate up) |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the remaining two templates, the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; the first four templates live one crate up) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -2103,7 +2103,7 @@ two-piece count. `ACTIONS` 26 → 27. **All eight goldens are unchanged**, and t
 846 → 856.
 
 Deferred, and named so they are not rediscovered as gaps: labels that *follow* their subject, the
-remaining three `explain.*` templates (`matrix`, `chart`, `algorithm`), the linter
+remaining two `explain.*` templates (`chart`, `algorithm`), the linter
 (out of frame, overlap, size, contrast, pacing) and `ScenePlan`. Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
 arrow is a static node placed once; re-placing it is a `point_at` again, and following would need a
 per-frame constraint the tree does not have), and spotlight-beyond-opacity (a true mask over the
@@ -3010,6 +3010,31 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   by-field refusals plus three constructed ones with the tree unchanged, and a late-typesetter
   rollback), two round-trip fixtures, and a conformance case through the real binary;
   **all eight goldens unchanged**, count 859 → 870.
+- **Phase 2's eighth slice — the fourth template, `explain.matrix` — is done**, and it is the first
+  template whose subject is *text all the way down*: a matrix is a measured grid of typeset cells, so
+  unlike `geometry` it has no bare spelling — a build with no text typesetter refuses every call under
+  `text`. Four decisions are load-bearing. **A cell is plain text, not a formula** (`Cell::Number` /
+  `Cell::Text`): a matrix entry is normally a number or a word, a symbolic entry (`x^2`) renders
+  literally, and a lesson that needs typeset algebra uses `add` of `formula` — there is no second
+  typesetting path inside the template. **Column widths and row heights are measured** as the widest
+  cell per column and the tallest per row, so the caller never pads strings to make a grid line up and
+  unequal cells cannot collide. **The four bracket spellings each use a shape the kernel already
+  had**: `square` is one filled 8-corner L outline (`Polygon`, `kind = Unknown` so it is announced as
+  an image rather than an area), `bars` is a stroked `Line` turned a quarter turn about its own tail,
+  `round` is a sampled `Plot` half-ellipse, `none` emits no node — no new kernel shape was added for
+  a bracket. **Every cell is addressable and labelled by its own text**, so a table with two `1`s is
+  `ambiguous_label` by label exactly as a shared tick value is in `plot`; the caption keeps no label
+  and is addressed by id. The round bracket cost one real bug the test caught: its `centre_x` is
+  where the arc *opens*, not the ellipse's centre, and passing the latter put the bracket a whole
+  semi-width too far from the grid — the bounds assertion is what saw it.
+  `created = [group, brackets…, cells row-major, column labels, row labels, lhs?, caption?]`, and
+  `ACTIONS` 28 → 29. Evidence: two unit tests over the pure bracket outlines, six context tests (the
+  bare square-bracket layout with its declared box, the full-slot grid with unequal columns and every
+  hanging label, the four bracket spellings, eleven by-field refusals plus four constructed ones with
+  the tree unchanged, no-typesetter refusal, and the late-cell rollback), two round-trip fixtures,
+  and a conformance case through the real binary that reads back the bracket and cell names, asserts
+  the duplicate-cell `ambiguous_label`, and proves a ragged row leaves no group behind;
+  **all eight goldens unchanged**, count 870 → 879.
 
 ## AI integration
 

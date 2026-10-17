@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (28 actions, 12 shapes, 11 animations, 10
+//!    the build actually has (29 actions, 12 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -155,7 +155,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 28, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 29, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -668,6 +668,87 @@ fn the_geometry_template_groups_a_figure_its_labels_and_a_marker() {
         .expect("a tree");
     assert!(
         !tree.nodes.iter().any(|node| node.name == "空的"),
+        "a refused template left its group behind"
+    );
+
+    finish(client, &png);
+}
+
+/// The fourth `explain.*` template: a matrix whose cells are real, named nodes.
+///
+/// The pieces only the real binary can prove are that the host's shaper draws
+/// every entry (a cell is a glyph run, not a picture), that two identical cells
+/// are an `ambiguous_label` rather than a silent pick, and that a refusal by
+/// field leaves nothing behind.
+#[test]
+fn the_matrix_template_groups_its_cells_and_addresses_each_by_its_text() {
+    let (mut client, png) = client("matrix");
+
+    // The group, two square brackets, four cells, two column labels, two row
+    // labels and a caption.
+    let created = expect_diff(
+        &mut client,
+        r#"{"action":"explain.matrix","rows":[[1.0,2.0],[1.0,4.0]],"column_labels":["列一","列二"],"row_labels":["甲","乙"],"caption":"行列式","label":"矩阵"}"#,
+    )
+    .created;
+    assert_eq!(created.len(), 12, "{:?}", created);
+
+    let group = created[0];
+    let tree = client
+        .send_raw(&format!(r#"{{"action":"query","target":{}}}"#, group.raw()))
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert_eq!(tree.root, group);
+    assert_eq!(tree.nodes[0].name, "矩阵", "the label names the group");
+    assert!(
+        tree.nodes[0].bounds.is_some(),
+        "the group declares the union of its pieces"
+    );
+    let names: Vec<&str> = tree.nodes.iter().map(|node| node.name.as_str()).collect();
+    for name in [
+        "左括号",
+        "右括号",
+        "1",
+        "2",
+        "4",
+        "列一",
+        "列二",
+        "甲",
+        "乙",
+    ] {
+        assert!(names.contains(&name), "missing {name}: {names:?}");
+    }
+
+    // A duplicate cell is not a key: addressing "1" names two nodes in draw
+    // order instead of picking one.
+    let error = client
+        .send_raw(r#"{"action":"set","target":"1","property":{"name":"opacity","value":0.5}}"#)
+        .expect("a refusal is a reply")
+        .error;
+    assert!(
+        matches!(
+            error,
+            Some(rustim_client::CommandError::AmbiguousLabel { .. })
+        ),
+        "{error:?}"
+    );
+
+    // Ragged rows are refused under `rows`, and the refused group does not
+    // survive.
+    let error = client
+        .send_raw(r#"{"action":"explain.matrix","rows":[[1.0],[2.0,3.0]],"label":"残缺的矩阵"}"#)
+        .expect("a refusal is a reply")
+        .error
+        .expect("a ragged matrix is refused");
+    assert!(format!("{error}").contains("rows"), "{error}");
+    let tree = client
+        .send_raw(r#"{"action":"query"}"#)
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert!(
+        !tree.nodes.iter().any(|node| node.name == "残缺的矩阵"),
         "a refused template left its group behind"
     );
 

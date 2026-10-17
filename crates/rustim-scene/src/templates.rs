@@ -51,7 +51,7 @@ use rustim_math::{Affine2, Rect};
 use rustim_mobject::shapes::{AxesScale, DEFAULT_THICKNESS, ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree, TextBlock};
 
-use crate::command::{CommandError, StateDiff};
+use crate::command::{Cell, CommandError, MatrixBrackets, StateDiff};
 use crate::typeset::{TextSpec, Typesetter, style_formula, typeset_error};
 
 /// The gap between a template's pieces, in world units.
@@ -137,6 +137,18 @@ impl<'a> Build<'a> {
         let id = self
             .tree
             .insert(rustim_mobject::shapes::build(kind, &params));
+        self.adopt(id);
+        id
+    }
+
+    /// Insert a mobject the template built itself and attach it to the group.
+    ///
+    /// For a piece that needs a transform the shape builder cannot spell — a
+    /// matrix's vertical determinant bar is a horizontal `Line` turned a quarter
+    /// turn — the builder is called with the geometry and the transform is
+    /// composed on the way in.
+    fn node(&mut self, m: Mobject) -> NodeId {
+        let id = self.tree.insert(m);
         self.adopt(id);
         id
     }
@@ -1245,6 +1257,517 @@ fn marker_quad(vertices: &[[f64; 2]], index: usize) -> Option<Vec<[f64; 2]>> {
     Some(vec![corner, p, [p[0] + b[0] * size, p[1] + b[1] * size], q])
 }
 
+// ---- explain.matrix -----------------------------------------------------
+
+/// The most rows and columns one matrix may have.
+///
+/// A matrix is a *teaching* object, and the cap is the same posture as the
+/// figure's: a command from a model must not be able to allocate hundreds of
+/// text nodes. Sixteen square is already twelve times the largest matrix a
+/// lecture shows, and it is cheap to validate.
+const MAX_MATRIX_ROWS: usize = 16;
+const MAX_MATRIX_COLS: usize = 16;
+
+/// The gap between two columns and between two rows of cells.
+///
+/// Column gap wider than the row gap because entries are read across a row: a
+/// little air between columns is what stops `1 2` from reading as `12`, while
+/// rows are separated by their own line height already.
+const MATRIX_COLUMN_GAP: f64 = 0.4;
+const MATRIX_ROW_GAP: f64 = 0.25;
+
+/// The gap between the entries and a bracket.
+const BRACKET_GAP: f64 = 0.1;
+
+/// A square bracket's arm length: a fraction of the bracket's height, clamped
+/// so the arm neither vanishes on a one-row matrix nor becomes a picture of its
+/// own on a tall one. It is also clamped above the shaft thickness, because an
+/// arm shorter than the shaft is not a bracket.
+const MATRIX_SERIF_FRACTION: f64 = 0.15;
+const MATRIX_SERIF_MIN: f64 = 0.08;
+const MATRIX_SERIF_MAX: f64 = 0.3;
+
+/// A round bracket's half-width: a fraction of the bracket's height (an
+/// ellipse, not a semicircle), clamped for the same two reasons.
+const MATRIX_ROUND_FRACTION: f64 = 0.12;
+const MATRIX_ROUND_MIN: f64 = 0.05;
+const MATRIX_ROUND_MAX: f64 = 0.2;
+
+/// Samples per round bracket. A quarter of the whole ellipse, which at any
+/// size a 720p frame shows is finer than a pixel.
+const ROUND_BRACKET_SAMPLES: usize = 24;
+
+/// The names the two brackets carry.
+///
+/// Scenery rather than subjects, like the right-angle marker: `--inspect` names
+/// them, and a screen reader says which side a reader is on without being told
+/// a size it cannot use.
+const LEFT_BRACKET_LABEL: &str = "左括号";
+const RIGHT_BRACKET_LABEL: &str = "右括号";
+
+/// The slots `explain.matrix` fills.
+pub(crate) struct Matrix<'a> {
+    /// The cell table, row by row. Every row has the same number of cells.
+    pub rows: &'a [Vec<Cell>],
+    pub column_labels: Option<&'a [String]>,
+    pub row_labels: Option<&'a [String]>,
+    pub brackets: MatrixBrackets,
+    /// Text placed left of the whole matrix (`"A ="`).
+    pub lhs: Option<&'a str>,
+    /// The em size of the cells, the labels and the `lhs`.
+    pub cell_size: Option<f64>,
+    /// The cells' colour; the labels, the `lhs` and the caption stay foreground.
+    pub color: Option<[u8; 3]>,
+    pub position: Option<[f64; 2]>,
+    pub caption: Option<&'a str>,
+    pub caption_size: Option<f64>,
+    pub label: Option<&'a str>,
+}
+
+/// A grid of cells with brackets, row and column labels and a caption.
+///
+/// The template exists because a model asked to "show the matrix A" should not
+/// have to work out the column widths, where the brackets go, or that a label
+/// belongs outside them. It fills the slots and the engine makes those
+/// decisions.
+///
+/// The cells are typeset first, and **the grid is measured from them**: column
+/// `c` is as wide as its widest cell and row `r` as tall as its tallest, so a
+/// caller never pads a number to line a column up. The **bracketed matrix is
+/// centred on `position`** — the row labels, the `lhs` and the column labels
+/// hang around it — which keeps `position` meaning "the centre of the thing"
+/// as it does in every other template. A caption goes under the lowest piece,
+/// measured from the ink rather than from the grid.
+///
+/// Pieces, in `created` order: the left and right brackets (none for
+/// [`MatrixBrackets::None`]), the cells row-major, the column labels, the row
+/// labels, the `lhs`, then the caption. Every cell is labelled by the text it
+/// renders, so a cell can be addressed by value — and a matrix with a repeated
+/// value answers `ambiguous_label`, because a label is not a key.
+///
+/// Text is mandatory, so a build with no typesetter refuses the command under
+/// `text` rather than drawing an empty grid.
+pub(crate) fn matrix(
+    tree: &mut SceneTree,
+    typesetter: &mut dyn Typesetter,
+    args: Matrix<'_>,
+) -> Result<StateDiff, CommandError> {
+    let rows = args.rows;
+    if rows.is_empty() {
+        return Err(CommandError::OutOfRange {
+            property: "rows".to_owned(),
+            detail: "a matrix needs at least one row".to_owned(),
+        });
+    }
+    if rows.len() > MAX_MATRIX_ROWS {
+        return Err(CommandError::OutOfRange {
+            property: "rows".to_owned(),
+            detail: format!("{} rows exceed the {MAX_MATRIX_ROWS}-row cap", rows.len()),
+        });
+    }
+    let columns = rows[0].len();
+    if columns == 0 {
+        return Err(CommandError::OutOfRange {
+            property: "rows".to_owned(),
+            detail: "row 0 has no cells".to_owned(),
+        });
+    }
+    if columns > MAX_MATRIX_COLS {
+        return Err(CommandError::OutOfRange {
+            property: "rows".to_owned(),
+            detail: format!("{columns} cells in a row exceed the {MAX_MATRIX_COLS}-column cap"),
+        });
+    }
+    for (r, row) in rows.iter().enumerate() {
+        if row.len() != columns {
+            return Err(CommandError::OutOfRange {
+                property: "rows".to_owned(),
+                detail: format!("row {r} has {} cells, row 0 has {columns}", row.len()),
+            });
+        }
+        for (c, cell) in row.iter().enumerate() {
+            match cell {
+                Cell::Number(value) if !value.is_finite() => {
+                    return Err(CommandError::OutOfRange {
+                        property: "rows".to_owned(),
+                        detail: format!("row {r}, cell {c} is {value}, not a finite number"),
+                    });
+                }
+                Cell::Text(text) if text.trim().is_empty() => {
+                    return Err(CommandError::OutOfRange {
+                        property: "rows".to_owned(),
+                        detail: format!("row {r}, cell {c} is blank"),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    for (labels, field, want, what) in [
+        (args.column_labels, "column_labels", columns, "columns"),
+        (args.row_labels, "row_labels", rows.len(), "rows"),
+    ] {
+        let Some(labels) = labels else { continue };
+        if labels.len() != want {
+            return Err(CommandError::OutOfRange {
+                property: field.to_owned(),
+                detail: format!("{} labels for a matrix with {want} {what}", labels.len()),
+            });
+        }
+        if let Some(index) = labels.iter().position(|label| label.trim().is_empty()) {
+            return Err(CommandError::OutOfRange {
+                property: field.to_owned(),
+                detail: format!("label {index} is blank"),
+            });
+        }
+    }
+    if let Some(lhs) = args.lhs
+        && lhs.trim().is_empty()
+    {
+        return Err(CommandError::OutOfRange {
+            property: "lhs".to_owned(),
+            detail: "a left-hand side needs something to say".to_owned(),
+        });
+    }
+    if let Some(size) = args.cell_size
+        && (!size.is_finite() || size <= 0.0)
+    {
+        return Err(CommandError::OutOfRange {
+            property: "cell_size".to_owned(),
+            detail: format!("{size} is not a finite, positive size"),
+        });
+    }
+    if let Some(size) = args.caption_size
+        && (!size.is_finite() || size <= 0.0)
+    {
+        return Err(CommandError::OutOfRange {
+            property: "caption_size".to_owned(),
+            detail: format!("{size} is not a finite, positive size"),
+        });
+    }
+    let caption = match args.caption {
+        Some(text) if text.trim().is_empty() => {
+            return Err(CommandError::OutOfRange {
+                property: "caption".to_owned(),
+                detail: "a caption needs something to say".to_owned(),
+            });
+        }
+        Some(text) => Some(text),
+        None => None,
+    };
+    // A matrix is its cells, and a cell is text, so there is no bare spelling
+    // to fall back to — unlike a figure, which draws without labels.
+    if !typesetter.supports_text() {
+        return Err(CommandError::Unsupported {
+            feature: "text".to_owned(),
+        });
+    }
+
+    let cell_spec = TextSpec {
+        size: args.cell_size,
+        max_width: None,
+    };
+    let row_count = rows.len();
+
+    let mut build = Build::open(tree, args.label, args.position, "position")?;
+    let result = (|| -> Result<(), CommandError> {
+        // Typeset every cell before placing anything: the column widths and row
+        // heights decide where each cell goes, so the whole grid has to be
+        // measured first.
+        let mut blocks: Vec<Vec<TextBlock>> = Vec::with_capacity(row_count);
+        for row in rows {
+            let mut line = Vec::with_capacity(columns);
+            for cell in row {
+                let text = cell.to_string();
+                let block = typesetter
+                    .text(&text, &cell_spec)
+                    .map_err(|error| typeset_error(error, "rows"))?;
+                line.push(block);
+            }
+            blocks.push(line);
+        }
+        let extent = |block: &TextBlock| {
+            block
+                .local_bounds()
+                .map_or((0.0, 0.0), |rect| (rect.width(), rect.height()))
+        };
+        let mut column_widths = vec![0.0_f64; columns];
+        let mut row_heights = vec![0.0_f64; row_count];
+        for (r, line) in blocks.iter().enumerate() {
+            for (c, block) in line.iter().enumerate() {
+                let (w, h) = extent(block);
+                column_widths[c] = column_widths[c].max(w);
+                row_heights[r] = row_heights[r].max(h);
+            }
+        }
+        let content_width =
+            column_widths.iter().sum::<f64>() + MATRIX_COLUMN_GAP * (columns - 1) as f64;
+        let content_height =
+            row_heights.iter().sum::<f64>() + MATRIX_ROW_GAP * (row_count - 1) as f64;
+        let mut column_centres = Vec::with_capacity(columns);
+        let mut x = -content_width / 2.0;
+        for width in &column_widths {
+            column_centres.push(x + width / 2.0);
+            x += width + MATRIX_COLUMN_GAP;
+        }
+        let mut row_centres = Vec::with_capacity(row_count);
+        let mut y = content_height / 2.0;
+        for height in &row_heights {
+            row_centres.push(y - height / 2.0);
+            y -= height + MATRIX_ROW_GAP;
+        }
+
+        // The brackets are as tall as the grid. A hairline is the floor rather
+        // than zero so a degenerate row cannot produce a zero-height polygon.
+        let bracket_height = content_height.max(DEFAULT_THICKNESS * 2.0);
+        let mut reach = 0.0;
+        match args.brackets {
+            MatrixBrackets::None => {}
+            MatrixBrackets::Square => {
+                let serif = (bracket_height * MATRIX_SERIF_FRACTION)
+                    .clamp(MATRIX_SERIF_MIN, MATRIX_SERIF_MAX)
+                    .max(DEFAULT_THICKNESS * 2.0);
+                reach = BRACKET_GAP + serif;
+                for (outer, direction, name) in [
+                    (-content_width / 2.0 - reach, 1.0, LEFT_BRACKET_LABEL),
+                    (content_width / 2.0 + reach, -1.0, RIGHT_BRACKET_LABEL),
+                ] {
+                    let id = build.piece(
+                        ShapeKind::Polygon,
+                        ShapeParams {
+                            points: Some(square_bracket(
+                                outer,
+                                direction,
+                                bracket_height,
+                                serif,
+                                DEFAULT_THICKNESS,
+                            )),
+                            color: args.color,
+                            label: Some(name.to_owned()),
+                            ..ShapeParams::default()
+                        },
+                    );
+                    if let Some(m) = build.tree.get_mut(id) {
+                        // A bracket is scenery: a `Polygon` kind would make
+                        // `--inspect` call it a small four-sided figure with an
+                        // area, which reads as a mistake.
+                        m.kind = NodeKind::Unknown;
+                        m.dirty.semantic = true;
+                    }
+                }
+            }
+            MatrixBrackets::Bars => {
+                reach = BRACKET_GAP;
+                for (x, name) in [
+                    (-content_width / 2.0 - reach, LEFT_BRACKET_LABEL),
+                    (content_width / 2.0 + reach, RIGHT_BRACKET_LABEL),
+                ] {
+                    // A `Line` is built along +x from its tail; the bar is the
+                    // same stroke turned a quarter turn about its own tail.
+                    let mut m = rustim_mobject::shapes::build(
+                        ShapeKind::Line,
+                        &ShapeParams {
+                            width: Some(bracket_height),
+                            color: args.color,
+                            label: Some(name.to_owned()),
+                            ..ShapeParams::default()
+                        },
+                    );
+                    m.transform = Affine2::translate((x, -bracket_height / 2.0))
+                        * Affine2::rotate(std::f64::consts::FRAC_PI_2);
+                    build.node(m);
+                }
+            }
+            MatrixBrackets::Round => {
+                let semi_width = (bracket_height * MATRIX_ROUND_FRACTION)
+                    .clamp(MATRIX_ROUND_MIN, MATRIX_ROUND_MAX);
+                reach = BRACKET_GAP + semi_width;
+                // `centre_x` is where the arc *opens* — one gap clear of the
+                // entries — and the bulge reaches half a semi-width further
+                // out. Putting the ellipse's centre there instead would leave
+                // the bracket a whole semi-width too far from the grid.
+                for (centre_x, left, name) in [
+                    (-content_width / 2.0 - BRACKET_GAP, true, LEFT_BRACKET_LABEL),
+                    (
+                        content_width / 2.0 + BRACKET_GAP,
+                        false,
+                        RIGHT_BRACKET_LABEL,
+                    ),
+                ] {
+                    build.piece(
+                        ShapeKind::Plot,
+                        ShapeParams {
+                            points: Some(round_bracket(
+                                centre_x,
+                                semi_width,
+                                bracket_height / 2.0,
+                                left,
+                            )),
+                            color: args.color,
+                            label: Some(name.to_owned()),
+                            ..ShapeParams::default()
+                        },
+                    );
+                }
+            }
+        }
+
+        // The cells, row-major, centred in their measured column and row.
+        for (r, line) in blocks.iter().enumerate() {
+            for (c, block) in line.iter().enumerate() {
+                let text = rows[r][c].to_string();
+                build.text(
+                    &text,
+                    block.clone(),
+                    &cell_spec,
+                    [column_centres[c], row_centres[r]],
+                    args.color,
+                    Some(text.clone()),
+                );
+            }
+        }
+        // The labels are typeset at the cell size too: a column label that was
+        // bigger than the entries would name the matrix rather than annotate
+        // it. They stay foreground, because `color` names the cells.
+        if let Some(labels) = args.column_labels {
+            for (c, text) in labels.iter().enumerate() {
+                let block = typesetter
+                    .text(text, &cell_spec)
+                    .map_err(|error| typeset_error(error, "column_labels"))?;
+                let half = block.local_bounds().map_or(0.0, |rect| rect.height() / 2.0);
+                let y = bracket_height / 2.0 + DEFAULT_GAP + half;
+                build.text(
+                    text,
+                    block,
+                    &cell_spec,
+                    [column_centres[c], y],
+                    None,
+                    Some(text.clone()),
+                );
+            }
+        }
+        // The picture's left edge, moved out by whatever hangs off the left.
+        let mut left_edge = -content_width / 2.0 - reach;
+        if let Some(labels) = args.row_labels {
+            let mut widest: f64 = 0.0;
+            for (r, text) in labels.iter().enumerate() {
+                let block = typesetter
+                    .text(text, &cell_spec)
+                    .map_err(|error| typeset_error(error, "row_labels"))?;
+                let (width, _) = extent(&block);
+                widest = widest.max(width);
+                // Right-aligned against the bracket, so a column of row names
+                // reads as a column and its right edge is one line.
+                let x = left_edge - LABEL_GAP - width / 2.0;
+                build.text(
+                    text,
+                    block,
+                    &cell_spec,
+                    [x, row_centres[r]],
+                    None,
+                    Some(text.clone()),
+                );
+            }
+            left_edge -= LABEL_GAP + widest;
+        }
+        if let Some(lhs) = args.lhs {
+            let block = typesetter
+                .text(lhs, &cell_spec)
+                .map_err(|error| typeset_error(error, "lhs"))?;
+            let half = block.local_bounds().map_or(0.0, |rect| rect.width() / 2.0);
+            let x = left_edge - LABEL_GAP - half;
+            build.text(lhs, block, &cell_spec, [x, 0.0], None, Some(lhs.to_owned()));
+        }
+
+        if let Some(caption) = caption {
+            let spec = TextSpec {
+                size: args.caption_size,
+                max_width: None,
+            };
+            let block = typesetter
+                .text(caption, &spec)
+                .map_err(|error| typeset_error(error, "caption"))?;
+            let half = block.local_bounds().map_or(0.0, |rect| rect.height() / 2.0);
+            // The lowest piece decides where the caption goes — usually a cell,
+            // or a column label when the grid is short.
+            let bottom = build
+                .created
+                .iter()
+                .filter_map(|id| build.tree.world_bounds(*id))
+                .map(|rect| rect.y0 - build.origin[1])
+                .fold(f64::INFINITY, f64::min);
+            let y = if bottom.is_finite() {
+                bottom - DEFAULT_GAP - half
+            } else {
+                -content_height / 2.0 - DEFAULT_GAP - half
+            };
+            build.text(caption, block, &spec, [0.0, y], None, None);
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => Ok(build.finish()),
+        Err(error) => {
+            build.rollback();
+            Err(error)
+        }
+    }
+}
+
+/// The eight corners of a square bracket, as one simple contour.
+///
+/// The union of a shaft and two arms is an L-shaped outline — eight corners, not
+/// three rectangles — and a single `Polygon` paints it under the fill rule with
+/// no subpath break, which a flat point array cannot express anyway. `outer` is
+/// the x of the bracket's outside edge; `direction` is `1.0` for a left bracket
+/// (its arms reach right, towards the entries) and `-1.0` for a right one.
+fn square_bracket(
+    outer: f64,
+    direction: f64,
+    height: f64,
+    serif: f64,
+    thickness: f64,
+) -> Vec<[f64; 2]> {
+    let half = height / 2.0;
+    let arm = outer + direction * serif;
+    let shaft = outer + direction * thickness;
+    vec![
+        [outer, -half],
+        [arm, -half],
+        [arm, -half + thickness],
+        [shaft, -half + thickness],
+        [shaft, half - thickness],
+        [arm, half - thickness],
+        [arm, half],
+        [outer, half],
+    ]
+}
+
+/// A round bracket: the half of an ellipse that faces away from the entries.
+///
+/// Sampled rather than approximated by a cubic — the stroker flattens it into
+/// exactly the polyline the samples describe, and a quarter-ellipse Bézier
+/// would need its own control-point constant to be right. `centre_x` is where
+/// the arc opens; `semi_width` is how far it bulges away from the entries, so
+/// the caller passes the open edge and the extent grows outwards from there.
+fn round_bracket(centre_x: f64, semi_width: f64, semi_height: f64, left: bool) -> Vec<[f64; 2]> {
+    let start = if left {
+        std::f64::consts::FRAC_PI_2
+    } else {
+        -std::f64::consts::FRAC_PI_2
+    };
+    (0..=ROUND_BRACKET_SAMPLES)
+        .map(|i| {
+            let angle = start + std::f64::consts::PI * i as f64 / ROUND_BRACKET_SAMPLES as f64;
+            [
+                centre_x + semi_width * angle.cos(),
+                semi_height * angle.sin(),
+            ]
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! The pure half of `explain.plot`: Horner, the sampling runs and the tick
@@ -1390,5 +1913,41 @@ mod tests {
         // The far corner is the parallelogram's, not a fourth guess.
         assert!((quad[2][0] - (quad[1][0] + quad[3][0] - quad[0][0])).abs() < 1e-12);
         assert!((quad[2][1] - (quad[1][1] + quad[3][1] - quad[0][1])).abs() < 1e-12);
+    }
+
+    // ---- explain.matrix ---------------------------------------------------
+
+    #[test]
+    fn a_square_bracket_is_one_eight_corner_l_outline() {
+        let left = square_bracket(-2.0, 1.0, 4.0, 0.3, 0.05);
+        assert_eq!(left.len(), 8);
+        // The contour runs the outside edge, then the arms and the shaft.
+        assert_eq!(left[0], [-2.0, -2.0]);
+        assert_eq!(left[7], [-2.0, 2.0]);
+        assert!((left[1][0] - -1.7).abs() < 1e-12);
+        assert!((left[3][0] - -1.95).abs() < 1e-12);
+        // Mirrored, the same shape faces the other way.
+        let right = square_bracket(2.0, -1.0, 4.0, 0.3, 0.05);
+        assert_eq!(right[0], [2.0, -2.0]);
+        assert!((right[1][0] - 1.7).abs() < 1e-12);
+        assert!((right[3][0] - 1.95).abs() < 1e-12);
+        for point in left.iter().chain(&right) {
+            assert!(point[1].abs() <= 2.0, "{point:?}");
+        }
+    }
+
+    #[test]
+    fn a_round_bracket_bulges_away_from_its_opening() {
+        let left = round_bracket(-2.0, 0.2, 1.0, true);
+        assert_eq!(left.len(), ROUND_BRACKET_SAMPLES + 1);
+        let min_x = left.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+        assert!((min_x - -2.2).abs() < 1e-9, "{min_x}");
+        // It spans the full height and stays on the outward side of its centre.
+        assert!((left[0][1] - 1.0).abs() < 1e-12, "{:?}", left[0]);
+        assert!((left[ROUND_BRACKET_SAMPLES][1] + 1.0).abs() < 1e-12);
+        assert!(left.iter().all(|p| p[0] <= -2.0 + 1e-12));
+        let right = round_bracket(2.0, 0.2, 1.0, false);
+        assert!(right.iter().all(|p| p[0] >= 2.0 - 1e-12));
+        assert!((right[0][1] + 1.0).abs() < 1e-12, "{:?}", right[0]);
     }
 }
