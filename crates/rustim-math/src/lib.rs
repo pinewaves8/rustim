@@ -24,7 +24,9 @@ pub mod text;
 
 pub use text::TextGlyph;
 
-pub use kurbo::{Affine, BezPath, PathEl, Point, Rect, Vec2};
+pub use kurbo::{
+    Affine, BezPath, Cap, Join, PathEl, Point, Rect, Stroke, StrokeOpts, Vec2, stroke,
+};
 
 /// The 2D affine transform carried by every [`rustim_mobject::Mobject`].
 ///

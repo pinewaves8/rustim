@@ -33,10 +33,10 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **366 tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **377 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
-`rustim-app` and **not** from `rustim-scene`), all seven golden scenes match their checked-in
+`rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
 baselines, a script replays to a byte-identical frame, and `rustim-app --png out.png` reproduces the
 Manim reference frame with an **identical content bounding box** (`343,90,936,629`); only 0.012% of
 pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The count is not
@@ -94,6 +94,7 @@ cargo run -p rustim-app -- --scene primitives  # ...a named scene; `--help` list
 cargo run -p rustim-app -- --scene text --png out.png   # CJK + Latin glyph runs
 cargo run -p rustim-app -- --scene formula --png out.png  # Typst → per-glyph outlines
 cargo run -p rustim-app -- --scene rotate --inspect  # rotate + scale, then a FadeOut removal
+cargo run -p rustim-app -- --scene axes --png out.png  # axes, ticks, a plot and a camera beat
 cargo run -p rustim-app -- --motion reduced  # ignore the platform "reduce motion" preference
 cargo run -p rustim-app -- --script sessions/intro.jsonl --reply  # drive it with JSON commands
 cargo run -p rustim-app -- --script - --reply --png out.png       # ...from stdin, answering each
@@ -211,7 +212,7 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   as the scene happens to need" — otherwise a duration change would silently rebless a golden as a
   capture of a half-faded frame.
 
-The seven scenes are there to disagree with each other: `pythagorean` is the one with a Manim
+The eight scenes are there to disagree with each other: `pythagorean` is the one with a Manim
 reference, `composite` covers deferred transforms, alpha and draw order through the mobject tree
 walk, `primitives` pushes strokes and clips as raw `DrawOp`s because nothing in the mobject model
 expresses either yet — without it the baselines would never touch stroke expansion or clip
@@ -224,7 +225,12 @@ only one whose still is the *end* of an animation rather than a static arrangeme
 3-curve triangle *up* into a circle and a 4-curve square *down* into a triangle, so one image shows
 both directions of the alignment padding and that the style lerp arrived (see "P2 step 2"), and
 `rotate` is the only one where an object **leaves the scene**: a `FadeOut` removes its square as its
-third beat, so the still has two objects where the script named three (see "P2 step 5").
+third beat, so the still has two objects where the script named three (see "P2 step 5"), and `axes`
+is the only one shot through a **non-default camera**: a `CameraMove` beat lands on
+`center (0.15, 0.2), zoom 1.25`, and the still holds welded axes with ticks, a stroke-outlined
+parabola, a number line and integer tick labels drawn through that same projection — so a camera
+that moved the fills and not the glyphs would show up here and nowhere else (see "Axes, number
+lines and plots").
 
 **A baseline's *bytes* are not a property of the image, and `BLESS=1` rewrites all of them** —
 `check()` copies the render unconditionally, not just the one under review. In the step-5 bless run
@@ -264,7 +270,7 @@ last property.
 |---|---|---|
 | `rustim-math` | Points, `Affine2`, rate functions, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
-| `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree`, stable `NodeId`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow`), `critical_point`, `world_anchors` | Real |
+| `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`), stable `NodeId`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `FadeOut`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `CameraMove`, `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
@@ -334,6 +340,41 @@ take the **composed world→device transform** (`SceneContext::affine()`), not a
 deliberately no camera-free variant, because a caller that forgot the camera would draw
 correct-looking text in the wrong place while every filled path moved correctly.
 
+### Axes, number lines and plots
+
+Three `ShapeKind`s — `NumberLine`, `Axes`, `Plot` — complete the mobject vocabulary the command
+layer already named (`NodeKind::{NumberLine, Axes, Plot}`), and each is built by
+`rustim_mobject::shapes::build` from one flat `ShapeParams`:
+
+- **`NumberLine`** and **`Axes`** are **one welded filled path**, not a subtree. A subtree would
+  make every tick an independent mobject: `Command::Add` can return only one id, opacity would not
+  inherit (a transparent axis with lit ticks), the accessibility tree and Tab order would each tick
+  as its own image, and `world_bounds` on a point-less parent would return `None` — which is
+  `focus`'s input and the a11y `bounds`' source. So the shafts and every tick rectangle are
+  `rect_path`s (same winding, explicitly closed), welded into one `BezPath` and handed to the
+  existing `points_from_path` (hub + doubled zero-winding slit, `Fill::NonZero`). The consequence,
+  and it is a trade rather than a gap: **a tick is not addressable and cannot be styled on its own**.
+- **Every tick is clamped to the shaft.** Without the clamp the end ticks protrude half a stroke
+  width past the axis and the corner set is longer than the axis is; the a11y description measures a
+  number line by the **diameter** of its corners (the rotation-invariant rule arrows use), so an
+  unclamped line was announced as "长度 6.05 的数轴" when it is 6 long.
+- **`Plot` is a stroke's outline, not a filled polyline.** Feeding sampled points to the fill rule
+  closes the polyline with its chord and paints the region under the curve — a graph would render as
+  an area, the single most visible wrong picture this suite could hold. `kurbo::stroke`
+  (`Join::Miter`, `Cap::Butt`, a fixed world tolerance) expands the polyline into a closed contour
+  first. The host supplies the points **in world coordinates**; there is no expression language and
+  no parser in the command layer, by decision — a scene samples with Rust.
+- **`AxesScale::new(x_range, x_length, y_range, y_length).to_world(x, y)`** is the shared data→world
+  map for the scene's own samples *and* the ticks' positions, so a curve and its grid cannot drift
+  apart. It centres on zero, scales each range onto its length, and returns `0.0` on a degenerate
+  axis rather than dividing by zero.
+
+Guards are values, not panics, because `ShapeParams` arrives from a model: non-finite, `min >= max`,
+`step <= 0` and `NaN`/infinite steps degrade to no ticks or to the defaults, and **`MAX_TICKS = 256`
+per axis** caps what one `add` can allocate. The `axes` scene is the one golden where all three
+objects, integer tick labels drawn through the camera, and a `CameraMove` beat meet: one image
+proves the camera reaches fills, glyphs and accessibility bounds at once (see "Golden images").
+
 ### The timeline: three layers
 
 | Layer | Type | What it is |
@@ -378,7 +419,7 @@ Four things follow, and each is why this is one branch and not a feature:
   snap".
 - **The settled picture is identical**, because a finished animation *is* its end state — Manim's own
   reading (`Animation.finish` forces `interpolate(1)`, `animation/animation.py:216-227`). Measured, not
-  assumed: all seven scenes render **byte-identical** stills at `--motion full` and `--motion reduced`,
+  assumed: all eight scenes render **byte-identical** stills at `--motion full` and `--motion reduced`,
   and `--inspect` prints the identical semantic tree, labels and measured sizes included. The suite
   asserts two of them (`reduced_motion_leaves_the_settled_frame_identical` and its `rotate` twin,
   `max == 0` — not the golden tolerance), and the second is not redundant: for a *removal* the reduced
@@ -473,13 +514,16 @@ angle of the 3-4-5 triangle — would be announced as a 4.2-square of area 17.64
 3-square of area 9. A blind reader told that has been told the Pythagorean theorem is false, in the
 one scene that exists to demonstrate it.
 
-A **line** and an **arrow** are the same rule applied to figures whose box is not a measurement at
-all — a line's is `3 × 0.045`, the stroke width read out as a dimension. A line's corners *are* its
-rectangle, so its long edge is exact; an arrow's corners are neither its tail nor its tip (the tail
-is two corners, the tip a seventh), so it is measured by the **diameter** of its corner set, which is
-its tail-to-tip length to within `t²/2L`. Both are rotation-invariant. That is not a refinement
-either: read from the box, the `rotate` scene's arrow — turned through 34° — was announced as
-"长度 2.49" when it is 3 long.
+A **line**, an **arrow** and a **number line** are the same rule applied to figures whose box is not
+a measurement at all — a line's is `3 × 0.045`, the stroke width read out as a dimension. A line's
+corners *are* its rectangle, so its long edge is exact; an arrow's corners are neither its tail nor
+its tip (the tail is two corners, the tip a seventh), so it is measured by the **diameter** of its
+corner set, which is its tail-to-tip length to within `t²/2L`; a number line is the same diameter
+rule, because its box height is tick decoration rather than a dimension. All three are
+rotation-invariant. That is not a refinement either: read from the box, the `rotate` scene's arrow —
+turned through 34° — was announced as "长度 2.49" when it is 3 long. A **number line** also has a
+name of its own — "数轴", measured "长度 6 的数轴" — while `Axes` and `Plot` keep the generic
+`w × h` sentence, where the box is honest.
 
 A description also **never contains a position**: on macOS and Windows a changed description is an
 accessibility property-change event, and `MoveTo` rewrites the transform every frame of an
@@ -552,7 +596,9 @@ has no accessibility bounds yet, because `world_anchors` has nothing to measure.
 ### Naming
 
 `Scene`→`Scene`, `Mobject`→`Mobject`, `Animation`→`Animation`, `construct()`/`play()`→same,
-`MathTex`→`Formula`, `Create`→`Create`, `Shift`→`MoveTo`.
+`MathTex`→`Formula`, `Create`→`Create`, `Shift`→`MoveTo`, `NumberLine`→`NumberLine`,
+`Axes`→`Axes`. `Plot` is not a Manim class: it is the wire spelling of an `Axes.plot` curve whose
+sampled points the host supplies (see "Axes, number lines and plots").
 
 ## Hard-won facts
 
@@ -635,6 +681,28 @@ typed.
 **`kurbo` 0.13 has no `From<Rect> for BezPath`.** Use `rustim_math::rect_path` (or `fill_rect`, which
 both backends expose) rather than reaching for a conversion that does not exist. `Point` also has no
 scalar multiplication or point addition — go through `Vec2` (`p.to_vec2()`, `Vec2::hypot`).
+
+**A filled open polyline is not a curve — the fill rule closes it.** Handing a sampled function's
+points to `Fill::NonZero` paints the region between the curve and its closing chord, so a graph
+renders as an area. `Plot` therefore runs `kurbo::stroke` (Miter/Butt) before `points_from_path`;
+`a_plot_is_a_ribbon_and_not_the_region_under_the_curve` asserts a winding of 1 *on* the curve and 0
+below it, because "it looks like a line" is exactly what the wrong picture also looks like at a
+glance. The same trap is why a formula's fraction bar is expanded to a quad rather than drawn as a
+polyline (see "P1 step 5").
+
+**Welding rectangles into one path requires that every rectangle share its winding and close
+explicitly.** `points_from_path` walks each `MoveTo` out to a hub with a doubled slit, so the
+subpaths' orientations decide what `Fill::NonZero` subtracts. Every axis shaft and tick is built
+with `rustim_math::rect_path` (CCW, `ClosePath`), never with hand-picked corners, and the test is a
+winding count at four points (inside the shaft, inside a tick, in the gap above a tick, outside).
+A tick that protrudes past the axis's end also breaks the a11y diameter measurement, which is why
+the extents are clamped to the shaft — see "Axes, number lines and plots".
+
+**`ShapeParams` is now a quarter-kilobyte, and that is enough to trip `large_enum_variant`.**
+Adding `range`/`x_range`/`y_range`/`step`/`tick_size`/`points` pushed `Command` past clippy's 256-byte
+threshold, so `rustim_app::a11y::Request::Command` carries `Box<Command>` — the request enum is
+cloned/moved once per action, not per frame, so the box costs nothing measurable and keeps the
+warning from being silenced workspace-wide.
 
 **`serde_json` without its `float_roundtrip` feature does not round-trip every float it writes.**
 Its parser can land one ULP away from the number serde_json itself serialised, so
@@ -832,7 +900,7 @@ weeks later.
 | | P1 step | State |
 |---|---|---|
 | 1 | Numerical parity against Manim (439 cases at 1e-9) | done — see "Commands" |
-| 2 | Golden-image suite: per-platform baselines, CI job (seven scenes now) | done — see "Golden images" |
+| 2 | Golden-image suite: per-platform baselines, CI job (eight scenes now) | done — see "Golden images" |
 | 3 | Accessibility: structure + full keyboard + throttled announcements | done — see "Accessibility" |
 | 4 | Text: `parley` end to end (string → glyphs → screen), bundled CJK, measured font size | done — see "Text" |
 | 5 | Formulas: Typst → per-glyph outlines via `skrifa::OutlinePen`, never `typst-render` | done — see "P1 step 5", `rustim-text::formula`, the `formula` scene |
@@ -935,7 +1003,8 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
 
 - **P2** — more mobjects (lines, arrows, axes, function plots) and animations (`Transform`, `Rotate`,
   `Scale`, `FadeOut`); morph via `align_points`. The animations are all in (steps 2 and 5); of the
-  mobjects, lines and arrows are, while axes and function plots wait on the camera.
+  mobjects, lines and arrows are, and **axes, number lines and function plots followed the camera**
+  (see the P3 entry below).
   **Step 1, the alignment core, is done**: `rustim_math::bezier::align_points` (with `subpaths`)
   is a literal port of `VMobject.align_points`, covered by twelve cases in a new `align_points`
   group in `manim-geometry.json`. It is deliberately **port-ahead-of-consumer** — nothing calls it
@@ -1051,7 +1120,8 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   interim, and teaching the draw walk to stroke changes every golden), `Create`/`Uncreate` (needs
   `pointwise_become_partial`), `Rotating` (an animation that never ends makes `is_playing`
   permanently true, which every "react when the timeline drains" scene depends on), `path_arc` for a
-  straight move, `FadeIn`'s `shift`/`scale`, and axes and plots.
+  straight move, `FadeIn`'s `shift`/`scale`, and axes and plots — **the last two have since
+  landed** with P3's camera ("P3's coordinate systems are done").
 - **The command feed — the first slice of P3's "AI command surface at full width" — is done**, and it
   is the step that made the engine *drivable* rather than merely scriptable: `--script` applies a file
   of JSON commands or reads stdin line by line, `--reply` answers each one, and a windowed run takes
@@ -1075,6 +1145,18 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   repository still handles no pointer events at all — input wiring is its own step), a `Rotating`
   animation (`duration = ∞` makes `alpha = age/∞ = 0`, freezing it while `is_playing` stays true;
   this needs a scheduler concept for perpetual animations), and any announcement of a camera change.
+- **P3's coordinate systems are done** (the second half). `ShapeKind::{NumberLine, Axes, Plot}` with
+  the `range`/`x_range`/`y_range`/`step`/`tick_size`/`points` parameters, `NodeKind::NumberLine`,
+  `AxesScale`, the a11y rules and the wire-round-trip cases all landed, and the `axes` scene put them
+  on screen under a `CameraMove` — see "Axes, number lines and plots". **The seven older goldens
+  passed untouched; `axes/linux-aarch64.png` is the only new baseline**, so the claim is that the
+  three shapes and the camera *added* a picture rather than moving one. Two details in the new
+  baseline are deliberate: the parabola is `0.25x² − 1.75` rather than ending at the range's floor
+  (an apex at `-2` ran through the y axis's own `-2` label), and samples above `y_range` are dropped
+  so the curve ends on the frame. Deferred, deliberately: an expression language (the host samples,
+  per decision), pointer pan/zoom, axis arrows and subticks, automatic label layout and number
+  formatting, `focus` on a group (its bounding box would need descendants), per-tick
+  addressability/styling, and text bounds — which is why `focus` still refuses a text node.
 - **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration

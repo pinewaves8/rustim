@@ -29,7 +29,7 @@
 //! Blessing writes whatever the current build produces, so it is only correct
 //! when the change is meant. It should also be run in the same profile the suite
 //! is run in, since the render and the baseline have to come from the same float
-//! codegen — all seven scenes have been measured **byte-identical between debug
+//! codegen — all eight scenes have been measured **byte-identical between debug
 //! and release** on the floor machine, but that is luck about this build, not a
 //! property of the pipeline.
 //!
@@ -54,7 +54,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_rustim-app");
 /// registry without a golden fails the suite rather than quietly going
 /// untested, and a scene removed from it fails too, rather than leaving a stale
 /// baseline behind.
-const SCENES: [&str; 7] = [
+const SCENES: [&str; 8] = [
     "pythagorean",
     "primitives",
     "composite",
@@ -62,6 +62,7 @@ const SCENES: [&str; 7] = [
     "formula",
     "transform",
     "rotate",
+    "axes",
 ];
 
 fn platform() -> String {
@@ -252,6 +253,56 @@ fn transform_matches_its_baseline() {
 #[test]
 fn rotate_matches_its_baseline() {
     check("rotate");
+}
+
+/// The axes scene is the only one with a coordinate system, a sampled curve, a
+/// number line **and** a non-default camera.
+///
+/// What only an image can say about it: that a plot is a ribbon and not the
+/// area under the curve (a filled polyline is a plausible-looking wrong
+/// picture), that the welded axes and ticks are solid with empty quadrants,
+/// that tick labels shaped through the shaper land on the ticks the geometry
+/// placed, and — because the still is the end of a camera beat — that the camera
+/// reaches **all three** of the projections: fills, glyph runs and the
+/// accessibility bounds. A camera that moved the tree walk and not the text
+/// would leave the labels behind and no unit test compares them to the fills.
+#[test]
+fn axes_matches_its_baseline() {
+    check("axes");
+}
+
+/// The camera beat under reduced motion: the beat is not interpolated, so the
+/// camera lands on its destination in one step — and the settled frame has to be
+/// the same one a full run ends on.
+///
+/// This is the reduced-motion identity stated over the one animation that writes
+/// no object: `CameraMove`'s `interpolate(1.0)` is the only thing that has to
+/// agree with the full run's last frame, and the label glyphs are what make a
+/// half-moved camera visible rather than merely a different crop.
+#[test]
+fn reduced_motion_leaves_the_axes_scene_identical() {
+    let full = render_at("axes", "full", "vs-reduced");
+    let reduced = render_at("axes", "reduced", "vs-reduced");
+
+    let tolerance = Tolerance::default();
+    let diff = compare_png_files(&full, &reduced, &tolerance).unwrap_or_else(|e| {
+        panic!(
+            "comparing {} against {}: {e}",
+            full.display(),
+            reduced.display()
+        )
+    });
+    assert_eq!(
+        diff.max,
+        0,
+        "the settled axes frame moved under reduced motion — the camera beat's \
+         end state must not depend on which branch played it.\n{}",
+        diff.report(&tolerance),
+    );
+    assert!(
+        diff.diff_bbox.is_none(),
+        "no pixel may differ at all, not merely none by more than the tolerance"
+    );
 }
 
 /// The same identity as the transform scene's, over a scene that exercises a

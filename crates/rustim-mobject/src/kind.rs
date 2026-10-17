@@ -48,6 +48,14 @@ pub enum NodeKind {
     /// not recoverable from the kind the way a square's side is.
     Line,
     Arrow,
+    /// A one-dimensional coordinate frame.
+    ///
+    /// A kind of its own rather than `Line` or `Unknown` because it is what the
+    /// description is read *from*: "长度 6 的数轴" is a different sentence from
+    /// "长度 6 的线段", and the two are different objects even though both are
+    /// drawn as filled outlines. It is measured like a line (the corner set's
+    /// diameter), not like a box, for the same rotation reason.
+    NumberLine,
     /// A container. Reserved: nothing builds one yet, `SceneTree::reparent` is
     /// the only way to make a group today.
     Group,
@@ -66,6 +74,9 @@ impl From<ShapeKind> for NodeKind {
             ShapeKind::RightTriangle => Self::RightTriangle,
             ShapeKind::Line => Self::Line,
             ShapeKind::Arrow => Self::Arrow,
+            ShapeKind::NumberLine => Self::NumberLine,
+            ShapeKind::Axes => Self::Axes,
+            ShapeKind::Plot => Self::Plot,
         }
     }
 }
@@ -84,6 +95,9 @@ mod tests {
             ShapeKind::RightTriangle,
             ShapeKind::Line,
             ShapeKind::Arrow,
+            ShapeKind::NumberLine,
+            ShapeKind::Axes,
+            ShapeKind::Plot,
         ] {
             assert_eq!(
                 serde_json::to_string(&NodeKind::from(kind)).unwrap(),
@@ -102,6 +116,7 @@ mod tests {
             NodeKind::RightTriangle,
             NodeKind::Line,
             NodeKind::Arrow,
+            NodeKind::NumberLine,
             NodeKind::Group,
             NodeKind::Text,
             NodeKind::Heading,

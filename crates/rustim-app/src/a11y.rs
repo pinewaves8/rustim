@@ -92,7 +92,12 @@ pub enum Request {
     /// Apply this to the scene — the same command an AI or a host would send,
     /// through the same validation. So an assistive technology cannot ask for a
     /// state the engine would refuse: there is only one command layer.
-    Command(Command),
+    ///
+    /// Boxed because `Command` carries a whole `ShapeParams` (a quarter of a
+    /// kilobyte of optional fields) and this enum is returned by value from an
+    /// action handler. `Request::TogglePlayback` is two bytes; without the box
+    /// every request — including that one — would be a command-sized copy.
+    Command(Box<Command>),
     /// Start or stop the animation clock. Not a scene command, because whether
     /// the clock runs is a property of the *loop*, not of the scene graph.
     TogglePlayback,
@@ -247,15 +252,15 @@ impl A11yCore {
                 self.focus_on(NodeId::from_raw(req.target_node.0), ctx);
                 None
             }
-            Action::Increment => self.adjust(OPACITY_STEP, ctx).map(Request::Command),
-            Action::Decrement => self.adjust(-OPACITY_STEP, ctx).map(Request::Command),
+            Action::Increment => Self::command(self.adjust(OPACITY_STEP, ctx)),
+            Action::Decrement => Self::command(self.adjust(-OPACITY_STEP, ctx)),
             Action::SetValue => match req.data {
                 Some(ActionData::NumericValue(v)) => {
                     let target = self.focus.focused()?;
-                    Some(Request::Command(Command::Set {
+                    Some(Request::Command(Box::new(Command::Set {
                         target,
                         property: Property::Opacity(v.clamp(0.0, 1.0)),
-                    }))
+                    })))
                 }
                 _ => None,
             },
@@ -265,6 +270,11 @@ impl A11yCore {
             // every action in that enum is wired up.
             _ => None,
         }
+    }
+
+    /// Wrap a command in the box [`Request::Command`] carries.
+    fn command(cmd: Option<Command>) -> Option<Request> {
+        cmd.map(|c| Request::Command(Box::new(c)))
     }
 
     /// Queue an announcement of wherever the focus is, if it is anywhere.
@@ -773,27 +783,27 @@ mod tests {
 
         assert_eq!(
             core.on_action(&request(Action::Increment, None), &ctx),
-            Some(Request::Command(Command::Set {
+            Some(Request::Command(Box::new(Command::Set {
                 target: id,
                 property: Property::Opacity(1.0),
-            }))
+            })))
         );
         assert_eq!(
             core.on_action(&request(Action::Decrement, None), &ctx),
-            Some(Request::Command(Command::Set {
+            Some(Request::Command(Box::new(Command::Set {
                 target: id,
                 property: Property::Opacity(0.95),
-            }))
+            })))
         );
         assert_eq!(
             core.on_action(
                 &request(Action::SetValue, Some(ActionData::NumericValue(0.25))),
                 &ctx
             ),
-            Some(Request::Command(Command::Set {
+            Some(Request::Command(Box::new(Command::Set {
                 target: id,
                 property: Property::Opacity(0.25),
-            }))
+            })))
         );
         assert_eq!(
             core.on_action(&request(Action::Click, None), &ctx),

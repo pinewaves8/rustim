@@ -79,7 +79,7 @@ impl SemanticRole {
             | NodeKind::RightTriangle
             | NodeKind::Line
             | NodeKind::Arrow => Self::Image,
-            NodeKind::Axes | NodeKind::Plot => Self::Image,
+            NodeKind::Axes | NodeKind::Plot | NodeKind::NumberLine => Self::Image,
             NodeKind::Group => Self::Group,
             NodeKind::Text => Self::Label,
             NodeKind::Heading => Self::Heading,
@@ -282,6 +282,7 @@ pub fn default_name(kind: NodeKind) -> &'static str {
         NodeKind::RightTriangle => "直角三角形",
         NodeKind::Line => "线段",
         NodeKind::Arrow => "箭头",
+        NodeKind::NumberLine => "数轴",
         NodeKind::Group => "组合",
         NodeKind::Text => "文本",
         NodeKind::Heading => "标题",
@@ -365,7 +366,9 @@ pub fn describe(kind: NodeKind, label: Option<&str>, shape: Option<&Shape>) -> S
                     }
                     NodeKind::Square => rectangle_sentence(s, w, h, !named),
                     NodeKind::RightTriangle => triangle_sentence(s, w, h, !named),
-                    NodeKind::Line | NodeKind::Arrow => line_sentence(kind, s, w, h, !named),
+                    NodeKind::Line | NodeKind::Arrow | NodeKind::NumberLine => {
+                        line_sentence(kind, s, w, h, !named)
+                    }
                     _ if named => format!("{} × {}", num(w), num(h)),
                     _ => format!("{} × {} 的{}", num(w), num(h), default_name(kind)),
                 }
@@ -443,13 +446,18 @@ fn triangle_sentence(s: &Shape, w: f64, h: f64, with_noun: bool) -> String {
     }
 }
 
-/// A line or an arrow: its **length**.
+/// A line, an arrow or a number line: its **length**.
 ///
-/// The one thing about either that a reader can act on, and the thing the
+/// The one thing about any of them that a reader can act on, and the thing the
 /// fallback below cannot say: a line is drawn as a filled rectangle (it has no
 /// area, and the draw walk emits fills — see `rustim_mobject::shapes::line`), so a
 /// box-based sentence would announce one as "3 × 0.045 的图形" — the stroke width
 /// read out as if it were a dimension.
+///
+/// A number line joins them rather than taking the box sentence because its box
+/// includes the ticks, whose height is a decoration and not a dimension: the
+/// length is the shaft, and the corner set's diameter *is* the shaft's length
+/// because the shaft's own ends are its farthest corners.
 ///
 /// Neither is measured from the box, and for the line that is the same reason
 /// [`rectangle_sentence`] reads edges: a rotated line's box is
@@ -954,6 +962,43 @@ mod tests {
         );
     }
 
+    /// A number line is measured like a line, not like its box.
+    ///
+    /// The box includes the ticks, so its *height* is the tick height — a
+    /// decoration — and its width is the shaft only until the line is turned.
+    /// The diameter of the corner set is the shaft's length either way.
+    #[test]
+    fn a_number_line_is_described_by_its_length() {
+        let params = ShapeParams {
+            width: Some(6.0),
+            range: Some([-3.0, 3.0]),
+            ..Default::default()
+        };
+        let line = rustim_mobject::shapes::build(ShapeKind::NumberLine, &params);
+        let s = shape_of(&line);
+        assert_eq!(
+            describe(NodeKind::NumberLine, None, Some(&s)),
+            "长度 6 的数轴"
+        );
+        assert_eq!(
+            describe(NodeKind::NumberLine, Some("数轴"), Some(&s)),
+            "数轴，长度 6"
+        );
+
+        let mut turned = line;
+        turned.set_transform(Affine::rotate(0.5));
+        let s = shape_of(&turned);
+        assert!(
+            s.bounds.width() < 5.6,
+            "the box really is the underestimate here: {:?}",
+            s.bounds
+        );
+        assert_eq!(
+            describe(NodeKind::NumberLine, None, Some(&s)),
+            "长度 6 的数轴"
+        );
+    }
+
     #[test]
     fn roles_do_not_change_without_someone_noticing() {
         // The mapping is a decision, not a default, so it is pinned rather than
@@ -976,6 +1021,10 @@ mod tests {
         assert_eq!(SemanticRole::from_kind(NodeKind::Line), SemanticRole::Image);
         assert_eq!(
             SemanticRole::from_kind(NodeKind::Arrow),
+            SemanticRole::Image
+        );
+        assert_eq!(
+            SemanticRole::from_kind(NodeKind::NumberLine),
             SemanticRole::Image
         );
         assert_eq!(

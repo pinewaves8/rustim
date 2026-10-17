@@ -34,7 +34,7 @@ use std::time::Instant;
 use rustim_anim::Motion;
 use rustim_app::a11y::{A11y, Request};
 use rustim_app::{AppEvent, Intent, feed, input};
-use rustim_math::{Affine2, BezPath, Point, Viewport, bezier};
+use rustim_math::{Affine2, BezPath, Camera, Point, Viewport, bezier};
 use rustim_mobject::{Mobject, NodeId, NodeKind, Style};
 use rustim_render::{CpuRenderer, DrawList, DrawOp, RenderError, Renderer};
 use rustim_scene::command::Command;
@@ -991,6 +991,199 @@ impl Scene for FormulaScene {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The axes scene: a coordinate system, a sampled curve, a number line
+// ---------------------------------------------------------------------------
+
+/// Where the coordinate system sits, in world units.
+///
+/// Slightly above the origin so the number line underneath clears it, and so the
+/// camera beat below has something to pan across rather than only to zoom on.
+const AXES_AT: (f64, f64) = (0.0, 0.3);
+
+/// The data ranges the axes mark, and the geometric lengths they occupy.
+///
+/// Data units and world units differ — 8 data units across 7 world units — which
+/// is the point of drawing this: a tick's position comes from the mapping, not
+/// from the number, so a scene that confused the two would put a tick labelled 4
+/// somewhere other than the axis' end.
+const X_RANGE: (f64, f64) = (-4.0, 4.0);
+const Y_RANGE: (f64, f64) = (-2.0, 2.0);
+const X_LENGTH: f64 = 7.0;
+const Y_LENGTH: f64 = 4.0;
+
+/// A coordinate system, a function graph and a number line — plus a camera beat.
+///
+/// The three new object kinds disagree with each other on purpose:
+///
+/// - `axes` is one welded path of shafts and ticks, so the golden shows whether
+///   the weld leaves the quadrants empty and the axes solid;
+/// - the plot is a **stroke's outline**, not a filled polyline: the counterfactual
+///   is an area under `y = 0.25x² - 1.75`, which would be the single most visible
+///   wrong picture in the suite;
+/// - the number line is the same weld with a different tick direction, and it is
+///   the object `focus` and the accessibility layer measure by diameter;
+/// - the labels are shaped text drawn *through the camera*, so a camera that
+///   moved the fills and not the glyphs would show up here and nowhere else.
+///
+/// The parabola is a quadratic rather than a sine on purpose: `sin` comes from a
+/// platform libm and can move by an ULP between targets, which would make the
+/// checked-in baseline unreproducible on the platform that made it. `0.25x² - 1.75`
+/// is multiplication and subtraction, which IEEE 754 rounds identically
+/// everywhere.
+///
+/// The apex sits at `-1.75` rather than at the range's floor because the y axis
+/// labels `-2` at `x ≈ -0.42`, which is inside the parabola's well: an apex at
+/// `-2` put the curve through the label. Labels are drawn over the fills, so
+/// that is a visible collision and not a z-order accident.
+struct AxesScene {
+    /// Tick labels, parallel to `nodes`, shaped once in `construct`.
+    blocks: Vec<ShapedText>,
+    nodes: Vec<NodeId>,
+}
+
+impl AxesScene {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    fn build(&mut self, ctx: &mut SceneContext) {
+        use rustim_mobject::shapes::{AxesScale, ShapeKind, ShapeParams, build};
+
+        let scale = AxesScale::new(X_RANGE, X_LENGTH, Y_RANGE, Y_LENGTH);
+
+        let axes = build(
+            ShapeKind::Axes,
+            &ShapeParams {
+                width: Some(X_LENGTH),
+                height: Some(Y_LENGTH),
+                x_range: Some([X_RANGE.0, X_RANGE.1]),
+                y_range: Some([Y_RANGE.0, Y_RANGE.1]),
+                step: Some(1.0),
+                tick_size: Some(0.15),
+                position: Some([AXES_AT.0, AXES_AT.1]),
+                ..Default::default()
+            },
+        )
+        .with_style(filled(rustim_color::FG, 1.0));
+        ctx.add(axes);
+
+        // `y = 0.25x² - 1.75`, sampled in data coordinates and handed over in world
+        // coordinates — the same mapping the axes' ticks used, which is why it is
+        // `AxesScale` and not two copies of the formula. Samples above the top of
+        // `y_range` are dropped: a graph that pokes out of its coordinate system
+        // reads as a layout bug, and the endpoints then land on the frame.
+        let samples: Vec<[f64; 2]> = (0..=80)
+            .filter_map(|i| {
+                let x = f64::from(i) * 0.1 - 4.0;
+                let y = 0.25 * x * x - 1.75;
+                (y <= Y_RANGE.1).then(|| {
+                    let p = scale.to_world(x, y);
+                    [p.x + AXES_AT.0, p.y + AXES_AT.1]
+                })
+            })
+            .collect();
+        let curve = build(
+            ShapeKind::Plot,
+            &ShapeParams {
+                points: Some(samples),
+                thickness: Some(0.05),
+                ..Default::default()
+            },
+        )
+        .with_style(filled(rustim_color::YELLOW, 1.0));
+        ctx.add(curve);
+
+        let number_line = build(
+            ShapeKind::NumberLine,
+            &ShapeParams {
+                width: Some(6.0),
+                range: Some([-3.0, 3.0]),
+                step: Some(1.0),
+                tick_size: Some(0.12),
+                position: Some([0.0, -2.15]),
+                ..Default::default()
+            },
+        )
+        .with_style(filled(rustim_color::BLUE, 1.0));
+        ctx.add(number_line);
+
+        self.labels(ctx, &scale);
+
+        // The camera beat. It is a beat like any other — queued behind nothing,
+        // played by the same scheduler — and the still is ten seconds in, so the
+        // screenshot *is* the destination. That is what makes one image prove
+        // the camera reaches fills, glyphs and the accessibility bounds.
+        ctx.play(rustim_anim::CameraMove::new(Camera::new((0.15, 0.2), 1.25)).with_duration(1.5));
+    }
+
+    /// Integer labels for both axes, excluding the origin.
+    ///
+    /// The origin is skipped because the two axes cross there: a "0" would sit on
+    /// top of the intersection and read as a smudge in the image, and it is the
+    /// one value both axes would label.
+    fn labels(&mut self, ctx: &mut SceneContext, scale: &rustim_mobject::shapes::AxesScale) {
+        let mut provider = match FontProvider::with_bundled() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("axes: no font at {}: {e}", rustim_text::BUNDLED_DIR);
+                return;
+            }
+        };
+        let style = TextStyle {
+            size: 0.22,
+            ..TextStyle::default()
+        };
+        let mut push = |ctx: &mut SceneContext, text: String, at: (f64, f64), this: &mut Self| {
+            let shaped = provider.shape(&text, &style, 1.0, None);
+            let mut m = Mobject::new(Vec::new())
+                .with_style(filled(rustim_color::FG, 1.0))
+                .with_kind(NodeKind::Text)
+                .with_label(text);
+            m.transform = Affine2::translate(at);
+            this.nodes.push(ctx.add(m));
+            this.blocks.push(shaped);
+        };
+
+        for i in (X_RANGE.0 as i32)..=(X_RANGE.1 as i32) {
+            if i == 0 {
+                continue;
+            }
+            let x = scale.to_world(f64::from(i), 0.0).x + AXES_AT.0;
+            push(ctx, format!("{i}"), (x, AXES_AT.1 - 0.38), self);
+        }
+        for i in (Y_RANGE.0 as i32)..=(Y_RANGE.1 as i32) {
+            if i == 0 {
+                continue;
+            }
+            let y = scale.to_world(0.0, f64::from(i)).y + AXES_AT.1;
+            push(ctx, format!("{i}"), (AXES_AT.0 - 0.42, y), self);
+        }
+    }
+}
+
+impl Scene for AxesScene {
+    fn construct(&mut self, ctx: &mut SceneContext) {
+        self.build(ctx);
+    }
+
+    fn build_draw_list(&self, ctx: &SceneContext, list: &mut DrawList) {
+        // The tree walk draws the axes, the curve and the number line; the labels
+        // are glyph runs and go over them, exactly as `TextScene` does it.
+        ctx.build_draw_list(list);
+        for (id, shaped) in self.nodes.iter().zip(&self.blocks) {
+            let Some(m) = ctx.tree.get(*id) else { continue };
+            let world = ctx.tree.parent_transform(*id) * m.transform;
+            let mut paint = m.style.fill;
+            paint.components[3] = (m.opacity * m.style.fill_opacity) as f32;
+            rustim_app::text::push_text(list, shaped, world, ctx.affine(), paint);
+        }
+    }
+}
+
 /// The `--scene` value used when the flag is absent.
 const DEFAULT_SCENE: &str = "pythagorean";
 
@@ -1027,6 +1220,7 @@ fn scene_by_name(name: &str) -> Option<Box<dyn Scene>> {
         "formula" => Some(Box::new(FormulaScene::new())),
         "transform" => Some(Box::new(TransformScene::new())),
         "rotate" => Some(Box::new(RotateScene)),
+        "axes" => Some(Box::new(AxesScene::new())),
         _ => None,
     }
 }
@@ -1047,6 +1241,7 @@ fn scene_names() -> String {
         "formula",
         "transform",
         "rotate",
+        "axes",
     ]
     .join(", ")
 }
@@ -1370,7 +1565,7 @@ impl ApplicationHandler<AppEvent> for App {
                         .and_then(|w| w.a11y.core().on_action(&req, &self.ctx));
                     match request {
                         Some(Request::Command(cmd)) => {
-                            self.queued.push(cmd);
+                            self.queued.push(*cmd);
                             self.request_redraw();
                         }
                         Some(Request::TogglePlayback) => {

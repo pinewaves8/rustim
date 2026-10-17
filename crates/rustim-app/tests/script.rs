@@ -560,6 +560,48 @@ fn a_camera_command_moves_the_settled_view() {
     assert_eq!(tree["camera"]["zoom"], 1.5);
 }
 
+/// The three coordinate-system kinds are reachable from the wire, and the
+/// semantic tree describes them the way the accessibility layer means to.
+///
+/// The number-line description is the assertion with teeth: it is measured from
+/// the *shaft*, and the sentence says 6 rather than the box's height-plus-ticks
+/// or a tick's own width. A fallback branch would compile and announce
+/// "7 × 0.195 的图形".
+#[test]
+fn a_script_can_add_the_coordinate_system_kinds() {
+    let script = scratch(
+        "coords",
+        concat!(
+            r#"{"action":"add","type":"axes","params":{"width":7.0,"height":4.0,"x_range":[-4.0,4.0],"y_range":[-2.0,2.0]}}"#,
+            "\n",
+            r#"{"action":"add","type":"number_line","params":{"width":6.0,"range":[-3.0,3.0],"label":"数轴"}}"#,
+            "\n",
+            r#"{"action":"add","type":"plot","params":{"points":[[-3.0,1.0],[-2.0,0.0],[-1.0,-1.0]]}}"#,
+            "\n",
+        ),
+    );
+    let ran = run(&["--script", script.to_str().unwrap(), "--inspect"]);
+    ran.ok("--script … --inspect");
+    let tree: serde_json::Value =
+        serde_json::from_str(&ran.stdout).expect("--inspect must emit JSON");
+    let nodes = tree["nodes"].as_array().expect("nodes must be an array");
+    let named: Vec<(&str, &str)> = nodes
+        .iter()
+        .filter_map(|n| Some((n["name"].as_str()?, n["description"].as_str()?)))
+        .filter(|(name, _)| !name.is_empty())
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("坐标轴", "7 × 4 的坐标轴"),
+            ("数轴", "数轴，长度 6"),
+            ("函数图象", "2.03 × 2.03 的函数图象"),
+        ],
+        "in:\n{}",
+        serde_json::to_string_pretty(&tree).unwrap_or_default(),
+    );
+}
+
 /// A script path that cannot be read is an `exit(2)`, not a silent no-op.
 ///
 /// The one failure here that is not a per-line refusal: there is no line to

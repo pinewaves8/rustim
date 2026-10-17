@@ -618,6 +618,16 @@ mod tests {
                 r#"{{"action":"set","target":{id},"property":{{"name":"opacity","value":0.5}}}}"#
             ),
             r#"{"action":"add","type":"circle","params":{"radius":2.0}}"#.to_owned(),
+            // The three coordinate-system kinds, whose parameters add new
+            // optional fields to `ShapeParams`. Each is spelled with only the
+            // fields that shape reads, so a round trip that leaked the others as
+            // `null` would fail here.
+            r#"{"action":"add","type":"number_line","params":{"width":6.0,"range":[-3.0,3.0],"step":1.0,"tick_size":0.15}}"#
+                .to_owned(),
+            r#"{"action":"add","type":"axes","params":{"width":7.0,"height":4.0,"x_range":[-4.0,4.0],"y_range":[-2.0,2.0],"step":1.0}}"#
+                .to_owned(),
+            r#"{"action":"add","type":"plot","params":{"thickness":0.05,"points":[[0.0,0.0],[1.0,1.0],[2.0,0.0]]}}"#
+                .to_owned(),
             // The animation specs round-trip too, which is what lets a host log and
             // replay a session: `range`'s absent-field rule holds for `duration`
             // and `to` as well, so neither is written back as `null`.

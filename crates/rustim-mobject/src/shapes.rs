@@ -22,6 +22,13 @@ pub enum ShapeKind {
     RightTriangle,
     Line,
     Arrow,
+    /// A horizontal axis with ticks: a one-dimensional coordinate frame.
+    NumberLine,
+    /// Two axes crossing at the origin, with ticks on both.
+    Axes,
+    /// A sampled curve, drawn as a stroke's outline rather than as a filled
+    /// polygon.
+    Plot,
 }
 
 /// Parameters for a shape. Every field is optional so a partial description —
@@ -53,6 +60,34 @@ pub struct ShapeParams {
     pub color: Option<[u8; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The data range a [`ShapeKind::NumberLine`] spans, `[min, max]`.
+    ///
+    /// Only the *tick positions* come from this: the line's geometric length is
+    /// `width` (the `line` convention, not `square`'s), and the two are
+    /// deliberately separate numbers so that a number line of length 6 can show
+    /// the range `[-3, 3]` or `[0, 12]` without moving.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<[f64; 2]>,
+    /// The data ranges a [`ShapeKind::Axes`] spans, `[min, max]` each.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_range: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y_range: Option<[f64; 2]>,
+    /// Data units between ticks, for a number line or a set of axes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<f64>,
+    /// How far a tick rises above its axis, in world units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tick_size: Option<f64>,
+    /// A [`ShapeKind::Plot`]'s samples, **in world coordinates**.
+    ///
+    /// World rather than data coordinates on purpose: the command layer has no
+    /// expression language and no opinion about what a sample means, so a host
+    /// that wants `y = 0.25x² - 2` samples it itself and hands over the points it
+    /// wants drawn. [`AxesScale::to_world`] is the mapping a scene uses to do
+    /// that against the axes it is drawing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub points: Option<Vec<[f64; 2]>>,
 }
 
 impl ShapeParams {
@@ -68,6 +103,12 @@ impl ShapeParams {
     pub fn thickness(&self) -> f64 {
         self.thickness.unwrap_or(DEFAULT_THICKNESS)
     }
+    pub fn step(&self) -> f64 {
+        self.step.unwrap_or(1.0)
+    }
+    pub fn tick_size(&self) -> f64 {
+        self.tick_size.unwrap_or(DEFAULT_TICK_SIZE)
+    }
 }
 
 /// How thick a line or an arrow's shaft is when the caller did not say.
@@ -79,6 +120,13 @@ impl ShapeParams {
 /// px↔unit mapping is the viewport's business and a mobject never learns it.
 pub const DEFAULT_THICKNESS: f64 = 0.045;
 
+/// How far a tick rises above its axis when the caller did not say.
+///
+/// Manim's `NumberLine` tick size is 0.1 `frame_height/8` units, i.e. 0.1 world
+/// units here; 0.15 is a little larger so that a tick survives a rasterised
+/// 1-unit step without becoming a hairline — the golden image is the check.
+pub const DEFAULT_TICK_SIZE: f64 = 0.15;
+
 /// Build a mobject from a shape description.
 pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
     let (w, h) = (params.width(), params.height());
@@ -88,6 +136,40 @@ pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
         ShapeKind::RightTriangle => right_triangle(w, h),
         ShapeKind::Line => line(w, params.thickness()),
         ShapeKind::Arrow => arrow(w, params.thickness()),
+        ShapeKind::NumberLine => {
+            // The default range spans the line's own length, so with no range
+            // given one data unit is one world unit — the honest default for a
+            // number line, and the one that keeps `{"type":"number_line"}`
+            // renderable rather than empty.
+            let [lo, hi] = params.range.unwrap_or([-w / 2.0, w / 2.0]);
+            number_line(
+                w,
+                (lo, hi),
+                params.step(),
+                params.tick_size(),
+                params.thickness(),
+            )
+        }
+        ShapeKind::Axes => {
+            let [x0, x1] = params.x_range.unwrap_or([-4.0, 4.0]);
+            let [y0, y1] = params.y_range.unwrap_or([-3.0, 3.0]);
+            axes(
+                w,
+                h,
+                (x0, x1),
+                (y0, y1),
+                params.step(),
+                params.tick_size(),
+                params.thickness(),
+            )
+        }
+        ShapeKind::Plot => match &params.points {
+            Some(points) => plot(points, params.thickness()),
+            // No samples is a legitimate description — a host may add the
+            // object before it has data — and it is an empty mobject rather
+            // than an error, which is what `add` can say.
+            None => Vec::new(),
+        },
     };
 
     let color = params.color.map_or(rustim_color::FG, |[r, g, b]| {
@@ -244,6 +326,299 @@ pub fn arrow(length: f64, thickness: f64) -> Vec<Point> {
         Point::new(0.0, t),
         Point::new(0.0, -t),
     ])
+}
+
+/// A number line: a horizontal filled shaft with ticks rising from it.
+///
+/// Built as **one welded path** rather than a shaft with tick children — see
+/// [`axes`] for why — and centred on its own origin, `x` in
+/// `[-length/2, length/2]`.
+///
+/// `range` is the *data* range the ticks mark; the mapping from data to world
+/// is [`AxesScale`]'s, restricted to `x`. A non-finite or degenerate description
+/// (a range that does not grow, a step that is not positive, a tick count the
+/// [`MAX_TICKS`] guard refuses) draws nothing rather than allocating or
+/// panicking: every number here can come from a language model.
+pub fn number_line(
+    length: f64,
+    range: (f64, f64),
+    step: f64,
+    tick_size: f64,
+    thickness: f64,
+) -> Vec<Point> {
+    if !(length.is_finite() && thickness.is_finite() && tick_size.is_finite())
+        || length <= 0.0
+        || thickness <= 0.0
+        || tick_size < 0.0
+    {
+        return Vec::new();
+    }
+    let half_t = thickness / 2.0;
+    let mut path = rustim_math::BezPath::new();
+    path.extend(rustim_math::rect_path(rustim_math::Rect::new(
+        -length / 2.0,
+        -half_t,
+        length / 2.0,
+        half_t,
+    )));
+    for v in tick_values(range, step) {
+        let x = AxesScale::map(v, range, length);
+        // Clamped to the shaft: a tick at the very end protrudes half a
+        // thickness past it otherwise, and that protrusion is what a
+        // diameter-based description would then report as extra length.
+        let (x0, x1) = clamp_span(x - half_t, x + half_t, length / 2.0);
+        path.extend(rustim_math::rect_path(rustim_math::Rect::new(
+            x0,
+            half_t,
+            x1,
+            half_t + tick_size,
+        )));
+    }
+    points_from_path(&path)
+}
+
+/// Two axes crossing at the origin, with ticks on both.
+///
+/// `x_length` and `y_length` are the shafts' geometric lengths; `x_range` and
+/// `y_range` are the data ranges the ticks mark, mapped by [`AxesScale`]. Ticks
+/// rise above the x-axis and to the right of the y-axis, and the tick at the
+/// origin is omitted on both because the other axis already crosses there.
+///
+/// # One path, not a group of tick mobjects
+///
+/// Same trade as [`number_line`]: a subtree of ticks would make each tick a
+/// separately addressable object, which sounds like a feature until `add`
+/// returns one id for the axes and `Tab` visits twelve ticks, the parent's
+/// opacity stops at its children, and [`crate::SceneTree::world_bounds`] answers
+/// `None` for a parent that has only children. So the shafts and every tick are
+/// subpaths of a single `BezPath`, welded by [`points_from_path`]. The cost is
+/// that a tick is not addressable; the alternative costs the object model.
+pub fn axes(
+    x_length: f64,
+    y_length: f64,
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+    step: f64,
+    tick_size: f64,
+    thickness: f64,
+) -> Vec<Point> {
+    if !(x_length.is_finite() && y_length.is_finite())
+        || !(thickness.is_finite() && tick_size.is_finite())
+        || x_length <= 0.0
+        || y_length <= 0.0
+        || thickness <= 0.0
+        || tick_size < 0.0
+    {
+        return Vec::new();
+    }
+    let half_t = thickness / 2.0;
+    let mut path = rustim_math::BezPath::new();
+    // The x-axis, then the y-axis. Both wind the same way (`rect_path` is
+    // counter-clockwise for every rectangle), so their overlap at the origin
+    // counts twice under `Fill::NonZero` and still fills.
+    path.extend(rustim_math::rect_path(rustim_math::Rect::new(
+        -x_length / 2.0,
+        -half_t,
+        x_length / 2.0,
+        half_t,
+    )));
+    path.extend(rustim_math::rect_path(rustim_math::Rect::new(
+        -half_t,
+        -y_length / 2.0,
+        half_t,
+        y_length / 2.0,
+    )));
+    for v in tick_values(x_range, step) {
+        if v == 0.0 {
+            continue;
+        }
+        let x = AxesScale::map(v, x_range, x_length);
+        let (x0, x1) = clamp_span(x - half_t, x + half_t, x_length / 2.0);
+        path.extend(rustim_math::rect_path(rustim_math::Rect::new(
+            x0,
+            half_t,
+            x1,
+            half_t + tick_size,
+        )));
+    }
+    for v in tick_values(y_range, step) {
+        if v == 0.0 {
+            continue;
+        }
+        let y = AxesScale::map(v, y_range, y_length);
+        let (y0, y1) = clamp_span(y - half_t, y + half_t, y_length / 2.0);
+        path.extend(rustim_math::rect_path(rustim_math::Rect::new(
+            half_t,
+            y0,
+            half_t + tick_size,
+            y1,
+        )));
+    }
+    points_from_path(&path)
+}
+
+/// The tolerance [`plot`] hands `kurbo`'s stroker, in world units.
+///
+/// It only affects curves: every segment of a sampled polyline is straight, and
+/// `kurbo` emits a straight segment's offset exactly. Stated anyway because the
+/// number has to come from somewhere, and a tolerance chosen per call would make
+/// the geometry depend on who called.
+const STROKE_TOLERANCE: f64 = 1e-3;
+
+/// A sampled curve, drawn as the **outline a stroke would cover**.
+///
+/// # Not a filled polyline
+///
+/// Handing the samples to the fill walk as an open polyline would fill the
+/// region between the curve and its closing chord — a function graph would be
+/// drawn as a solid area rather than as a line. Manim's `plot` is a stroke, and
+/// the mobject model has no stroke, so the shape here is `kurbo::stroke`'s
+/// expansion of the polyline into one closed outline that `points_from_path`
+/// carries like any other polygon. That is the same expansion
+/// [`crate::shapes::line`] performs by hand, with the joins handled by the
+/// stroker rather than by a constant.
+///
+/// Miter joins and butt caps are chosen for the same reason: the outline is then
+/// pure polygon geometry with no rounded overshoot, and its corners are at the
+/// samples rather than at arc approximations. Consecutive duplicate samples are
+/// dropped — a host sampling at two different parameters can produce them, and a
+/// zero-length segment makes the stroker's join direction undefined.
+///
+/// Fewer than two distinct points draws nothing: there is no direction in one
+/// point, and a lone sample is not a curve.
+pub fn plot(points: &[[f64; 2]], thickness: f64) -> Vec<Point> {
+    if !thickness.is_finite() || thickness <= 0.0 {
+        return Vec::new();
+    }
+    let mut path = rustim_math::BezPath::new();
+    let mut count = 0_usize;
+    let mut last: Option<Point> = None;
+    for &[x, y] in points {
+        // A non-finite sample refuses the whole plot rather than being skipped:
+        // skipping would move the curve's start to the origin, which is a wrong
+        // picture instead of an absent one.
+        if !(x.is_finite() && y.is_finite()) {
+            return Vec::new();
+        }
+        let p = Point::new(x, y);
+        if last == Some(p) {
+            continue;
+        }
+        if count == 0 {
+            path.move_to(p);
+        } else {
+            path.line_to(p);
+        }
+        count += 1;
+        last = Some(p);
+    }
+    if count < 2 {
+        return Vec::new();
+    }
+    let outline = rustim_math::stroke(
+        &path,
+        &rustim_math::Stroke::new(thickness)
+            .with_join(rustim_math::Join::Miter)
+            .with_caps(rustim_math::Cap::Butt),
+        &rustim_math::StrokeOpts::default(),
+        STROKE_TOLERANCE,
+    );
+    points_from_path(&outline)
+}
+
+/// The most ticks one axis may draw.
+///
+/// A guard, not a taste: `step` and the ranges arrive over the wire, and
+/// `step = 1e-9` over a range of 8 would otherwise build billions of rectangles
+/// inside `add`. Exceeding it draws nothing, which is a refusal the caller can
+/// see in the picture and act on.
+pub const MAX_TICKS: usize = 256;
+
+/// The tick values in `range` that are multiples of `step`, inclusive.
+///
+/// Multiplied rather than accumulated: `x += step` drifts, and a tick at 0.3
+/// that lands at 0.30000000000000004 is a tick the `!= 0.0` skip misses and a
+/// label disagrees with.
+fn tick_values((lo, hi): (f64, f64), step: f64) -> Vec<f64> {
+    if !(lo.is_finite() && hi.is_finite()) || lo >= hi || !step.is_finite() || step <= 0.0 {
+        return Vec::new();
+    }
+    let first = (lo / step).ceil();
+    let last = (hi / step).floor();
+    if !(first.is_finite() && last.is_finite()) || last < first {
+        return Vec::new();
+    }
+    // `as usize` saturates, so an enormous span is refused by the same check as
+    // a merely large one.
+    let count = (last - first + 1.0) as usize;
+    if count == 0 || count > MAX_TICKS {
+        return Vec::new();
+    }
+    (0..count).map(|i| (first + i as f64) * step).collect()
+}
+
+/// Clamp a tick's extent along its axis to `[-half, half]`.
+///
+/// A tick centred on the axis' very end would otherwise protrude half a
+/// thickness past it. That is a couple of pixels in the picture and it is also
+/// the ink a diameter-based description measures: with the protrusion, a
+/// number line whose shaft is 6 is announced as "长度 6.05".
+fn clamp_span(lo: f64, hi: f64, half: f64) -> (f64, f64) {
+    (lo.max(-half), hi.min(half))
+}
+
+/// The mapping from data coordinates to world coordinates, shared by the axis
+/// builders and the scenes that plot against them.
+///
+/// The world is Y-up with the origin at the frame's centre; a coordinate system
+/// is therefore a rectangle of data mapped onto a rectangle centred on the
+/// origin. Keeping that mapping in one place is what lets a scene sample a
+/// function in data coordinates and hand [`ShapeKind::Plot`] the world-space
+/// points it drew the axes for — there is no second, subtly different mapping
+/// inside the tick placement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AxesScale {
+    /// The data interval the x-axis spans.
+    pub x_range: (f64, f64),
+    /// The x-axis' geometric length, in world units.
+    pub x_length: f64,
+    pub y_range: (f64, f64),
+    pub y_length: f64,
+}
+
+impl AxesScale {
+    pub const fn new(
+        x_range: (f64, f64),
+        x_length: f64,
+        y_range: (f64, f64),
+        y_length: f64,
+    ) -> Self {
+        Self {
+            x_range,
+            x_length,
+            y_range,
+            y_length,
+        }
+    }
+
+    /// Where the data point `(x, y)` lands in world space.
+    pub fn to_world(&self, x: f64, y: f64) -> Point {
+        Point::new(
+            Self::map(x, self.x_range, self.x_length),
+            Self::map(y, self.y_range, self.y_length),
+        )
+    }
+
+    /// One axis of the map: centre the data interval on zero, scale it to
+    /// `length`. A degenerate interval answers `0.0` — the midpoint, which is a
+    /// finite point — rather than dividing by zero.
+    fn map(v: f64, (lo, hi): (f64, f64), length: f64) -> f64 {
+        let span = hi - lo;
+        if !(span.is_finite() && span > 0.0) || !length.is_finite() {
+            return 0.0;
+        }
+        (v - (lo + hi) / 2.0) * length / span
+    }
 }
 
 /// Build a drawable path straight from a point array, for callers that do not
@@ -582,6 +957,161 @@ mod tests {
             let base = length - length / 4.0;
             assert!(base > 0.0 && base < length);
         }
+    }
+
+    /// A number line is one welded path: a whole number of curves, finite
+    /// throughout, and closed back onto its hub so the array's implicit closing
+    /// edge draws nothing.
+    #[test]
+    fn a_number_line_is_one_welded_closed_path() {
+        let pts = number_line(6.0, (-3.0, 3.0), 1.0, 0.15, 0.045);
+        assert_eq!(pts.len() % 4, 0, "every segment is a cubic");
+        assert!(pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
+        assert_eq!(pts[pts.len() - 1], pts[0], "the loop returns to the hub");
+        assert!(
+            bezier::anchors(&pts).is_some(),
+            "the welded array is a whole number of curves"
+        );
+
+        // Seven ticks and the shaft, each four straight segments. The end ticks
+        // are clamped to the shaft, so the ink is exactly as long as the shaft.
+        let b = bezier::bounds_of(&bezier::anchors(&pts).unwrap()).unwrap();
+        assert_eq!((b.x0, b.x1), (-3.0, 3.0), "{b:?}");
+        assert!((b.y1 - 0.1725).abs() < 1e-9, "{:?}", b);
+    }
+
+    /// The shaft is solid and the ticks are solid, and the space between two
+    /// ticks is not: the welded loop has to keep all three true at once.
+    ///
+    /// Asserted as winding numbers because that is what `Fill::NonZero` reads.
+    /// A weld that dropped the return-to-hub segment would leave the array's
+    /// implicit closing edge running from the last tick back along the shaft,
+    /// and the number line would come out half filled with a diagonal scar.
+    #[test]
+    fn the_ticks_do_not_punch_holes_in_the_shaft() {
+        let pts = number_line(6.0, (-3.0, 3.0), 1.0, 0.15, 0.045);
+        let poly = flatten(&pts);
+
+        assert_eq!(winding(&poly, Point::new(0.5, 0.0)), 1, "inside the shaft");
+        assert_eq!(winding(&poly, Point::new(1.0, 0.1)), 1, "inside a tick");
+        assert_eq!(
+            winding(&poly, Point::new(0.5, 0.1)),
+            0,
+            "the gap between ticks is not filled"
+        );
+        assert_eq!(winding(&poly, Point::new(4.0, 0.0)), 0, "outside");
+    }
+
+    /// A step of zero (or a negative or non-finite one) draws the shaft and no
+    /// ticks, rather than dividing by zero or looping forever.
+    ///
+    /// These values arrive over the wire, so a refusal has to be a picture, not
+    /// a hang. The same guard covers a step so small that the tick count would
+    /// exceed [`MAX_TICKS`].
+    #[test]
+    fn a_zero_step_does_not_run_away() {
+        for step in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-12] {
+            let pts = number_line(6.0, (-3.0, 3.0), step, 0.15, 0.045);
+            // The shaft alone: four curves, sixteen points.
+            assert_eq!(pts.len(), 4 * 4, "step {step}");
+            let b = bezier::bounds_of(&bezier::anchors(&pts).unwrap()).unwrap();
+            assert!((b.height() - 0.045).abs() < 1e-9, "step {step}: no ticks");
+        }
+    }
+
+    /// Both axes and every tick in one path, and the filled result is the union:
+    /// each shaft is solid, and the origin — where the two overlap — is still
+    /// filled under `Fill::NonZero` (winding 2 is not a hole).
+    #[test]
+    fn an_axes_welds_both_axes_and_their_ticks() {
+        let pts = axes(7.0, 4.0, (-4.0, 4.0), (-2.0, 2.0), 1.0, 0.15, 0.045);
+        assert_eq!(pts.len() % 4, 0);
+        let poly = flatten(&pts);
+
+        assert_eq!(winding(&poly, Point::new(2.0, 0.0)), 1, "inside the x-axis");
+        assert_eq!(winding(&poly, Point::new(0.0, 1.5)), 1, "inside the y-axis");
+        assert!(
+            winding(&poly, Point::new(0.0, 0.0)) >= 1,
+            "the axes' overlap must not cancel: {}",
+            winding(&poly, Point::new(0.0, 0.0))
+        );
+        // The tick at data x = 2 sits at world x = 1.75 — the ticks are placed by
+        // the data→world map, not in world units.
+        assert_eq!(
+            winding(&poly, Point::new(1.75, 0.12)),
+            1,
+            "inside an x tick"
+        );
+        assert_eq!(winding(&poly, Point::new(0.12, 1.0)), 1, "inside a y tick");
+        assert_eq!(
+            winding(&poly, Point::new(2.0, 0.5)),
+            0,
+            "the quadrant is empty"
+        );
+
+        let b = bezier::bounds_of(&bezier::anchors(&pts).unwrap()).unwrap();
+        // The end ticks are clamped to their shafts, so the ink is exactly the
+        // shafts' rectangle.
+        assert_eq!((b.width(), b.height()), (7.0, 4.0), "{b:?}");
+    }
+
+    /// A plot is the *ribbon* a stroke would cover, not the region under the
+    /// curve.
+    ///
+    /// This is the counterfactual for the obvious implementation: handing the
+    /// samples to the fill walk as an open polyline fills between the curve and
+    /// its closing chord, so `y = 0.25x² - 2` would be drawn as a solid area. The
+    /// point below the apex is inside that area and outside the ribbon, which is
+    /// exactly what the winding number at `(1, 0.5)` measures.
+    #[test]
+    fn a_plot_is_a_ribbon_and_not_the_region_under_the_curve() {
+        let pts = plot(&[[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]], 0.1);
+        assert_eq!(pts.len() % 4, 0);
+        let poly = flatten(&pts);
+
+        assert_eq!(winding(&poly, Point::new(1.0, 1.0)), 1, "on the curve");
+        assert_eq!(
+            winding(&poly, Point::new(1.0, 0.5)),
+            0,
+            "under the apex is not the plot"
+        );
+        assert_eq!(winding(&poly, Point::new(1.0, -0.5)), 0, "nor below it");
+
+        let b = bezier::bounds_of(&bezier::anchors(&pts).unwrap()).unwrap();
+        assert!(b.height() > 1.0 && b.height() < 1.2, "{:?}", b);
+        assert!(
+            b.x0 < 0.0 && b.x1 > 2.0,
+            "the outline surrounds the samples"
+        );
+    }
+
+    /// Fewer than two distinct samples is not a curve, and a non-finite sample
+    /// refuses the whole plot rather than moving its start.
+    #[test]
+    fn a_plot_needs_two_distinct_points() {
+        assert!(plot(&[], 0.1).is_empty());
+        assert!(plot(&[[1.0, 1.0]], 0.1).is_empty());
+        assert!(plot(&[[1.0, 1.0], [1.0, 1.0]], 0.1).is_empty());
+        assert!(plot(&[[0.0, 0.0], [1.0, f64::NAN]], 0.1).is_empty());
+        assert!(plot(&[[0.0, 0.0], [1.0, 1.0]], 0.0).is_empty());
+        // Duplicated interior samples are dropped, not zero-length segments.
+        assert!(!plot(&[[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]], 0.1).is_empty());
+    }
+
+    /// The one mapping a scene samples through: the endpoints of the data range
+    /// land on the ends of the axis, and the middle on the origin.
+    #[test]
+    fn the_data_to_world_mapping_maps_the_range_onto_the_length() {
+        let scale = AxesScale::new((-4.0, 4.0), 7.0, (-2.0, 2.0), 4.0);
+        assert_eq!(scale.to_world(-4.0, -2.0), Point::new(-3.5, -2.0));
+        assert_eq!(scale.to_world(4.0, 2.0), Point::new(3.5, 2.0));
+        assert_eq!(scale.to_world(0.0, 0.0), Point::new(0.0, 0.0));
+        assert_eq!(scale.to_world(1.0, 1.0), Point::new(0.875, 1.0));
+
+        // A degenerate interval answers the midpoint rather than dividing by
+        // zero — the same refusal the builders make, in the mapping's own terms.
+        let flat = AxesScale::new((1.0, 1.0), 7.0, (-2.0, 2.0), 4.0);
+        assert_eq!(flat.to_world(3.0, 2.0), Point::new(0.0, 2.0));
     }
 
     #[test]
