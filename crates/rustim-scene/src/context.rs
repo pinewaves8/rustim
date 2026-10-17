@@ -69,14 +69,22 @@ pub struct SceneContext {
     /// here by hand plays at full motion whatever the user asked for.
     pub animations: AnimationScheduler,
     pub viewport: Viewport,
-    /// How much of the motion to play, for the whole run.
+    /// How much of the motion to play.
     ///
-    /// Fixed at construction rather than set afterwards, because a scene is allowed
-    /// to consult it while scripting (`construct` may skip a flourish it knows will
-    /// not be animated) and a context with a mode that arrives *after* `construct`
-    /// would let the two disagree. See [`Motion`] for what `Reduced` does to a beat
-    /// — the rule is in `rustim_anim::Sequence::start_next`, the one place a beat
-    /// reaches the clock.
+    /// Set at construction from the host's flag or platform preference, and
+    /// changeable while running through [`Command::Motion`] — which is what the
+    /// `m` key sends. A change takes effect at the **next beat started**: the
+    /// value is read each time [`SceneContext::advance`] hands a beat to the
+    /// scheduler, and a beat already on the clock keeps the decision it was given
+    /// ([`Motion`]'s rule is in `rustim_anim::Sequence::start_next`, the one place
+    /// a beat reaches it).
+    ///
+    /// A scene may read it while scripting — `construct` may skip a flourish it
+    /// knows will not be animated — and that reading has no later correction:
+    /// turning motion back on cannot replay what was skipped, because the scene's
+    /// scripting ran once. The field is public for that read; a host that wants
+    /// the change to go through the command layer gets it announced as a
+    /// [`Command::Motion`] would.
     pub motion: Motion,
     /// The scripted beats not yet started — deliberately private.
     ///
@@ -227,13 +235,15 @@ impl SceneContext {
 
     /// Apply a command from outside the engine.
     ///
-    /// [`Command::Play`] and [`Command::Camera`] are answered **here** rather than
-    /// in `command::apply`: a play needs the playback machine, a camera command
-    /// needs the playback machine *or* the viewport's aspect ratio (for `focus`),
-    /// and `apply`'s documented purity — "pure with respect to everything except
-    /// `tree`: no clock, no I/O, no renderer" — is what makes the rest of the
-    /// protocol testable in isolation and replayable. The wire→animation and
-    /// wire→camera mappings still live in `command`, next to the wire types.
+    /// [`Command::Play`], [`Command::Camera`] and [`Command::Motion`] are answered
+    /// **here** rather than in `command::apply`: a play needs the playback
+    /// machine, a camera command needs the playback machine *or* the viewport's
+    /// aspect ratio (for `focus`), a motion command names a field on this context
+    /// rather than in the tree, and `apply`'s documented purity — "pure with
+    /// respect to everything except `tree`: no clock, no I/O, no renderer" — is
+    /// what makes the rest of the protocol testable in isolation and replayable.
+    /// The wire→animation and wire→camera mappings still live in `command`, next
+    /// to the wire types.
     ///
     /// A camera command without a `duration` writes `tree.camera` now; one with a
     /// duration (including `0.0`) queues a single `CameraMove` beat, so it is
@@ -245,12 +255,21 @@ impl SceneContext {
     /// The returned diff is **empty**, and that is the honest answer rather than a
     /// placeholder: a diff describes the tree, and queueing a beat does not change
     /// the tree — it changes what will happen to it — while the camera is not a
-    /// node at all. The animation would report its own modification when it runs;
-    /// an `ANIMATION_DONE` announcement is how a host learns that it did.
+    /// node at all and the motion mode is not either. The animation would report
+    /// its own modification when it runs; an `ANIMATION_DONE` announcement is how
+    /// a host learns that it did.
+    ///
+    /// A [`Command::Motion`] writes `self.motion` and answers with an empty diff
+    /// for the same reason; it reads back through [`SceneContext::motion`]'s field,
+    /// not through the tree.
     pub fn handle(&mut self, cmd: &Command) -> Result<StateDiff, CommandError> {
         if let Command::Play { animation } = cmd {
             let anim = command::animation_for(&self.tree, animation)?;
             self.play_all([anim]);
+            return Ok(StateDiff::default());
+        }
+        if let Command::Motion { mode } = cmd {
+            self.motion = (*mode).into();
             return Ok(StateDiff::default());
         }
         if let Command::Camera {
@@ -871,6 +890,100 @@ mod tests {
         tick(&mut ctx, 1);
         assert_eq!(opacity(&ctx, id), 1.0);
         assert!(ctx.is_playing(), "and still holds the beat's own length");
+    }
+
+    /// The runtime switch takes effect at the **next beat started**.
+    ///
+    /// Both halves matter and neither is visible in a still: a switch that
+    /// reached into the scheduler would snap a beat the viewer is already
+    /// watching, and a switch that took effect one beat late would answer the
+    /// user a whole animation after they asked. The running beat is allowed to
+    /// finish its own journey — it made its decision when it was handed the
+    /// clock — and the one queued behind it is reduced.
+    #[test]
+    fn a_motion_command_affects_the_next_beat_and_not_the_running_one() {
+        let mut ctx = scene();
+        let first = invisible_square(&mut ctx);
+        let second = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(first).with_duration(0.5));
+        tick(&mut ctx, 1);
+        let partial = opacity(&ctx, first);
+        assert!(
+            partial > 0.0 && partial < 1.0,
+            "full motion, a slice of the way: {partial}"
+        );
+
+        let diff = ctx
+            .handle(&Command::Motion {
+                mode: command::MotionMode::Reduced,
+            })
+            .expect("a motion command is a value, never a refusal");
+        assert_eq!(ctx.motion, Motion::Reduced);
+        assert_eq!(
+            diff,
+            StateDiff::default(),
+            "the mode is not a node, so the diff is empty"
+        );
+
+        tick(&mut ctx, 1);
+        assert!(
+            opacity(&ctx, first) < 1.0,
+            "the beat on the clock was not snapped by a mode it never saw"
+        );
+
+        // Let the first beat run out. The second starts under `Reduced` and is
+        // therefore at its end state on its very first frame.
+        while ctx.is_playing() {
+            ctx.advance(DT);
+        }
+        ctx.play(FadeIn::new(second).with_duration(0.5));
+        tick(&mut ctx, 1);
+        assert_eq!(opacity(&ctx, second), 1.0);
+
+        // And back: the same switch in the other direction is a full-mode beat.
+        ctx.handle(&Command::Motion {
+            mode: command::MotionMode::Full,
+        })
+        .unwrap();
+        assert_eq!(ctx.motion, Motion::Full);
+    }
+
+    /// A mode switch cannot replay what `construct` already decided to skip.
+    ///
+    /// Documenting this as a limit rather than treating it as one: a scene reads
+    /// the mode while scripting and may omit a flourish it knows will not be
+    /// animated, so the scripting that ran under `Reduced` cannot be re-run under
+    /// `Full`. The test pins the honest consequence — the toggle is for the beats
+    /// still queued, not for the scene's shape.
+    #[test]
+    fn turning_motion_back_on_does_not_replay_skipped_flourishes() {
+        let mut ctx = scene_at(Motion::Reduced);
+        let id = invisible_square(&mut ctx);
+        // A scene that scripts differently under reduced motion.
+        if !ctx.motion.is_reduced() {
+            ctx.wait(1.0);
+        }
+        ctx.play(FadeIn::new(id).with_duration(0.25));
+
+        ctx.handle(&Command::Motion {
+            mode: command::MotionMode::Full,
+        })
+        .unwrap();
+        // The beat was queued *after* the switch, so it is full motion: the
+        // skipped `Wait` is not resurrected, which is exactly the limit.
+        tick(&mut ctx, 1);
+        let alpha = opacity(&ctx, id);
+        assert!(alpha < 1.0, "a full beat is interpolated: {alpha}");
+
+        let mut frames = 1;
+        while ctx.is_playing() {
+            ctx.advance(DT);
+            frames += 1;
+        }
+        assert!(
+            frames < 30,
+            "only the 0.25 s fade should remain; the skipped Wait came back ({frames} frames)"
+        );
     }
 
     /// **The two halves of `Command::Play` join here:** the wire mapping is

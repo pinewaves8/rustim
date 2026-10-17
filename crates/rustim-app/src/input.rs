@@ -50,6 +50,13 @@ pub enum Intent {
     Adjust(f64),
     /// Space.
     TogglePlayback,
+    /// `m`: flip between full and reduced motion.
+    ///
+    /// The switch takes effect at the next beat started, not on one already on
+    /// the clock — see [`rustim_scene::Command::Motion`]. It exists so a user
+    /// who did not (or could not) tell the host their preference up front has a
+    /// way to ask mid-session.
+    ToggleMotion,
     /// `,` and `.`: step one frame backwards or forwards.
     StepFrame(i8),
     /// Enter: read the focused object aloud.
@@ -128,6 +135,10 @@ pub fn classify(press: &KeyPress) -> Option<Intent> {
         // the machine the engine is being built on.
         Key::Character("," | "，") => Intent::StepFrame(-1),
         Key::Character("." | "。") => Intent::StepFrame(1),
+        // Shift is already part of the character here (a shifted `m` arrives as
+        // `"M"`), and the full-width pair is spelled out for the same IME reason
+        // as the comma.
+        Key::Character("m" | "M" | "ｍ" | "Ｍ") => Intent::ToggleMotion,
         // Fallback for the case the full-width check cannot cover: an IME that
         // consumes the press outright leaves `logical_key` unidentified while the
         // *physical* key is still whatever was pressed. Restricted to the two
@@ -136,6 +147,7 @@ pub fn classify(press: &KeyPress) -> Option<Intent> {
         Key::Unidentified(_) | Key::Dead(_) => match press.physical {
             PhysicalKey::Code(KeyCode::Comma) => Intent::StepFrame(-1),
             PhysicalKey::Code(KeyCode::Period) => Intent::StepFrame(1),
+            PhysicalKey::Code(KeyCode::KeyM) => Intent::ToggleMotion,
             _ => return None,
         },
         _ => return None,
@@ -307,6 +319,13 @@ mod tests {
         assert_eq!(classify(&named(NamedKey::Escape)), Some(Intent::Escape));
         assert_eq!(classify(&ch(",")), Some(Intent::StepFrame(-1)));
         assert_eq!(classify(&ch(".")), Some(Intent::StepFrame(1)));
+        assert_eq!(classify(&ch("m")), Some(Intent::ToggleMotion));
+        // A shifted `m` arrives as the uppercase character, which winit reports
+        // as such — `shift` is not consulted for it. The full-width pair is the
+        // IME form, for the same reason as the comma.
+        assert_eq!(classify(&ch("M")), Some(Intent::ToggleMotion));
+        assert_eq!(classify(&ch("ｍ")), Some(Intent::ToggleMotion));
+        assert_eq!(classify(&ch("Ｍ")), Some(Intent::ToggleMotion));
         // Anything else is not ours, and saying so is what keeps the classifier
         // from swallowing keys the IME or a future widget needs.
         assert_eq!(classify(&ch("a")), None);
@@ -332,6 +351,7 @@ mod tests {
             classify(&eaten(KeyCode::Period)),
             Some(Intent::StepFrame(1))
         );
+        assert_eq!(classify(&eaten(KeyCode::KeyM)), Some(Intent::ToggleMotion));
         assert_eq!(classify(&eaten(KeyCode::KeyA)), None);
         // ...and it stays out of the way of a key that did identify itself: the
         // physical code here says "comma", the logical key says "Escape".
@@ -381,6 +401,15 @@ mod tests {
                 true
             )),
             Some(Intent::StepFrame(-1))
+        );
+        // Holding `m` must not flip the mode thirty times a second.
+        assert_eq!(
+            classify(&key(
+                Key::Character("m".into()),
+                ElementState::Pressed,
+                true
+            )),
+            None
         );
     }
 

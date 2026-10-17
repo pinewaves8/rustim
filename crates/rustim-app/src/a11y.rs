@@ -66,7 +66,7 @@ use accesskit::{
 };
 use accesskit_winit::Adapter;
 use rustim_mobject::NodeId;
-use rustim_scene::command::{Command, Property};
+use rustim_scene::command::{Command, MotionMode, Property};
 use rustim_scene::{SceneContext, SemanticNode, SemanticRole, SemanticTree};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
@@ -298,6 +298,18 @@ pub fn speak_of(node: &SemanticNode) -> String {
         node.name.clone()
     } else {
         format!("{}，{}", node.name, node.description)
+    }
+}
+
+/// What the `m` key says after it flips the motion mode.
+///
+/// A function rather than a literal at the call site so the wording is reachable
+/// from a test: the live region is the only channel a blind user has for a
+/// setting that changes nothing they can otherwise hear.
+pub fn motion_announcement(mode: MotionMode) -> &'static str {
+    match mode {
+        MotionMode::Reduced => "动效：减弱",
+        MotionMode::Full => "动效：完整",
     }
 }
 
@@ -732,6 +744,24 @@ mod tests {
         // a backend announces on.
         let u = core.to_update(&ctx, "t");
         assert_eq!(find(&u, LIVE_NODE).label(), Some(core.live_text()));
+    }
+
+    /// The motion switch is otherwise silent to a blind user: it changes timing,
+    /// and timing is precisely what the reduced path removes. So it gets an
+    /// announcement of its own, through the same live region as everything else.
+    #[test]
+    fn a_motion_switch_is_announced_through_the_live_region() {
+        let mut core = A11yCore::new();
+        core.offer(motion_announcement(MotionMode::Reduced));
+        assert_eq!(core.live_text(), "", "offered, not yet spoken");
+        let now = Instant::now();
+        core.flush(now);
+        assert_eq!(core.live_text(), "动效：减弱");
+
+        core.offer(motion_announcement(MotionMode::Full));
+        let later = now + core.announcer.min_interval();
+        core.flush(later);
+        assert_eq!(core.live_text(), "动效：完整");
     }
 
     #[test]

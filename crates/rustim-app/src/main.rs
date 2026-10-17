@@ -37,7 +37,7 @@ use rustim_app::{AppEvent, Intent, feed, input};
 use rustim_math::{Affine2, BezPath, Camera, Point, Viewport, bezier};
 use rustim_mobject::{Mobject, NodeId, NodeKind, Style};
 use rustim_render::{CpuRenderer, Damage, DrawList, DrawOp, RenderError, RenderStats, Renderer};
-use rustim_scene::command::Command;
+use rustim_scene::command::{Command, MotionMode};
 use rustim_scene::{Scene, SceneContext};
 use rustim_text::{FontProvider, ShapedText, TextStyle};
 use winit::application::ApplicationHandler;
@@ -1557,6 +1557,23 @@ impl App {
                 }
             }
             Intent::TogglePlayback => self.paused = !self.paused,
+            Intent::ToggleMotion => {
+                let mode = if ctx.motion.is_reduced() {
+                    MotionMode::Full
+                } else {
+                    MotionMode::Reduced
+                };
+                self.queued.push(Command::Motion { mode });
+                // Only the keyboard announces it. A command from a host is
+                // already known to the host, and repeating it into the live
+                // region would make an AT-driven switch speak twice — the same
+                // rule focus announcements follow.
+                if let Some(w) = self.windowed.as_mut() {
+                    w.a11y
+                        .core()
+                        .offer(rustim_app::a11y::motion_announcement(mode));
+                }
+            }
             Intent::StepFrame(n) => {
                 self.paused = true;
                 self.step = (self.step + i32::from(n)).clamp(-60, 60);
@@ -1929,6 +1946,9 @@ fn main() {
                 // `camera` is a command, not an animation kind: without
                 // `duration` it writes the view now, with one it queues a beat.
                 println!(r#"  {{"action":"camera","focus":4294967297,"duration":1.0}}"#);
+                // So is `motion`, and it takes effect at the next beat started —
+                // a running beat keeps the policy it was handed.
+                println!(r#"  {{"action":"motion","mode":"reduced"}}"#);
                 // `rate` names the easing curve by Manim's name; absent means the
                 // animation's own default. The full vocabulary is the line above.
                 println!(

@@ -65,6 +65,41 @@ pub enum Command {
         #[serde(skip_serializing_if = "Option::is_none")]
         duration: Option<f64>,
     },
+    /// Change how much motion the run plays from now on.
+    ///
+    /// The switch takes effect at the **next beat started**, not on whatever is
+    /// already on the clock: reduced motion is decided where a beat is handed to
+    /// the scheduler ([`rustim_anim::Sequence::start_next`]), and a beat in
+    /// flight has already made that decision. Turning motion back on likewise
+    /// cannot replay a flourish `construct` skipped — the scene's own scripting
+    /// already ran.
+    ///
+    /// Answered by [`crate::SceneContext::handle`], because the mode lives on the
+    /// context rather than in the tree; the returned diff is empty for the same
+    /// reason a camera command's is.
+    Motion { mode: MotionMode },
+}
+
+/// The wire spelling of [`rustim_anim::Motion`].
+///
+/// A separate enum rather than serde on `Motion` itself, because `rustim-anim`
+/// is a kernel crate with no wire vocabulary of its own — and because the wire
+/// names are part of *this* protocol, where renaming a variant of an animation
+/// library must not silently change the JSON a host sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionMode {
+    Full,
+    Reduced,
+}
+
+impl From<MotionMode> for rustim_anim::Motion {
+    fn from(mode: MotionMode) -> Self {
+        match mode {
+            MotionMode::Full => Self::Full,
+            MotionMode::Reduced => Self::Reduced,
+        }
+    }
 }
 
 /// A named, settable property.
@@ -366,6 +401,12 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // Likewise answered by `SceneContext::handle`: resolving `focus` needs
             // the viewport's aspect ratio, and applying the result is either a
             // write to `tree.camera` or a queued beat. The arm keeps `apply` total.
+        }
+        Command::Motion { .. } => {
+            // And likewise: the motion mode lives on the `SceneContext`, beside
+            // the playback machine that consults it, not in the tree `apply` can
+            // reach. Keeping the arm is what lets a direct `apply` caller replay
+            // the same command log without a panic.
         }
     }
     Ok(diff)
@@ -1003,6 +1044,11 @@ mod tests {
             ),
             r#"{"action":"camera","zoom":2.0}"#.to_owned(),
             r#"{"action":"camera","center":[0.0,0.0]}"#.to_owned(),
+            // The runtime motion switch. `mode` is the wire's own word for it,
+            // not `rustim_anim::Motion`'s serde spelling — that enum has none,
+            // and giving it one would tie the protocol to a library's naming.
+            r#"{"action":"motion","mode":"reduced"}"#.to_owned(),
+            r#"{"action":"motion","mode":"full"}"#.to_owned(),
         ];
         for json in cases {
             let cmd: Command =
@@ -1141,6 +1187,24 @@ mod tests {
         ));
         // ...and the object was not half-modified.
         assert_eq!(tree.get(id).unwrap().opacity, 1.0);
+    }
+
+    /// A motion command is answered by the context, not by the tree — but
+    /// `apply` still has to be total over `Command`, so a direct caller gets an
+    /// empty diff rather than a panic.
+    #[test]
+    fn a_motion_command_leaves_the_pure_apply_untouched() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(vec![]));
+        let diff = apply(
+            &mut tree,
+            &Command::Motion {
+                mode: MotionMode::Reduced,
+            },
+        )
+        .unwrap();
+        assert!(diff.is_empty());
+        assert!(tree.get(id).is_some(), "and the tree is exactly as it was");
     }
 
     /// The three stroke properties reach `Style` and mark it dirty.
