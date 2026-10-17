@@ -76,7 +76,11 @@ pub enum Axis {
     Column,
 }
 
-/// Why a placement could not be made.
+/// Why a placement or an attention helper could not be computed.
+///
+/// [`crate::attention`] uses the same vocabulary: an arrow needs the same
+/// measurable box a placement does, and its own fields are refused the same
+/// way.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayoutError {
     /// The id is not in the tree. The command layer resolves a `Target` before

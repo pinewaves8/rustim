@@ -2,7 +2,10 @@
 
 use std::collections::VecDeque;
 
-use rustim_anim::{Animation, AnimationScheduler, CameraMove, Motion, Sequence, Wait};
+use rustim_anim::{
+    Animate, Animation, AnimationGroup, AnimationScheduler, CameraMove, Motion, Sequence,
+    StyleProperty, Succession, Wait,
+};
 use rustim_math::{Affine2, Camera, Viewport};
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 use rustim_mobject::{NodeId, SceneTree};
@@ -1160,6 +1163,80 @@ impl SceneContext {
             // already is: a file feed applies every line at t = 0, so the delay
             // is the only thing that keeps the lecture in order.
             self.narration.push((self.clock + delay, text.to_owned()));
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Highlight {
+            target,
+            dim,
+            duration,
+            hold,
+        } = cmd
+        {
+            let target = target.resolve(&self.tree)?;
+            let dim = dim.unwrap_or(command::DEFAULT_HIGHLIGHT_DIM);
+            if !dim.is_finite() || !(0.0..=1.0).contains(&dim) {
+                return Err(CommandError::OutOfRange {
+                    property: "dim".to_owned(),
+                    detail: format!("{dim} is not a dimming factor in 0.0..=1.0"),
+                });
+            }
+            let duration = duration.unwrap_or(command::DEFAULT_HIGHLIGHT_DURATION);
+            if !duration.is_finite() || duration < 0.0 {
+                return Err(CommandError::OutOfRange {
+                    property: "duration".to_owned(),
+                    detail: format!("{duration} is not a finite, non-negative duration"),
+                });
+            }
+            let hold = hold.unwrap_or(command::DEFAULT_HIGHLIGHT_HOLD);
+            if !hold.is_finite() || hold < 0.0 {
+                return Err(CommandError::OutOfRange {
+                    property: "hold".to_owned(),
+                    detail: format!("{hold} is not a finite, non-negative hold"),
+                });
+            }
+            // The nodes to dim, and the opacities to put back. Both are read
+            // **now**, before any beat exists: the restore has to return the
+            // scene to the state the highlight found, and an `Animate` that
+            // captured its destination later would return it to whatever the
+            // dim left behind.
+            let dimmed: Vec<(rustim_mobject::NodeId, f64)> =
+                rustim_director::spotlight(&self.tree, target)
+                    .map_err(|error| command::layout_error("target", error))?
+                    .into_iter()
+                    .filter_map(|id| self.tree.get(id).map(|m| (id, m.opacity)))
+                    .collect();
+            // `dim == 1.0` is a well-formed no-op ("dim nothing"), and a scene
+            // with nothing outside the subject has nothing to dim. Either way
+            // there is no beat to queue, and queuing an empty one would make
+            // `is_playing` flicker for a command that asked for nothing.
+            if !dimmed.is_empty() && dim < 1.0 {
+                let dim_group = dimmed
+                    .iter()
+                    .map(|&(id, was)| {
+                        Box::new(
+                            Animate::new(id, StyleProperty::Opacity(was * dim))
+                                .with_duration(duration),
+                        ) as Box<dyn Animation>
+                    })
+                    .collect::<Vec<_>>();
+                // The restore captures each node's *dimmed* value when its turn
+                // arrives (`Animate::begin`) and blends to the opacity this
+                // command found — two independent statements, so the pair closes
+                // even if something else touched the same node between them.
+                let restore_group = dimmed
+                    .iter()
+                    .map(|&(id, was)| {
+                        Box::new(
+                            Animate::new(id, StyleProperty::Opacity(was)).with_duration(duration),
+                        ) as Box<dyn Animation>
+                    })
+                    .collect::<Vec<_>>();
+                self.play(Succession::new(vec![
+                    Box::new(AnimationGroup::new(dim_group)),
+                    Box::new(Wait::new(hold)),
+                    Box::new(AnimationGroup::new(restore_group)),
+                ]));
+            }
             return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Camera {
@@ -2708,6 +2785,132 @@ mod tests {
         assert!(ctx.animations.is_empty());
         tick(&mut ctx, 10);
         assert!(!ctx.is_playing());
+    }
+
+    // ---- attention: dim the rest and put it back --------------------------
+
+    fn square(ctx: &mut SceneContext, at: [f64; 2]) -> NodeId {
+        ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams {
+                width: Some(1.0),
+                height: Some(1.0),
+                position: Some(at),
+                ..Default::default()
+            },
+        ))
+    }
+
+    /// A highlight is one beat: dim every picture outside the subject's subtree,
+    /// hold, then restore **the opacity it found** — not 1.0, so a scene that
+    /// was already partly faded comes back the way it was. The subject itself
+    /// never moves.
+    #[test]
+    fn highlight_dims_the_rest_and_puts_every_opacity_back() {
+        let mut ctx = scene();
+        let subject = square(&mut ctx, [0.0, 0.0]);
+        let other = square(&mut ctx, [3.0, 0.0]);
+        ctx.tree.get_mut(other).unwrap().opacity = 0.8;
+
+        let diff = applied(
+            &mut ctx,
+            &Command::Highlight {
+                target: subject.into(),
+                dim: Some(0.5),
+                duration: Some(0.2),
+                hold: Some(0.1),
+            },
+        );
+        assert!(diff.is_empty(), "a queued beat is not a tree change");
+        assert!(ctx.is_playing());
+
+        // A tenth of a second into a two-tenths dim: strictly between the two
+        // ends, so this is a ramp and not a jump.
+        tick(&mut ctx, 6);
+        let mid = opacity(&ctx, other);
+        assert!(mid < 0.8 && mid > 0.4, "mid-dim opacity {mid}");
+        assert_eq!(opacity(&ctx, subject), 1.0, "the subject stays lit");
+
+        // Just past the dim, inside the hold: settled on 0.8 × 0.5 and staying.
+        tick(&mut ctx, 11);
+        assert!(
+            (opacity(&ctx, other) - 0.4).abs() < 1e-12,
+            "held at {}",
+            opacity(&ctx, other)
+        );
+        // Past the hold, the restore is a ramp back up rather than a jump.
+        tick(&mut ctx, 2);
+        let rising = opacity(&ctx, other);
+        assert!(rising > 0.4 && rising < 0.8, "restoring through {rising}");
+
+        // Past dim + hold + restore: back to exactly what it was, and done.
+        tick(&mut ctx, 30);
+        assert!((opacity(&ctx, other) - 0.8).abs() < 1e-12);
+        assert_eq!(opacity(&ctx, subject), 1.0);
+        assert!(!ctx.is_playing(), "the beat ends where it started");
+    }
+
+    /// Nothing to dim is a success that queues nothing: a scene holding only its
+    /// subject, and `dim: 1.0` — the well-formed way to ask for no dimming.
+    /// Queuing an empty beat would make `is_playing` flicker for a command that
+    /// asked for nothing.
+    #[test]
+    fn a_highlight_with_nothing_to_dim_queues_no_beat() {
+        let mut ctx = scene();
+        let subject = square(&mut ctx, [0.0, 0.0]);
+        let highlight = |dim| Command::Highlight {
+            target: subject.into(),
+            dim,
+            duration: None,
+            hold: None,
+        };
+
+        applied(&mut ctx, &highlight(None));
+        assert!(!ctx.is_playing());
+
+        square(&mut ctx, [3.0, 0.0]);
+        applied(&mut ctx, &highlight(Some(1.0)));
+        assert!(!ctx.is_playing(), "dim 1.0 dims nothing");
+    }
+
+    #[test]
+    fn highlight_refuses_a_bad_factor_and_a_bad_timing() {
+        let mut ctx = scene();
+        let id = square(&mut ctx, [0.0, 0.0]);
+        square(&mut ctx, [3.0, 0.0]);
+
+        for (dim, duration, hold, field) in [
+            (Some(-0.1), None, None, "dim"),
+            (Some(1.5), None, None, "dim"),
+            (Some(f64::NAN), None, None, "dim"),
+            (None, Some(-0.1), None, "duration"),
+            (None, None, Some(f64::INFINITY), "hold"),
+        ] {
+            let cmd = Command::Highlight {
+                target: id.into(),
+                dim,
+                duration,
+                hold,
+            };
+            assert!(
+                matches!(
+                    ctx.handle(&cmd),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == field
+                ),
+                "{field} must be refused: {cmd:?}"
+            );
+        }
+        assert!(!ctx.is_playing(), "a refused highlight queues nothing");
+
+        assert!(matches!(
+            ctx.handle(&Command::Highlight {
+                target: "无".into(),
+                dim: None,
+                duration: None,
+                hold: None,
+            }),
+            Err(CommandError::NoSuchLabel { .. })
+        ));
     }
 
     // ---- the camera -------------------------------------------------------

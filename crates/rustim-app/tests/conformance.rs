@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (22 actions, 11 shapes, 11 animations, 10
+//!    the build actually has (24 actions, 11 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -155,7 +155,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 22, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 24, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -374,6 +374,64 @@ fn layout_actions_place_objects_through_the_wire() {
         .expect("a refusal is a reply");
     let error = reply.error.expect("a zero extent is refused");
     assert!(format!("{error}").contains("width"), "{error}");
+
+    finish(client, &png);
+}
+
+/// The teaching tier's attention actions are ordinary commands: `point_at`
+/// creates a node and answers with its id (the handle a client needs to fade or
+/// remove the arrow later), and `highlight` queues a beat and answers with an
+/// empty diff — the same distinction `play` has with `add`.
+#[test]
+fn attention_commands_work_through_the_wire() {
+    let (mut client, png) = client("attention");
+
+    expect_diff(
+        &mut client,
+        r#"{"action":"add","type":"square","params":{"width":2.0,"label":"三角形"}}"#,
+    );
+    expect_diff(
+        &mut client,
+        r#"{"action":"add","type":"square","params":{"width":1.0,"position":[3.0,0.0],"label":"旁物"}}"#,
+    );
+
+    let created = expect_diff(
+        &mut client,
+        r#"{"action":"point_at","target":"三角形","direction":"down","buff":0.2,"label":"看这里"}"#,
+    )
+    .created;
+    assert_eq!(created.len(), 1, "one arrow was created");
+    let arrow = created[0];
+
+    // The created arrow is addressable by the id the reply named, and by the
+    // label it carries — both are the protocol's normal spellings.
+    let tree = client
+        .send_raw(&format!(r#"{{"action":"query","target":{}}}"#, arrow.raw()))
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert_eq!(tree.root, arrow);
+    assert_eq!(tree.nodes[0].name, "看这里");
+    assert!(
+        tree.nodes[0].bounds.is_some(),
+        "a placed arrow has measured bounds"
+    );
+
+    // A highlight is a beat: the tree does not move until the frames run, so
+    // the diff is present and empty, like `play`'s.
+    let diff = expect_diff(
+        &mut client,
+        r#"{"action":"highlight","target":"三角形","dim":0.5}"#,
+    );
+    assert!(diff.is_empty(), "{diff:?}");
+
+    // And its refusals are the protocol's, not transport failures.
+    let error = client
+        .send_raw(r#"{"action":"highlight","target":"三角形","dim":2.0}"#)
+        .expect("a refusal is a reply")
+        .error
+        .expect("dim above 1 is refused");
+    assert!(format!("{error}").contains("dim"), "{error}");
 
     finish(client, &png);
 }

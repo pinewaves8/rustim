@@ -52,15 +52,24 @@
 //! are the wire's `next_to` / `arrange` / `fit` actions; the protocol's
 //! spelling and refusal mapping live in `rustim-scene`.
 //!
+//! [`attention`]: the geometry of *point at this* and *dim the rest* —
+//! [`pointing_arrow`](attention::pointing_arrow) builds an arrow whose tip sits
+//! a gap from the subject's world box, and [`spotlight`](attention::spotlight)
+//! names the picture-bearing nodes outside the subject's subtree. They are the
+//! wire's `point_at` / `highlight` actions; the dim-and-restore beat itself is
+//! composed in `rustim-scene`, because this crate does not depend on
+//! `rustim-anim`.
+//!
 //! Deferred, deliberately, and named so they are not rediscovered as gaps:
-//! annotation (labels that follow their subject), attention animations
-//! (`highlight`, `point_at`), the six `explain.*` templates, the linter
-//! (`out of frame`, overlap, size, contrast, pacing) and the declarative
-//! `ScenePlan`.
+//! annotation (labels that follow their subject), the six `explain.*`
+//! templates, the linter (out of frame, overlap, size, contrast, pacing) and
+//! the declarative `ScenePlan`.
 //!
 //! `rustim-text` is not a dependency and will not become one without a separate
 //! crate: see this module's note on the wasm kernel.
 
+pub mod attention;
 pub mod layout;
 
+pub use attention::{DEFAULT_POINT_AT_BUFF, DEFAULT_POINT_AT_LENGTH, pointing_arrow, spotlight};
 pub use layout::{Axis, Direction, LayoutError, arrange, fit, next_to};

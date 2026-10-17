@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **826 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **836 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -171,7 +171,7 @@ cargo test -p rustim-daemon          # sessions, RPC envelope, and real loopback
 cargo test -p rustim-daemon --test daemon   # ...only the socket-level integration suite
 cargo test -p rustim-mcp            # the MCP envelope and tools, natively
 cargo test -p rustim-mcp --test mcp # ...only the real-process stdio suite
-cargo test -p rustim-director       # the teaching tier's layout, over real scene trees
+cargo test -p rustim-director       # the teaching tier's layout and attention, over real scene trees
 cargo test -p rustim-export --test compare_cli  # the visual-regression CLI's exit codes
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo test -p rustim-web             # the browser session core, natively (no Chrome, no wasm)
@@ -373,7 +373,7 @@ last property.
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it) and `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) | Real |
-| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform). Annotation, attention, templates, the linter and `ScenePlan` are deferred; nothing here does I/O and nothing names a model | Real (layout) |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). Both are pure geometry and animations are *not* composed here — the director does not depend on `rustim-anim`. Annotation, templates, the linter and `ScenePlan` are deferred; nothing here does I/O and nothing names a model | Real (layout, attention) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -1914,10 +1914,6 @@ arrangement is centred on the group's original box — with a column running top
 order. `fit` is `scale_to_fit_width/height` collapsed into one call: the tighter axis decides, so a
 circle stays a circle.
 
-Deferred, and named so they are not rediscovered as gaps: annotation that follows its subject,
-attention animations (`highlight` / `point_at`), the six `explain.*` templates, the linter
-(out of frame, overlap, size, contrast, pacing) and `ScenePlan`.
-
 **The three functions are the wire's `next_to` / `arrange` / `fit` actions, and `rustim-scene`
 depends on `rustim-director` directly rather than installing a trait.** The earlier plan was the
 `Typesetter` pattern — a seam a host installs — and it was the wrong shape here: layout is pure tree
@@ -1938,6 +1934,66 @@ Two hardening rules were added with the wire: **`next_to` refuses a reference th
 target** (moving the target carries the reference, so the requested gap is unreachable; the reverse
 nesting — a label beside its parent — stays legal), and **bulk placements check every target before
 the first write**, so a refusal never leaves a half-arranged tree.
+
+**The second slice is `attention` — `point_at` and `highlight` — and its split is deliberately not
+layout's.** The geometry lives in the director; the animation composition lives in `rustim-scene`,
+because a dim-and-restore beat needs `rustim-anim` and the director's dependency set (only
+`rustim-math` + `rustim-mobject`) is what keeps it wasm-clean. Two pure functions:
+
+- **`attention::pointing_arrow(tree, target, direction, buff, length, thickness) -> Mobject`** builds
+  an ordinary filled `ShapeKind::Arrow` whose **tip** sits `buff` outside the subject's world box on
+  the named side and whose shaft runs *outward* from there — so `Direction::Down` means "below the
+  subject, pointing up at it". The placement is one affine on the deferred transform
+  (`translate(tip) · rotate(angle) · translate(-length, 0)`), so the arrow is a normal node: it can
+  be faded, moved or removed. `buff` may be negative (overlapping tip), `length` must be positive and
+  finite, `thickness` finite and non-negative; a stale id is `Unknown` and a node with no box is
+  `Unmeasurable`, checked in that order so the two bugs stay distinguishable. Defaults are
+  `DEFAULT_POINT_AT_BUFF = 0.1` (Manim's `SMALL_BUFF`, the same `next_to` uses) and
+  `DEFAULT_POINT_AT_LENGTH = 1.0` (an eighth of the frame height — a pointer, not a bar).
+- **`attention::spotlight(tree, target) -> Vec<NodeId>`** names every **picture-bearing** node
+  outside the target's subtree, in draw order, for `highlight` to dim. "Outside the subtree"
+  includes ancestors on purpose: a formula's root is a picture-bearing container over its glyphs, so
+  spotlighting one glyph should dim the rest of the formula too. The list is computed at command
+  time, not remembered — the caller captures the opacities before animating, and a node created
+  later is simply not part of this spotlight.
+
+**On the wire, the two actions reply differently, and that is the point.** `point_at` is a pure
+`apply` arm: it resolves the target, builds the arrow (honouring optional `color` and `label`), and
+returns `diff.created` with the new id. `highlight` is intercepted by `SceneContext::handle`, because
+it queues a beat and only the playback machine can do that: it resolves the target, validates `dim`
+(finite, `0.0..=1.0`), `duration` and `hold` (finite, `>= 0`), collects `spotlight`, and — unless
+there is nothing to dim or `dim == 1.0` — appends a single self-contained `Succession`:
+
+```text
+AnimationGroup(dim each node) → Wait(hold) → AnimationGroup(restore each node)
+```
+
+Every member is an `Animate` on `StyleProperty::Opacity`, so the restore target is the value
+**captured when that animation begins**, not a hard-coded `1.0` — a scene that was already partly
+transparent comes back exactly as it was, and a `Succession` begins a member when its turn arrives,
+so the restore sees the dimmed state rather than the original. The beat's reply is a
+present-but-empty `StateDiff` for `play`'s reason. Defaults: `dim = 0.25`, `duration = 0.4`,
+`hold = 0.5` (`DEFAULT_HIGHLIGHT_*` in `rustim-scene::command`). `point_at` names `direction`,
+`buff`, `length`, `thickness`, `color`, `label`; `highlight` names `dim`, `duration`, `hold` — all
+optional, all absent rather than `null` on the wire.
+
+Evidence for the slice: four director tests (the tip and outward tail from all four sides, a
+negative buff producing an overlapping arrow that is still a normal node, stale/degenerate refusals,
+and a spotlight excluding the subject's subtree and any picture-less node), two `command.rs` apply
+tests for `point_at`, three `context.rs` tests (dim → hold → restore puts every opacity back, an
+empty spotlight or `dim == 1.0` queues no beat, and bad factors/timings are refused under their
+field names), four round-trip fixtures (both spellings for both actions), and one conformance case
+that points at a labelled square, reads the arrow back through `query`, highlights, and sees
+`dim: 2.0` refused. `ACTIONS` 22 → 24. **All eight goldens are unchanged**, and the count moved
+826 → 836.
+
+Deferred, and named so they are not rediscovered as gaps: annotation that follows its subject, the
+six `explain.*` templates, the linter (out of frame, overlap, size, contrast, pacing) and
+`ScenePlan`. Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
+arrow is a static node placed once; re-placing it is a `point_at` again, and following would need a
+per-frame constraint the tree does not have), and spotlight-beyond-opacity (a true mask over the
+rest of the scene). Several subjects at once is a `group` — `target` names one node, and the group's
+subtree stays lit while everything outside it dims.
 
 Evidence: fifteen layout tests over real `SceneTree`s — all four directions and the perpendicular
 centring, a negative buff, a self-placement refusal, row and column arrangements with equal gaps and a
@@ -2749,8 +2805,20 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   tests, five round-trip fixtures, and an end-to-end conformance case that arranges three labelled
   squares and reads the pixel gaps back through `query` — plus the six-crate wasm build passing
   with the new edge. **All eight goldens are unchanged**, and the count moved 818 → 826.
-  Deliberately deferred: annotation, attention animations, the `explain.*` templates, the linter and
-  `ScenePlan`.
+- **Phase 2's third slice — attention (`point_at` / `highlight`) — is done.** The director gained
+  `attention`: `pointing_arrow` places a filled arrow's tip a `buff` outside the subject's world box
+  and runs the shaft outward, and `spotlight` names the picture-bearing nodes outside the subject's
+  subtree in draw order. The split from layout is deliberate — the geometry is pure tree measurement,
+  but the dim-and-restore beat needs `rustim-anim`, so `rustim-scene` composes it as a
+  `Succession(AnimationGroup(dim), Wait(hold), AnimationGroup(restore))` and the director stays
+  wasm-clean. `point_at` is a pure `apply` arm answering `diff.created`; `highlight` is intercepted
+  by `handle` and answers an empty diff, because it queues a beat rather than mutating the tree. The
+  restore target is the opacity captured when the beat begins, not `1.0`, so a partly transparent
+  scene comes back unchanged. Defaults: buff `0.1`, length `1.0`, dim `0.25`, duration `0.4`, hold
+  `0.5`. Evidence: four director tests, two `apply` tests, three context tests, four round-trip
+  fixtures and an end-to-end conformance case; `ACTIONS` 22 → 24. **All eight goldens are
+  unchanged**, and the count moved 826 → 836.
+  Deliberately deferred: annotation, the `explain.*` templates, the linter and `ScenePlan`.
 
 ## AI integration
 

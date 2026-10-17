@@ -45,6 +45,31 @@ const DEFAULT_NEXT_TO_BUFF: f64 = 0.1;
 /// is a quarter of a world unit, not the half a first guess suggests.
 const DEFAULT_ARRANGE_BUFF: f64 = 0.25;
 
+/// How far [`Command::Highlight`] dims the rest of the scene when the command
+/// did not say.
+///
+/// A **factor**, not an absolute opacity, and a quarter rather than a half: the
+/// subject has to stand out, and dimming to a quarter still leaves the
+/// surrounding picture readable enough to keep the subject in context. The
+/// value is this protocol's own — Manim has no spotlight — so it is stated and
+/// the caller can override it.
+pub(crate) const DEFAULT_HIGHLIGHT_DIM: f64 = 0.25;
+
+/// How long [`Command::Highlight`] takes to dim (and, symmetrically, to
+/// restore) when the command did not say.
+///
+/// Short enough to read as "look here" rather than as an animation in its own
+/// right; the same order as a `fade_in`, which is the move a lecturer makes
+/// with a hand.
+pub(crate) const DEFAULT_HIGHLIGHT_DURATION: f64 = 0.4;
+
+/// How long [`Command::Highlight`] holds the dimmed picture when the command
+/// did not say.
+///
+/// Long enough to notice, short enough not to stall a lecture: half a second is
+/// about one spoken clause.
+pub(crate) const DEFAULT_HIGHLIGHT_HOLD: f64 = 0.5;
+
 /// A mutation requested from outside the engine.
 ///
 /// Internally tagged (`"action": "..."`) so the wire form matches the sketch in
@@ -182,6 +207,78 @@ pub enum Command {
         targets: Vec<Target>,
         width: f64,
         height: f64,
+    },
+    /// Point an arrow at an object.
+    ///
+    /// The second teaching-tier sentence, and the other one a model reaches for
+    /// instead of computing coordinates: "point at this" is true whatever the
+    /// subject's size, wherever the camera is, however the subject is rotated —
+    /// the arrow is built from the subject's **world bounding box**, the same
+    /// materialised anchors the accessibility tree measures.
+    ///
+    /// The **tip** sits `buff` away from the box on the named side and the shaft
+    /// runs outward from there, so `"down"` means "below the subject, pointing
+    /// up at it" — the placement a caption arrow uses, and the default. The
+    /// result is a normal [`ShapeKind::Arrow`] node: it is in the tree, it has
+    /// an id, it can be faded, moved, recoloured or removed like anything else.
+    ///
+    /// `buff` defaults to `0.1` (the same `SMALL_BUFF` `next_to` uses) and may
+    /// be negative — an arrow whose tip overlaps its subject is a real design.
+    /// `length` defaults to `1.0`; `thickness`, `color` and `label` are passed
+    /// through to the shape. Refusals are values under `OutOfRange`: a
+    /// non-finite `buff`, a non-positive or non-finite `length`, a negative or
+    /// non-finite `thickness`, and a subject with no measurable box.
+    PointAt {
+        target: Target,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<Direction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        buff: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thickness: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<[u8; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Dim everything but an object for a moment, then bring it back.
+    ///
+    /// The attention helper a spoken explanation needs and `point_at` does not
+    /// give: pointing says *where*, dimming says *only*. Every picture-bearing
+    /// node **outside the subject's subtree** is animated to `dim` times its
+    /// current opacity, held, and restored to exactly the opacity it started
+    /// with — one beat, so a queued `play` still runs after it as it would after
+    /// any other.
+    ///
+    /// `dim` is a **factor** in `0.0..=1.0` (default `0.25`): `0.0` blanks the
+    /// rest, `1.0` is no dimming at all and queues nothing. It multiplies each
+    /// node's own opacity rather than assigning an absolute one, so an already
+    /// faded object does not brighten on its way to being dimmed.
+    /// `duration` (default `0.4`, may be `0.0` for an instant cut) is how long
+    /// the dim takes and, symmetrically, how long the restore takes; `hold`
+    /// (default `0.5`) is the pause at the dimmed opacity.
+    ///
+    /// **The restore is part of the beat, not an instruction to the caller.**
+    /// A lecture that had to remember to put the scene back would leak a dimmed
+    /// picture every time a model forgot; the beat is self-contained, and an
+    /// interrupted one leaves the picture wherever the interrupt found it —
+    /// `stop` is an interrupt, not a fast-forward.
+    ///
+    /// The reply is a present-but-empty [`StateDiff`], for `play`'s reason: the
+    /// beat changes what will happen to the tree, not the tree. Answered by
+    /// [`crate::SceneContext::handle`], because it queues an animation and
+    /// `apply` is pure. A scene with nothing outside the subject queues nothing
+    /// and succeeds.
+    Highlight {
+        target: Target,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dim: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold: Option<f64>,
     },
     /// Play an animation that names its subject by id or label.
     Play { animation: AnimationSpec },
@@ -487,11 +584,13 @@ pub const ACTIONS: &[&str] = &[
     "events",
     "fit",
     "hello",
+    "highlight",
     "motion",
     "narrate",
     "next_to",
     "pause",
     "play",
+    "point_at",
     "query",
     "remove",
     "resume",
@@ -520,6 +619,8 @@ impl Command {
             Self::NextTo { .. } => "next_to",
             Self::Arrange { .. } => "arrange",
             Self::Fit { .. } => "fit",
+            Self::PointAt { .. } => "point_at",
+            Self::Highlight { .. } => "highlight",
             Self::Play { .. } => "play",
             Self::Stop => "stop",
             Self::Pause => "pause",
@@ -1410,7 +1511,10 @@ fn resolve_all(tree: &SceneTree, targets: &[Target]) -> Result<Vec<NodeId>, Comm
 /// with the id in the detail — a caller can act on both without a second read.
 /// `Unknown` cannot normally reach here (resolution checked the name first),
 /// but it is mapped rather than dropped so this function is total.
-fn layout_error(property: &'static str, error: rustim_director::LayoutError) -> CommandError {
+pub(crate) fn layout_error(
+    property: &'static str,
+    error: rustim_director::LayoutError,
+) -> CommandError {
     use rustim_director::LayoutError as Layout;
     match error {
         Layout::Unknown(target) => CommandError::NoSuchNode { target },
@@ -1555,6 +1659,42 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
                 .map_err(|error| layout_error("targets", error))?;
             diff.modified.extend(moved);
         }
+        Command::PointAt {
+            target,
+            direction,
+            buff,
+            length,
+            thickness,
+            color,
+            label,
+        } => {
+            // Resolution doubles as the existence check, so a stale id is
+            // `NoSuchNode` before anything is built.
+            let target = target.resolve(tree)?;
+            let mut arrow = rustim_director::pointing_arrow(
+                tree,
+                target,
+                direction.unwrap_or(Direction::Down).into(),
+                buff.unwrap_or(rustim_director::DEFAULT_POINT_AT_BUFF),
+                length.unwrap_or(rustim_director::DEFAULT_POINT_AT_LENGTH),
+                *thickness,
+            )
+            .map_err(|error| layout_error("target", error))?;
+            // The shape builder paints with the engine's foreground when no
+            // colour was given; a colour named here replaces both the fill and
+            // the stroke, matching what `add` does with `params.color`.
+            if let Some([r, g, b]) = color {
+                let paint = rustim_color::Srgb::from_rgba8(*r, *g, *b, 255);
+                arrow.style.fill = paint;
+                arrow.style.stroke = paint;
+                arrow.dirty.style = true;
+            }
+            if let Some(label) = label {
+                arrow.label = Some(label.clone());
+            }
+            let id = tree.insert(arrow);
+            diff.created.push(id);
+        }
         Command::Set { target, property } => {
             let target = target.resolve(tree)?;
             let Some(m) = tree.get_mut(target) else {
@@ -1612,6 +1752,12 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // `SceneContext`, not a node. Keeping the arm is what lets a direct
             // `apply` caller replay a whole log — including the subscription —
             // without a panic.
+        }
+        Command::Highlight { .. } => {
+            // Answered by `SceneContext::handle`: a highlight is a queued beat,
+            // and `apply` has neither the scheduler nor the queue. The arm keeps
+            // `apply` total, so a caller replaying a session log through a bare
+            // tree gets a no-op rather than a panic.
         }
         Command::Narrate { .. } => {
             // Answered by `SceneContext::handle`, because scheduling narration
@@ -2437,6 +2583,19 @@ mod tests {
             format!(r#"{{"action":"arrange","targets":[{id},"leg a"],"axis":"row"}}"#),
             r#"{"action":"arrange","targets":["a","b"],"axis":"column","buff":0.5}"#.to_owned(),
             format!(r#"{{"action":"fit","targets":[{id}],"width":4.0,"height":2.0}}"#),
+            // The teaching tier's two attention actions. `point_at` creates a
+            // picture and carries the same optional knobs `add` does, each
+            // omitted when absent; `highlight` queues a beat and writes no
+            // fields back. Both take a label where every other target field
+            // does.
+            format!(
+                r#"{{"action":"point_at","target":{id},"direction":"down","buff":0.2,"length":1.5,"thickness":0.05,"color":[100,181,246],"label":"看这里"}}"#
+            ),
+            r#"{"action":"point_at","target":"三角形"}"#.to_owned(),
+            format!(
+                r#"{{"action":"highlight","target":{id},"dim":0.2,"duration":0.4,"hold":0.6}}"#
+            ),
+            r#"{"action":"highlight","target":"三角形"}"#.to_owned(),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for json in cases {
@@ -2499,6 +2658,12 @@ mod tests {
                 at: Some(1.0),
             },
             Command::Query { target: None },
+            Command::Highlight {
+                target: id.into(),
+                dim: None,
+                duration: None,
+                hold: None,
+            },
         ] {
             let diff = apply(&mut tree, &cmd).expect("answered elsewhere, not refused");
             assert_eq!(diff, StateDiff::default(), "{cmd:?}");
@@ -4377,6 +4542,110 @@ mod tests {
             })
         );
         assert_eq!(tree.world_bounds(a).unwrap(), before);
+    }
+
+    // ---- the teaching tier's attention actions ----------------------------
+
+    /// `point_at` creates a real node whose tip sits the asked-for gap from the
+    /// subject's world box, on the named side, pointing at it. The subject may
+    /// be named by label, and the knobs a bare command omits take the defaults.
+    #[test]
+    fn point_at_builds_an_arrow_whose_tip_faces_the_subject() {
+        let mut tree = SceneTree::new();
+        let subject = square_at(&mut tree, 2.0, [0.0, 0.0]);
+        tree.get_mut(subject).unwrap().label = Some("三角形".into());
+
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"point_at","target":"三角形","direction":"left","buff":0.25,"length":1.5,"color":[100,181,246],"label":"看这里"}"#,
+        )
+        .unwrap();
+        let diff = apply(&mut tree, &cmd).unwrap();
+        assert_eq!(diff.created.len(), 1);
+        let arrow = tree.get(diff.created[0]).unwrap();
+        assert_eq!(arrow.kind, NodeKind::Arrow);
+        assert_eq!(arrow.label.as_deref(), Some("看这里"));
+        assert_eq!(arrow.style.fill, rustim_color::BLUE);
+
+        // A 2×2 square's left edge is at −1, so the tip is 0.25 further out and
+        // the tail one length past the tip. The tip is the local point
+        // `(length, 0)`; the tail is the local origin.
+        let tip = arrow.transform * Point::new(1.5, 0.0);
+        let tail = arrow.transform * Point::ZERO;
+        assert!(
+            (tip.x + 1.25).abs() < 1e-12 && tip.y.abs() < 1e-12,
+            "tip {tip:?}"
+        );
+        assert!(
+            (tail.x + 2.75).abs() < 1e-12 && tail.y.abs() < 1e-12,
+            "tail {tail:?}"
+        );
+
+        // The bare spelling: default direction is `down` — below the subject,
+        // pointing up at it — with the action's own default gap and length.
+        let bare: Command =
+            serde_json::from_str(r#"{"action":"point_at","target":"三角形"}"#).unwrap();
+        let diff = apply(&mut tree, &bare).unwrap();
+        let arrow = tree.get(diff.created[0]).unwrap();
+        let tip = arrow.transform * Point::new(rustim_director::DEFAULT_POINT_AT_LENGTH, 0.0);
+        assert!(
+            tip.x.abs() < 1e-12
+                && (tip.y + 1.0 + rustim_director::DEFAULT_POINT_AT_BUFF).abs() < 1e-12,
+            "tip {tip:?}"
+        );
+    }
+
+    /// A refusal leaves the tree untouched: an arrow is a new node, so "refused"
+    /// has to mean "nothing was inserted", not "an arrow nobody wanted".
+    #[test]
+    fn point_at_refuses_a_bad_subject_and_a_bad_arrow() {
+        let mut tree = SceneTree::new();
+        let subject = square_at(&mut tree, 2.0, [0.0, 0.0]);
+        let before = tree.len();
+        let bare = |target: Target, buff, length, thickness| Command::PointAt {
+            target,
+            direction: None,
+            buff,
+            length,
+            thickness,
+            color: None,
+            label: None,
+        };
+
+        assert_eq!(
+            apply(&mut tree, &bare("无".into(), None, None, None)),
+            Err(CommandError::NoSuchLabel {
+                label: "无".into()
+            })
+        );
+        let ghost = tree.insert(Mobject::new(vec![]));
+        tree.remove(ghost);
+        assert_eq!(
+            apply(&mut tree, &bare(ghost.into(), None, None, None)),
+            Err(CommandError::NoSuchNode { target: ghost })
+        );
+        // A node with no points and no declared box has nothing to point at.
+        let empty = tree.insert(Mobject::new(vec![]));
+        assert!(matches!(
+            apply(&mut tree, &bare(empty.into(), None, None, None)),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "target"
+        ));
+
+        for (buff, length, thickness, field) in [
+            (Some(f64::NAN), None, None, "buff"),
+            (None, Some(0.0), None, "length"),
+            (None, Some(f64::INFINITY), None, "length"),
+            (None, None, Some(-0.1), "thickness"),
+        ] {
+            let cmd = bare(subject.into(), buff, length, thickness);
+            assert!(
+                matches!(
+                    apply(&mut tree, &cmd),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == field
+                ),
+                "{field} must be refused: {cmd:?}"
+            );
+        }
+        assert_eq!(tree.len(), before + 1, "only the empty subject was added");
     }
 
     // ---- the camera -------------------------------------------------------
