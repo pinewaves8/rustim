@@ -538,8 +538,11 @@ pub fn animation_for(
                     detail: "a move_to needs a destination".into(),
                 });
             };
-            let to = Affine2::translate((x, y));
-            Box::new(MoveTo::new(target, to).with_duration(duration))
+            // A *point*, not a transform: `move_to` says where the object's centre
+            // goes and leaves its scale and rotation alone. `MoveTo` resolves the
+            // translation in `begin`, so a later member of the same succession sees
+            // an earlier member's scale — see the type's doc.
+            Box::new(MoveTo::to_point(target, Point::new(x, y)).with_duration(duration))
         }
         AnimationKind::Rotate => {
             let Some(angle) = spec.angle else {
@@ -718,13 +721,19 @@ impl Property {
                 m.kind = *k;
                 m.dirty.semantic = true;
             }
-            // Absolute, and deliberately the odd one out among the three
-            // transform properties: "put it at (2, 3)" is a statement about where
-            // the object *is*, while scale and rotation below are operations
-            // applied to where it already is. Manim's `move_to` is absolute in the
-            // same way, so a plain `set` and a `play` of `move_to` agree.
+            // Absolute in *position*: "put it at (2, 3)" is a statement about where
+            // the object is, while scale and rotation below are operations applied
+            // to where it already is. Absolute in position is not the same as
+            // replacing the matrix, though: the translation that sends the current
+            // centre to `p` is composed onto whatever the object already carries, so
+            // a rotated or scaled object keeps that. `set_transform(translate(p))`
+            // silently undid an earlier scale — the same defect `Scale`/`Rotation`
+            // below were fixed for. Manim's `move_to` is a `shift` for exactly this
+            // reason, and a plain `set` and a `play` of `move_to` still agree: both
+            // go through the object's centre.
             Self::Position(p) => {
-                m.set_transform(rustim_math::Affine::translate((p[0], p[1])));
+                let here = m.critical_point((0.0, 0.0)).unwrap_or(Point::ZERO);
+                m.set_transform(Affine2::translate((p[0] - here.x, p[1] - here.y)) * m.transform);
             }
             // Both of these **compose** onto the object's transform rather than
             // replacing it, which is the one behavioural change in P2 step 5.
@@ -1135,9 +1144,8 @@ mod tests {
         assert_eq!(tree.get(id).unwrap().opacity, 1.0);
     }
 
-    /// The destination is applied as a *transform*, the same way
-    /// `Property::Position` applies one — so the animation interpolates toward it
-    /// rather than snapping to it.
+    /// The destination is a *point*, interpolated toward rather than snapped to,
+    /// and on an untransformed object it is the same matrix `set position` writes.
     #[test]
     fn a_move_to_command_moves_to_the_given_point() {
         let (mut tree, id) = scene_with_a_blank();
@@ -1150,6 +1158,98 @@ mod tests {
         assert_eq!(
             tree.get(id).unwrap().transform,
             Affine2::translate((3.0, -4.0))
+        );
+    }
+
+    /// The span of the materialised anchors, which is what a caller sees.
+    fn width_of(tree: &SceneTree, id: NodeId) -> f64 {
+        let anchors = tree.world_anchors(id).expect("a square has anchors");
+        let xs = anchors.iter().map(|p| p.x);
+        xs.clone().fold(f64::NEG_INFINITY, f64::max) - xs.fold(f64::INFINITY, f64::min)
+    }
+
+    fn scale_object(tree: &mut SceneTree, id: NodeId, factor: f64) {
+        let centre = tree.get(id).unwrap().critical_point((0.0, 0.0)).unwrap();
+        tree.get_mut(id)
+            .unwrap()
+            .set_transform(Affine2::scale_about(factor, centre));
+    }
+
+    /// "Put the centre here" is a statement about position, not about the whole
+    /// matrix: a scaled object that moves is still scaled. Replacing the matrix
+    /// with a translation was a silent ×0.5 on anything scaled first.
+    #[test]
+    fn a_move_to_command_keeps_the_objects_scale() {
+        let (mut tree, id) = scene_with_a_blank();
+        scale_object(&mut tree, id, 2.0);
+        let mut what = spec(id, AnimationKind::MoveTo);
+        what.to = Some([1.0, 0.5]);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        assert_eq!(
+            tree.get(id).unwrap().critical_point((0.0, 0.0)),
+            Some(Point::new(1.0, 0.5))
+        );
+        assert!(
+            (width_of(&tree, id) - 4.0).abs() < 1e-12,
+            "×2 scale was lost"
+        );
+    }
+
+    /// The composition that made the defect visible: both members are built before
+    /// either runs, so the move must resolve its destination when it *begins*, not
+    /// when the command was read.
+    #[test]
+    fn a_scale_then_move_succession_ends_scaled_and_moved() {
+        let (mut tree, id) = scene_with_a_blank();
+        let mut scale = spec(id, AnimationKind::Scale);
+        scale.factor = Some(2.0);
+        scale.duration = Some(0.5);
+        let mut mv = spec(id, AnimationKind::MoveTo);
+        mv.to = Some([5.0, 0.0]);
+        mv.duration = Some(0.5);
+
+        let mut anim =
+            animation_for(&tree, &composed(AnimationKind::Succession, vec![scale, mv])).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        assert_eq!(
+            tree.get(id).unwrap().critical_point((0.0, 0.0)),
+            Some(Point::new(5.0, 0.0))
+        );
+        assert!(
+            (width_of(&tree, id) - 4.0).abs() < 1e-12,
+            "the scale member must survive the move member"
+        );
+    }
+
+    /// `set`'s `position` and `play`'s `move_to` agree, and both preserve the rest
+    /// of the transform — which is what makes the property's "absolute" claim
+    /// honest about *position* rather than about the matrix.
+    #[test]
+    fn setting_position_keeps_the_rest_of_the_transform() {
+        let (mut tree, id) = scene_with_a_blank();
+        scale_object(&mut tree, id, 3.0);
+        apply(
+            &mut tree,
+            &Command::Set {
+                target: id,
+                property: Property::Position([2.0, -1.0]),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            tree.get(id).unwrap().critical_point((0.0, 0.0)),
+            Some(Point::new(2.0, -1.0))
+        );
+        assert!(
+            (width_of(&tree, id) - 6.0).abs() < 1e-12,
+            "×3 scale was lost"
         );
     }
 

@@ -139,7 +139,8 @@ impl Animation for FadeOut {
     }
 }
 
-/// Moves an object to a target transform.
+/// Moves an object to a target transform — or to a point, keeping its scale and
+/// rotation.
 ///
 /// This is the animation that demonstrates why transforms are deferred: the
 /// whole move is an interpolation of one [`Affine2`], regardless of how many
@@ -150,19 +151,61 @@ impl Animation for FadeOut {
 /// carried in the same transform rides along. Interpolating a general affine
 /// componentwise is not the same as interpolating a rotation's angle, so a
 /// `Rotate` animation needs its own type rather than riding on this one.
+///
+/// # Two destinations, and why the point one waits until `begin`
+///
+/// [`MoveTo::new`] takes the whole target transform: the caller has already said
+/// exactly what the matrix should be, and the animation interpolates toward it.
+/// [`MoveTo::to_point`] is the `move_to` a scene author means — **"put the
+/// object's centre here"** — and it therefore has to keep whatever scale and
+/// rotation the object already carries. Manim's `move_to` is a `shift`
+/// (`point - get_critical_point(..)`) composed onto the existing matrix, which is
+/// the same statement.
+///
+/// The destination is resolved in **`begin`**, not in the constructor, for a
+/// reason composition made visible: a `Succession` builds all of its members
+/// before the first one runs, so a `MoveTo` constructed after a `Scale` in the
+/// same succession would otherwise capture the *pre-scale* transform and then
+/// throw the scale away. Resolving in `begin` means "move it from wherever it is
+/// when this animation starts", which is what the author wrote.
 #[derive(Debug, Clone)]
 pub struct MoveTo {
     target: NodeId,
+    /// `Some` for [`MoveTo::to_point`]; `None` when the caller supplied the whole
+    /// transform.
+    point: Option<Point>,
     target_transform: Affine2,
     start: Option<Affine2>,
     duration: f64,
 }
 
 impl MoveTo {
+    /// Interpolate to `target_transform`, exactly as given.
+    ///
+    /// Use this when the destination *is* the matrix (a caller that has already
+    /// composed a scale or rotation into it). If you mean "move the centre to a
+    /// point", use [`MoveTo::to_point`] — this constructor will replace the
+    /// object's scale and rotation with the target's.
     pub fn new(target: NodeId, target_transform: Affine2) -> Self {
         Self {
             target,
+            point: None,
             target_transform,
+            start: None,
+            duration: 1.0,
+        }
+    }
+
+    /// Move the object's centre to `point`, preserving the rest of its transform.
+    ///
+    /// The point is in the **parent's** space (world units for a top-level
+    /// object), the same frame [`Mobject::critical_point`] answers in. The
+    /// translation is computed when the animation begins — see the type's doc.
+    pub fn to_point(target: NodeId, point: Point) -> Self {
+        Self {
+            target,
+            point: Some(point),
+            target_transform: Affine2::IDENTITY,
             start: None,
             duration: 1.0,
         }
@@ -180,7 +223,19 @@ impl Animation for MoveTo {
     }
 
     fn begin(&mut self, tree: &SceneTree) {
-        self.start = tree.get(self.target).map(|m| m.transform);
+        let Some(m) = tree.get(self.target) else {
+            self.start = None;
+            return;
+        };
+        self.start = Some(m.transform);
+        if let Some(point) = self.point {
+            // `critical_point` applies the object's own transform, so this is the
+            // centre as it stands at `begin` — after an earlier succession member,
+            // and in the parent's space.
+            let centre = m.critical_point((0.0, 0.0)).unwrap_or(Point::ZERO);
+            self.target_transform =
+                Affine2::translate((point.x - centre.x, point.y - centre.y)) * m.transform;
+        }
     }
 
     fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
@@ -955,6 +1010,73 @@ mod tests {
         anim.begin(&tree);
         anim.interpolate(0.5, &mut tree);
         assert!(tree.get(id).unwrap().dirty.geometry);
+    }
+
+    /// A point destination is absolute in *position*, not in matrix: the object
+    /// keeps the scale it already had. `new` with `translate(p)` would have thrown
+    /// it away, which is why both spellings exist.
+    #[test]
+    fn a_move_to_point_keeps_the_objects_scale() {
+        let (mut tree, id) = scene(square());
+        let centre = tree.get(id).unwrap().critical_point((0.0, 0.0)).unwrap();
+        tree.get_mut(id)
+            .unwrap()
+            .set_transform(Affine2::scale_about(2.0, centre));
+
+        let mut anim = MoveTo::to_point(id, Point::new(3.0, -1.0));
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        assert_eq!(
+            tree.get(id).unwrap().critical_point((0.0, 0.0)),
+            Some(Point::new(3.0, -1.0))
+        );
+        // The linear part is untouched: a side that was 2.6 is now 5.2.
+        let width = width_of(&tree, id);
+        assert!(
+            (width - 5.2).abs() < 1e-12,
+            "width was {width}, not the scaled 5.2"
+        );
+    }
+
+    /// The span of the materialised anchors, which is what a caller sees.
+    fn width_of(tree: &SceneTree, id: NodeId) -> f64 {
+        let anchors = tree.world_anchors(id).expect("a square has anchors");
+        let xs = anchors.iter().map(|p| p.x);
+        xs.clone().fold(f64::NEG_INFINITY, f64::max) - xs.fold(f64::INFINITY, f64::min)
+    }
+
+    /// The destination is resolved in `begin`, so a transform written between
+    /// construction and the first frame is the one that is preserved — which is the
+    /// case a `Succession` creates.
+    #[test]
+    fn a_move_to_point_resolves_against_the_state_it_finds() {
+        let (mut tree, id) = scene(square());
+        let mut anim = MoveTo::to_point(id, Point::new(2.0, 0.0));
+        // An earlier beat scaled the object after this animation was built.
+        let centre = tree.get(id).unwrap().critical_point((0.0, 0.0)).unwrap();
+        tree.get_mut(id)
+            .unwrap()
+            .set_transform(Affine2::scale_about(3.0, centre));
+
+        anim.begin(&tree);
+        anim.interpolate(0.0, &mut tree);
+        let start_centre = tree.get(id).unwrap().critical_point((0.0, 0.0)).unwrap();
+        assert_eq!(
+            start_centre, centre,
+            "frame 0 is where the object already was"
+        );
+
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(
+            tree.get(id).unwrap().critical_point((0.0, 0.0)),
+            Some(Point::new(2.0, 0.0))
+        );
+        let width = width_of(&tree, id);
+        assert!(
+            (width - 7.8).abs() < 1e-12,
+            "the ×3 scale must survive the move; width was {width}"
+        );
     }
 
     /// **The guard that a morphing scene actually morphs.**

@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **442 tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **447 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
@@ -974,6 +974,15 @@ way), visible as a wrong end state for any member whose `finish` reads its geome
 to `Succession`, which must finish a member at the moment it leaves it behind, not only at the very
 end.
 
+**A target affine is not a position, and computing it eagerly is wrong twice over.** `MoveTo` used
+to be handed `translate(to)` by the wire layer, which is correct only while the object's transform is
+the identity: on a scaled or rotated object it silently undid that, and the existing move test could
+not see it because its object was untransformed. The second half is timing — the
+translation that sends the *current centre* to a point has to be computed in `begin`, because a
+`Succession` constructs all its members before the first runs; an eager `translate(to)` also throws
+away the scale an earlier member applied. The rule that survives both: **a position is a point plus
+the state the object has when the animation starts**, and only `begin` knows the second half.
+
 **`serde` writes struct fields in declaration order, so a hand-written round-trip fixture must match
 it.** `AnimationSpec` declares `target, type, duration, to, angle, factor, about_point, animations,
 lag_ratio`; writing the nested-succession case as `{"type":"succession","animations":[...],
@@ -1428,13 +1437,21 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   tests, and a manual `--inspect` run of “scale, then rotate” through a succession.
   Deferred: per-submobject `rate_func` staggering (the `Create`-over-a-group note above),
   `AnimationGroup`'s `lag_ratio` for a *group of groups* beyond the nesting already allowed, and
-  interrupting a running composed animation. **One defect surfaced while verifying this step and is
-  deliberately not fixed here**: a wire `move_to` replaces the whole transform with a translation,
-  so a `succession` of "scale, then move_to" ends *unscaled* — `MoveTo`'s target is a full affine
-  built at command time, and the honest fix is begin-time resolution of the point (Manim's
-  `move_to` is a `shift`, preserving the rest of the matrix) with the same treatment for
-  `set position`. It needs its own tests and a golden review, so it is the next item rather than
-  part of this one.
+  interrupting a running composed animation.
+- **P3's absolute position, done properly** — the defect that composition surfaced. A wire
+  `move_to` used to build `translate(to)` and hand it to `MoveTo::new`, i.e. it replaced the whole
+  matrix: a `succession` of "scale, then move_to" ended at the right centre and the *wrong size*, and
+  a `set` of `position` on a scaled object did the same. Both now mean **"put the centre here"**,
+  which is Manim's `move_to` — a `shift`, composed onto whatever the object already carries.
+  `MoveTo` gained `to_point` beside `new`: the destination is resolved in **`begin`**, not at
+  construction, because a succession builds every member before the first runs, so an eager
+  translation would capture the pre-scale centre. `new` still takes a whole affine for callers that
+  really mean "interpolate to this matrix", and its doc now says so. Evidence: four unit tests
+  (`a_move_to_point_keeps_the_objects_scale`, `..._resolves_against_the_state_it_finds`, the
+  succession ending scaled and moved, and the `set position` twin) plus the manual `--inspect` run
+  that started it — a circle scaled ×1.5 and moved to (1, 0.5) now reports radius 1.5 and the right
+  bounds. **No golden moved**, because no compiled scene calls either route on a transformed object;
+  the eight baselines are unchanged.
 - **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration
