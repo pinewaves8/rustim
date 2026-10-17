@@ -414,6 +414,57 @@ pub fn motion_announcement(mode: MotionMode) -> &'static str {
     }
 }
 
+/// What `--a11y-probe` feeds the live region once, at startup.
+///
+/// Whether a reader actually speaks it is the probe's cheapest end-to-end
+/// question: it exercises the announcement node, the throttle and the backend in
+/// one string, and none of that is reachable in a unit test.
+pub const PROBE_ANNOUNCEMENT: &str = "无障碍探针：正在运行";
+
+/// What `--a11y-probe` prints when the run ends.
+///
+/// Data rather than a printed string, because the one thing this report can be
+/// tested on is a machine that has no assistive technology to attach — so its
+/// exact wording has to be assertable without a window.
+pub struct ProbeReport<'a> {
+    /// `<os>-<arch>`, the same spelling the golden baselines use.
+    pub platform: &'a str,
+    pub scene: &'a str,
+    /// Scene nodes in the exit-time semantic tree, root included.
+    pub semantic_nodes: usize,
+    pub full_pushes: usize,
+    pub incremental_pushes: usize,
+}
+
+impl ProbeReport<'_> {
+    /// The report, as one line per fact.
+    ///
+    /// "Attached" is inferred from the push counters rather than read from the
+    /// backend, because `accesskit_winit` has no `is_active`: the only signal an
+    /// unattached app gets is that `update_if_active` never calls its closure.
+    /// So a zero count means *no update was requested during the run* — honest
+    /// whether the reader was never started, started after the last frame, or
+    /// failed to attach — and that is exactly what the trailing hint says.
+    pub fn render(&self) -> String {
+        let attached = self.full_pushes + self.incremental_pushes > 0;
+        let mut out = format!(
+            "a11y probe: {} · scene {}\n  semantic nodes: {}\n  assistive technology: {}\n  tree updates: {} full, {} incremental",
+            self.platform,
+            self.scene,
+            self.semantic_nodes,
+            if attached { "attached" } else { "not attached" },
+            self.full_pushes,
+            self.incremental_pushes
+        );
+        if !attached {
+            out.push_str(
+                "\n  no update was requested: check that the screen reader is running and attached",
+            );
+        }
+        out
+    }
+}
+
 fn describe_target(ctx: &SceneContext, id: NodeId) -> Option<String> {
     let semantic = ctx.semantic_tree(None);
     let node = semantic.get(id)?;
@@ -666,6 +717,16 @@ impl A11y {
 
     pub fn focused(&self) -> Option<NodeId> {
         self.core.focused()
+    }
+
+    /// How many complete snapshots reached a backend; zero with no AT attached.
+    pub fn full_pushes(&self) -> usize {
+        self.core.full_pushes()
+    }
+
+    /// How many incremental updates reached a backend; zero with no AT attached.
+    pub fn incremental_pushes(&self) -> usize {
+        self.core.incremental_pushes()
     }
 
     /// Push the update, and release any announcement that is due.
@@ -1263,5 +1324,62 @@ mod tests {
             .expect("the parent");
         let children: Vec<AkNodeId> = node.children().map(|c| local(c.id())).collect();
         assert_eq!(children, vec![AkNodeId(child.raw())]);
+    }
+
+    #[test]
+    fn a_probe_report_says_when_a_reader_attached() {
+        let report = ProbeReport {
+            platform: "linux-aarch64",
+            scene: "text",
+            semantic_nodes: 12,
+            full_pushes: 1,
+            incremental_pushes: 47,
+        };
+        assert_eq!(
+            report.render(),
+            "a11y probe: linux-aarch64 · scene text\n  \
+             semantic nodes: 12\n  \
+             assistive technology: attached\n  \
+             tree updates: 1 full, 47 incremental"
+        );
+    }
+
+    #[test]
+    fn a_probe_report_with_no_pushes_says_none_was_requested() {
+        let report = ProbeReport {
+            platform: "windows-x86_64",
+            scene: "pythagorean",
+            semantic_nodes: 4,
+            full_pushes: 0,
+            incremental_pushes: 0,
+        };
+        assert_eq!(
+            report.render(),
+            "a11y probe: windows-x86_64 · scene pythagorean\n  \
+             semantic nodes: 4\n  \
+             assistive technology: not attached\n  \
+             tree updates: 0 full, 0 incremental\n  \
+             no update was requested: check that the screen reader is running and attached"
+        );
+    }
+
+    #[test]
+    fn one_full_push_is_enough_to_count_as_attached() {
+        // A reader that attached for one frame and then went away still counts:
+        // the report describes the run, and the hint is about runs where nothing
+        // ever asked for an update.
+        let report = ProbeReport {
+            platform: "macos-aarch64",
+            scene: "rotate",
+            semantic_nodes: 3,
+            full_pushes: 1,
+            incremental_pushes: 0,
+        };
+        assert!(
+            report.render().contains("assistive technology: attached"),
+            "{}",
+            report.render()
+        );
+        assert!(!report.render().contains("no update was requested"));
     }
 }

@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **496 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **518 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -90,6 +90,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo run -p rustim-app              # launch the reference window
 cargo run -p rustim-app -- --png out.png   # headless: the scene after 10 s to a PNG
 cargo run -p rustim-app -- --inspect       # headless: the accessibility tree as JSON
+cargo run -p rustim-app -- --a11y-probe    # windowed: did a screen reader attach? (600 frames)
 cargo run -p rustim-app -- --frames 300    # run 300 frames then exit
 cargo run -p rustim-app -- --scene primitives  # ...a named scene; `--help` lists them
 cargo run -p rustim-app -- --scene text --png out.png   # CJK + Latin glyph runs
@@ -274,7 +275,7 @@ last property.
 |---|---|---|
 | `rustim-math` | Points, `Affine2`, rate functions and the `Rate` wire vocabulary, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` / `paths` / `rate_functions` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
-| `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
+| `rustim-mobject` | `Mobject` (points / declared `local_bounds` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
@@ -395,8 +396,9 @@ The wire command is `{"action":"camera", "center"?, "zoom"?, "focus"?, "duration
   ends.
 - `focus` frames a node by its **world bounding box** with a `1.2` margin; the tighter axis decides
   the zoom, and one zero dimension is fitted by the other (a horizontal line is a legitimate
-  subject). Then explicit `center` and `zoom` override only their own half. A text mobject has no
-  points, so `focus` on one is refused rather than silently doing nothing.
+  subject). Then explicit `center` and `zoom` override only their own half. A text or formula node
+  has no points but carries a declared box (see "Accessibility"), so it is framed like any other
+  node; a point-less node with no declared box is still refused.
 - It returns an **empty `StateDiff`**, for `play`'s reason: the view is not a node.
 - Refusals are values: a missing `focus` node is `NoSuchNode`; no geometry/zero extent, a
   non-finite or non-positive `zoom`, a bad `duration`, or a command naming none of the three is
@@ -700,17 +702,24 @@ Four things follow, and each is why this is one branch and not a feature:
   path is a different call site (below).
 - **It is cheaper**: one frame of state per beat instead of N.
 
-`Motion` is passed into `SceneContext::new` rather than set afterwards, so a scene that consults it
-while scripting cannot see a mode that arrives after `construct`. The host reads the preference: the
-`--motion full|reduced` flag, else `rustim_app::motion::from_platform()` — which is **best effort and
-Linux only**. It runs `gsettings get org.gnome.desktop.interface enable-animations` (the GNOME-family
-schemas, which UKUI here honours; KDE is not read and the XDG portal has no such key) and returns
-`Full` for everything else: a missing command, a missing schema, an unparsable answer. macOS
+`Motion` is passed into `SceneContext::new`, and it is **changeable at runtime** through
+`Command::Motion` — the wire's `{"action":"motion","mode":"reduced"}` and the `m` key, which queues
+the same command. Both go through `SceneContext::handle`, the one apply point, and the mode is read
+once per beat in `Sequence::start_next`. So a switch takes effect at the **next beat started**: a
+running beat keeps the policy it was handed, and a beat that was already reduced cannot replay its
+skipped flourish when motion is turned back on. A scene that consults `ctx.motion` while scripting in
+`construct` still sees the construction-time mode, because no command can arrive before `construct`
+returns. The host reads the preference once, at startup: the `--motion full|reduced` flag, else
+`rustim_app::motion::from_platform()` — which is **best effort and Linux only**. It runs
+`gsettings get org.gnome.desktop.interface enable-animations` (the GNOME-family schemas, which UKUI
+here honours; KDE is not read and the XDG portal has no such key) and returns `Full` for everything
+else: a missing command, a missing schema, an unparsable answer. macOS
 (`NSWorkspace.accessibilityDisplayShouldReduceMotion`) and Windows
 (`SPI_GETCLIENTAREAANIMATION`) are named in that module and deliberately unread, so those two
-platforms have the flag and not the preference. That mapping lives in `rustim-app` and not in the
-kernel for the same reason `accesskit` does: `rustim-anim` compiles to wasm and a crate that spawns a
-process does not.
+platforms have the flag and not the preference; neither is a listener, so a desktop setting changed
+mid-run is not observed — the explicit switch is the runtime route. That mapping lives in
+`rustim-app` and not in the kernel for the same reason `accesskit` does: `rustim-anim` compiles to
+wasm and a crate that spawns a process does not.
 
 ### The two structural changes relative to Manim
 
@@ -773,7 +782,7 @@ Three layers, and the split is the design:
 | Layer | Where | What it knows |
 |---|---|---|
 | `NodeKind` | `rustim-mobject` | What a mobject *is* (square / circle / text / …), a serde field beside `label` |
-| `SemanticTree` | `rustim-scene::a11y` | Roles, names, measured descriptions, screen-pixel bounds. **No accesskit, no platform** — it compiles to wasm |
+| `SemanticTree` | `rustim-scene::a11y` | Roles, names, descriptions, screen-pixel bounds (measured, or declared for a point-less glyph tree). **No accesskit, no platform** — it compiles to wasm |
 | `accesskit` | `rustim-app::a11y` | The adapter, the announcement node, action requests. The only module in the workspace that names `accesskit`; CI asserts this with `cargo tree` |
 
 The two projections share *semantic data*, not an AccessKit tree: there is no `accesskit_web`, so a
@@ -802,6 +811,24 @@ turned through 34° — was announced as "长度 2.49" when it is 3 long. A **nu
 name of its own — "数轴", measured "长度 6 的数轴" — while `Axes` and `Plot` keep the generic
 `w × h` sentence, where the box is honest.
 
+**One bounds exception, and it is a declaration rather than a measurement: a text or formula node
+carries its own box.** A text mobject has no point array — its geometry is a glyph run the scene
+pushes — so `world_anchors` has nothing to measure, and `Formula::insert`'s root is a container with
+no points either. `Mobject::local_bounds: Option<Rect>` is therefore a fallback consulted **only when
+`points` is empty**, never an override: a node with points answers exactly as it did before, a ragged
+array still answers `None`, and every measured-bounds rule above is untouched.
+`SceneTree::world_bounds` applies the fallback through `parent_transform · transform`;
+`Mobject::critical_point` applies it through `self.transform` alone, because that function answers in
+the **parent's** space (see "Hard-won facts"). `rustim-app::text::local_bounds` derives the box from
+`ShapedText.width/height` and `Formula::insert` takes the union of its glyphs' local points. It is a
+**line box, not an ink box** — a glyph may paint outside it. The same field is what lets `camera
+focus` frame a text object and what gives `MoveTo`/`Rotate` a centre to work with.
+
+`a11y::build` splits the two uses deliberately: `bounds` comes from `SceneTree::world_bounds` (so a
+text node now has one), while `shape` and `describe` still come from `Shape::of(anchors)` — a text
+description stays its label alone, with no size sentence, because a `Scale` animation changes the
+size every frame and a changing description is an accessibility property-change event.
+
 A description also **never contains a position**: on macOS and Windows a changed description is an
 accessibility property-change event, and `MoveTo` rewrites the transform every frame of an
 animation, so a position in the text would re-announce every node sixty times a second. Size enters
@@ -809,17 +836,52 @@ the description, position lives in `bounds`, which the backends only report when
 
 The conversation with a platform is deliberately narrow: Tab/Shift+Tab move focus, the arrow keys
 become `Property::Opacity` **commands** (the same ones an AI sends, through the same validator),
-space toggles playback, `,`/`.` step a frame, Enter re-reads the focused object, Escape drops focus.
+space toggles playback, `,`/`.` step a frame, Enter re-reads the focused object, Escape drops focus,
+and `m` flips the motion mode (`{"action":"motion"}` — see "Reduced motion").
 `rustim-app::announce` throttles announcements and holds rather than drops a burst, so an animation
 ending says where things ended up instead of narrating the whole transition.
+
+**The adapter sends a full snapshot only when it must.** `A11yCore` keeps the last `SemanticTree`
+and title it handed to a backend (`sent`); while that is present every update is a **difference**:
+only nodes that were added or whose projection changed, the window node when the top-level children
+or the title changed, the live-region node when its text changed, and the focus on every update. The
+rules are the consumer's, not ours — a parent must arrive in the same update as an added or removed
+child, a removed node must not be named, a title change needs no full snapshot (the window node alone
+carries it). The tests replay every update through `accesskit_consumer`, the implementation the
+platform backends themselves use, because an assertion over our own `TreeUpdate` cannot prove them.
+Two reset points force `sent = None` and a complete snapshot: `InitialTreeRequested` (the consumer
+attached and holds nothing) and `AccessibilityDeactivated` (the platform dropped our tree); the
+invalidation is wired at both sites in `main.rs`, and neither is redundant — a consumer attached
+fresh on macOS must never receive a difference from a tree it never had.
+
+**A focused node can be deleted by an animation.** `FadeOut` removes its target in `finish`, and
+`FocusState` only resyncs on a key or AT event, so the projection would otherwise push a focus
+pointing at a node no longer in the tree — `accesskit_consumer` panics on that. `to_update`
+therefore releases a stale focus first (an O(1) `tree.get`); syncing the whole focus walk every frame
+would cost the tree walk the incremental update exists to avoid.
+`removing_the_focused_node_releases_the_focus` is the panic regression.
+
+**`--a11y-probe` is the real-machine instrument.** It opens the window, offers one announcement at
+startup, runs 600 frames by default (`--frames` overrides) and prints a report on **stderr**: the
+platform, the scene, the exit-time semantic node count, whether an assistive technology attached,
+and the full/incremental push counts. The counters double as the attachment signal because
+`accesskit_winit` has no `is_active`: with no AT the `update_if_active` closure never runs, so **zero
+pushes is the honest answer, not a failure** — the report says so and tells the reader to check the
+screen reader. It is windowed-only and refuses `--inspect`, `--png` and `--reply` (`exit(2)`),
+because the headless paths have no backend to ask. The report text is a pure function
+(`ProbeReport::render`), tested active, inactive and zero-count, so its wording is pinned without a
+screen reader.
 
 Verifying it by hand, per platform:
 
 ```bash
 cargo run -p rustim-app -- --scene pythagorean --inspect   # the tree, no screen reader needed
-cargo run -p rustim-app -- --frames 300                    # Tab, arrows, space, `,`/`.`
-# macOS: VoiceOver (Cmd+F5) · Windows: Narrator (Win+Ctrl+Enter) · Linux: Orca, needs a
-# session bus — with none, accesskit_unix skips silently and this is all untested here.
+cargo run -p rustim-app -- --frames 300                    # Tab, arrows, space, `,`/`.`, `m`
+cargo run -p rustim-app -- --a11y-probe                    # did a reader attach? report on stderr
+# macOS: start VoiceOver (Cmd+F5), then run the probe. Windows: Narrator (Win+Ctrl+Enter),
+# then run the probe. Linux: Orca needs a session bus — with none, accesskit_unix skips
+# silently, so nothing here has been heard. The probe is what makes the other two machines
+# a ten-minute check rather than an unfinished claim; the audible result still needs them.
 ```
 
 ### Text
@@ -862,8 +924,9 @@ which is why `the_composite_scale_is_positive_and_uniform` exists.
 `Mobject::has_picture()` — not a point count — is the test for "the user can see or reach this", and
 it is what `FocusState::sync` and the a11y `hidden` flag use. `SceneContext::build_draw_list`
 legitimately still tests points, because it emits filled paths and a text mobject has none to emit.
-The cost of being a different kind of object shows up as `bounds: null` in `--inspect`: a text node
-has no accessibility bounds yet, because `world_anchors` has nothing to measure.
+The consequence used to be `bounds: null` in `--inspect` and a `camera focus` that refused a text
+node; the declared box described under "Accessibility" fixed both, and the shaper's own
+`ShapedText.width/height` is where it comes from.
 
 `MANIM_FONT_SIZE_UNITS` (`rustim-text`) is **2/3**, i.e. Manim's `font_size` behaves as points with
 72 to the world unit. Measured, not derived — see the constant's doc and
@@ -1060,10 +1123,37 @@ cannot be expressed. The root id is ours to pick, and it is `NodeId::RESERVED` r
 
 **`update_if_active`'s closure is not called while no assistive technology is attached** — the guard
 is in all three platform backends, so "inactive costs nothing" is structural rather than an
-optimisation to remember. The corollary is that nothing may depend on a call *having* happened: the
-adapter is built with an event-loop proxy, which cannot supply a synchronous initial tree, so
-**every push is a full snapshot**. Fine for four nodes; the cost of a snapshot per frame becomes
-real at roughly 500 nodes, which is where an incremental update would have to be earned.
+optimisation to remember. The corollary is that nothing may depend on a call *having* happened, and
+that the push counters read zero unattached: `--a11y-probe` reports that as "not attached", which is
+the only signal `accesskit_winit` gives (there is no `is_active`).
+
+**An incremental AccessKit update is a set of relationship promises, not merely a smaller
+snapshot.** `tree: None` is legal only if the consumer can still reach every node it needs to
+change: a parent must arrive in the same update as an added or removed child, a removed node's id
+must not appear anywhere in the update, a reparent requires both parents, and `focus` must be
+present every time and must name a node that exists. The whole-tree assertion the full update
+satisfies ("every named node's parent is named or is the root") is *false* for the incremental case
+by design, so the tests replay each update through `accesskit_consumer` — the same code the platform
+backends run — rather than asserting over our own `TreeUpdate`.
+
+**A focused node can be removed by an animation, and a dangling focus makes the consumer panic.**
+`FadeOut` deletes its target in `finish`; `FocusState` resyncs only on a key or AT event, so between
+the removal and the next keypress the core still holds the id. `A11yCore::to_update` releases a stale
+focus with one `tree.get` before projecting, which is the O(1) fix — a per-frame `FocusState::sync`
+would walk the whole tree and undo what the incremental update bought.
+
+**`accesskit_consumer` is already in the Linux graph**, pulled in by `accesskit_unix` (the AT-SPI
+backend), so `rustim-app`'s `[dev-dependencies]` line adds no crate and no wasm risk; it only puts
+the same implementation in scope for tests. Check with
+`cargo tree -p rustim-app -i accesskit_consumer` before repeating the "it never reaches a binary"
+claim — that claim was wrong when this was written.
+
+**`Mobject::critical_point` answers in the parent's space, not the world's.** It applies
+`self.transform` and nothing else, unlike `SceneTree::world_bounds`, which multiplies in
+`parent_transform`. The declared `local_bounds` fallback must therefore use `self.transform`; folding
+the parent in as well applies the ancestor transform twice, and on a nested text node the object
+lands somewhere no one asked for. The doc comment used to say "world coordinates", which is what made
+the mistake attractive.
 
 **`KeyEvent` cannot be constructed outside winit** (private `platform_specific` field), so a key
 classifier that takes one is untestable. `rustim-app::input::classify` takes a `KeyPress` — the five
@@ -1285,7 +1375,7 @@ weeks later.
 
 | | P1 step | State |
 |---|---|---|
-| 1 | Numerical parity against Manim (495 cases at 1e-9) | done — see "Commands" |
+| 1 | Numerical parity against Manim (771 cases at 1e-9) | done — see "Commands" |
 | 2 | Golden-image suite: per-platform baselines, CI job (eight scenes now) | done — see "Golden images" |
 | 3 | Accessibility: structure + full keyboard + throttled announcements | done — see "Accessibility" |
 | 4 | Text: `parley` end to end (string → glyphs → screen), bundled CJK, measured font size | done — see "Text" |
@@ -1301,11 +1391,13 @@ shape-count bound** (4 large filled polygons at 720p already cost p50 2.25 ms of
 damage-rectangle invalidation was likely worth more than any micro-optimisation — and it landed as
 P3's damage rectangles (see "Damage rectangles").
 
-The accessibility layer's own deferred edges, so they are not rediscovered as gaps: the
-macOS/Windows backends are **compile-checked only** (this machine has no accessible bus, so nothing
-beyond Linux compiles-and-hopes has been observed), a full-snapshot push per frame is fine at this
-scale but is not the shape a 500-node scene wants, and there is no runtime toggle for motion — the
-mode is fixed at `SceneContext::new` and a desktop-settings change while running is not observed.
+The accessibility layer's own deferred edges, so they are not rediscovered as gaps: the macOS/Windows
+backends are **compile-and-probe only** — `--a11y-probe` turns "does VoiceOver receive this?" into a
+one-command check, but this machine has no accessible bus, so it has not been run on either and
+nothing beyond Linux has been observed. Updates are now incremental (only changed nodes), but a
+`CameraMove` changes every node's pixel bounds and therefore still sends the whole tree. Motion has a
+runtime switch (`m` and the wire command), but the *platform preference* is still read once at
+startup: a desktop setting changed while the engine runs is not observed.
 
 ### P1 step 5: formulas — Typst in, per-glyph outlines out
 
@@ -1472,8 +1564,11 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   now false and the corresponding sentences have been rewritten. The step's own evidence is that the
   six goldens passed **unchanged** while every scene's still and every scene's `--inspect` tree came
   out identical under the two modes — the journey moved and the picture and the rhythm did not. Its
-  deferred edges: the macOS/Windows probes, a runtime toggle, and re-reading the preference while
-  running.
+  deferred edges were the macOS/Windows probes, a runtime toggle and re-reading the preference while
+  running. The toggle landed in P3 step 11 (`Command::Motion`, the `m` key, taking effect at the next
+  beat started); `--a11y-probe` makes the two probes runnable but they still need those machines;
+  and the platform preference is still read once, so a desktop setting changed mid-run is not
+  observed.
   **Step 5, the remaining animations — `FadeOut`, `Rotate`, `Scale` — is done**, and the three are
   not variations on one another. **`FadeOut` is the first animation with an effect *after* its last
   frame**: it mirrors `FadeIn`'s opacity ramp and then removes its target, which is what forced
@@ -1646,7 +1741,21 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   wire (the enum is Manim's default set; a custom inflection is a Rust-level closure), parameterised
   rates for scene code beyond the explicit functions, and the `@unit_interval` / `@zero` decorators
   (the clamp lives in `Animation::ease`).
-- **P3+** — video export; the AI command surface at full width; Web (WASM).
+- **P3's accessibility debts are paid — text bounds, a runtime motion switch, incremental pushes and
+  a real-machine probe — and the eight goldens never moved**, because none of the four steps touches
+  drawing. Step 10 gave `Mobject` a declared `local_bounds` fallback, so a text or formula node has
+  `bounds`, a centre for `MoveTo`/`Rotate` and a frameable subject for `camera focus`; it is
+  consulted only when `points` is empty, and `a11y::build` keeps `Shape::of(anchors)` for
+  descriptions so a text node is still announced by its label alone. Step 11 made `Motion` switchable
+  at runtime with `{"action":"motion"}` and the `m` key, read once per beat in `Sequence::start_next`,
+  so a switch lands on the next beat and never mid-beat. Step 12 turned the per-frame full snapshot
+  into a difference, with the consumer's relationship rules pinned by replaying every update through
+  `accesskit_consumer`, and fixed a latent panic: a `FadeOut` could delete the focused node and leave
+  the projection pushing a focus the consumer cannot resolve. Step 13 added `--a11y-probe` — one
+  announcement, 600 frames, and a stderr report saying whether a backend attached; the honest answer
+  on this machine is "not attached, 0 pushes", and the report says so rather than pretending.
+- **P3+** — video export and the visual-regression CLI; self-voicing TTS; MathML flattening; the AI
+  command surface at full width; Web (WASM).
 
 ## AI integration
 
@@ -1674,6 +1783,12 @@ therefore returns an **empty** `StateDiff`, and honestly so: a diff describes th
 beat does not change the tree, it changes what will happen to it. An interruption would be a *different*
 command, spelled out in the data; `play` cannot preempt what is already playing.
 
+`camera` and `motion` are the other two commands intercepted by `SceneContext::handle` rather than
+by the pure `command::apply`, and both return an **empty** `StateDiff` for `play`'s reason — the view
+and the motion policy are not nodes. `camera` writes the view now or queues a `CameraMove`; `motion`
+(`{"action":"motion","mode":"full"|"reduced"}`) writes the policy the **next beat started** will be
+given, without touching the beat already running.
+
 Two wire-format invariants are load-bearing, both pinned by tests:
 - **Commands round-trip byte-for-byte.** `to_string(parse(json)) == json`. A host logs, replays and
   diffs these, so anything that serialises back differently is a bug.
@@ -1683,7 +1798,7 @@ Two wire-format invariants are load-bearing, both pinned by tests:
 ### The feed: a session is a file of commands
 
 `rustim-app --script <path|->` applies one JSON command per line (JSONL) and is *how a host drives the
-engine at all* — without it the only scenes that exist are the seven compiled in. The transport is
+engine at all* — without it the only scenes that exist are the eight compiled in. The transport is
 `rustim_app::feed`; the protocol is `rustim_scene::command`, which owns `CommandReply` and stays free
 of I/O and of a JSON parser (it compiles to wasm).
 

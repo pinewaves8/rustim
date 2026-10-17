@@ -18,6 +18,7 @@
 //! rustim-app --frames 300         # ...and exit after 300 frames
 //! rustim-app --png out.png        # no window: render one frame to a PNG
 //! rustim-app --inspect            # no window: print the accessibility tree
+//! rustim-app --a11y-probe         # windowed: did a screen reader attach?
 //! rustim-app --scene text --png t.png
 //! rustim-app --script session.jsonl --reply   # drive the engine with commands
 //! ```
@@ -1454,6 +1455,10 @@ struct App {
     pending: Vec<(u64, String)>,
     /// Whether each command's reply is printed to stdout. Off unless `--reply`.
     reply: bool,
+    /// Whether this run is an `--a11y-probe`: offer one announcement at startup
+    /// and print what the accessibility layer did when the loop ends. Windowed
+    /// only, enforced in `main`.
+    probe: bool,
     /// What the feed has done so far, for the closing line.
     feed: feed::Counts,
     /// The window's current modifier state. winit delivers modifiers in their
@@ -1620,6 +1625,15 @@ impl ApplicationHandler<AppEvent> for App {
             surface,
             a11y,
         });
+        // Offered once, before the first frame, so the frame loop's own
+        // `a11y.update` flushes it into the live region. That exercises the
+        // announcement path end to end; the report's push counters are what
+        // say whether a backend was there to receive it.
+        if self.probe
+            && let Some(w) = self.windowed.as_mut()
+        {
+            w.a11y.core().offer(rustim_app::a11y::PROBE_ANNOUNCEMENT);
+        }
         self.request_redraw();
     }
 
@@ -1884,6 +1898,7 @@ fn main() {
     let mut motion: Option<Motion> = None;
     let mut script: Option<String> = None;
     let mut reply = false;
+    let mut probe = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1937,10 +1952,14 @@ fn main() {
                 reply = true;
                 i += 1;
             }
+            "--a11y-probe" => {
+                probe = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 println!(
-                    "rustim-app [--frames N] [--png OUT.png | --inspect] [--scene NAME] \
-                     [--motion full|reduced] [--script PATH|-] [--reply]"
+                    "rustim-app [--frames N] [--png OUT.png | --inspect | --a11y-probe] \
+                     [--scene NAME] [--motion full|reduced] [--script PATH|-] [--reply]"
                 );
                 println!("scenes: {}", scene_names());
                 println!("--inspect: print the accessibility tree as JSON to stdout");
@@ -1953,6 +1972,10 @@ fn main() {
                      and without --scene the script gets an empty one"
                 );
                 println!("--reply: answer each command with one JSON line on stdout");
+                println!(
+                    "--a11y-probe: open a window, offer one announcement, and report on stderr \
+                     at exit whether a screen reader attached (600 frames if --frames is absent)"
+                );
                 println!("animations: {}", feed::animation_kinds());
                 println!("rates: {}", feed::rate_names());
                 println!();
@@ -2002,6 +2025,24 @@ fn main() {
     if reply && inspect {
         eprintln!("--reply and --inspect both write to stdout; run them separately");
         std::process::exit(2);
+    }
+
+    // The probe is the one accessibility mode that needs a window: it exists to
+    // ask a platform backend a question, and that backend exists only in the
+    // windowed path. Combining it with a headless flag would answer a different
+    // question, so it is a refusal rather than a precedence rule.
+    if probe && (inspect || png.is_some() || reply) {
+        eprintln!(
+            "--a11y-probe needs the window and cannot be combined with --inspect, --png or --reply"
+        );
+        std::process::exit(2);
+    }
+    // 600 real frames — roughly ten seconds on a vsync-paced desktop, which is
+    // long enough to start a reader after the window appears. The loop is not
+    // throttled here, so the wall-clock length is whatever the compositor
+    // allows; an explicit `--frames` still wins.
+    if probe && max_frames.is_none() {
+        max_frames = Some(600);
     }
 
     let viewport = Viewport {
@@ -2129,6 +2170,7 @@ fn main() {
         queued: Vec::new(),
         pending: Vec::new(),
         reply,
+        probe,
         feed: feed::Counts::default(),
         mods: ModifiersState::empty(),
         paused: false,
@@ -2140,7 +2182,35 @@ fn main() {
         render_ms: Vec::new(),
         last: Instant::now(),
     };
+    if probe {
+        // On stderr, before the window appears: the report at the end is only
+        // interesting if a reader attached in between, and nothing else tells
+        // the person running this what the run is waiting for.
+        eprintln!(
+            "a11y probe: scene {} — attach a screen reader now; the report prints after {} frames",
+            scene_name,
+            max_frames.unwrap_or(0)
+        );
+    }
     event_loop.run_app(&mut app).expect("run_app");
+    // The probe's answer, first, because everything after it is incidental. On
+    // stderr: stdout is the protocol's even when `--reply` is off, and this
+    // report is for a person or a CI log. Node count is read at exit, so it
+    // describes the scene the run actually ended with.
+    if app.probe {
+        let (full, incremental) = app.windowed.as_ref().map_or((0, 0), |w| {
+            (w.a11y.full_pushes(), w.a11y.incremental_pushes())
+        });
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let report = rustim_app::a11y::ProbeReport {
+            platform: &platform,
+            scene: &scene_name,
+            semantic_nodes: app.ctx.semantic_tree(None).nodes.len(),
+            full_pushes: full,
+            incremental_pushes: incremental,
+        };
+        eprintln!("{}", report.render());
+    }
     // What a live session's feed did, on stderr so it cannot be mistaken for a
     // reply line. Silent unless something was refused.
     if let Some(line) = app.feed.report() {
