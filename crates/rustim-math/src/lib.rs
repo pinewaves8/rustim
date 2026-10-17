@@ -10,14 +10,16 @@
 //! workspace depends on one version of it. `kurbo` is pure maths with no
 //! platform code.
 //!
-//! [`bezier`] and [`space_ops`] are literal ports of `manim.utils.bezier` and
-//! `manim.utils.space_ops`, checked case by case against Manim 0.22 in
+//! [`bezier`], [`space_ops`] and [`paths`] are literal ports of `manim.utils.bezier`,
+//! `manim.utils.space_ops` and `manim.utils.paths`, checked case by case against
+//! Manim 0.22 in
 //! `tests/manim_parity.rs`. They exist so that one scene description produces the
 //! same figure here as in Manim — which only holds if the arithmetic rounds the
-//! same way, so those two modules reproduce Manim's rounding paths and not just
+//! same way, so all three modules reproduce Manim's rounding paths and not just
 //! its formulas.
 
 pub mod bezier;
+pub mod paths;
 pub mod rate;
 pub mod space_ops;
 pub mod text;

@@ -1192,6 +1192,39 @@ fn quaternions_and_spherical_match() {
     ]);
 }
 
+/// `path_along_arc` — the route a `Transform(path_arc=…)` takes.
+///
+/// Every combination of the four chords, eleven angles and five alphas is a
+/// case, so none of the branch boundaries can go unexercised: `0.005` is under
+/// `STRAIGHT_PATH_THRESHOLD` (a plain lerp), `0.01` and `-0.01` are arcs, `±π`
+/// are the two half-turns (the source skips the centre displacement for `+π`
+/// and not for `-π`), and `2.5` is beyond `π`, which 0.22 accepts. The
+/// coincident chord is the division-by-zero case wearing a shape.
+#[test]
+fn path_along_arc_matches() {
+    let fixture = Fixture::load("manim-space-ops.json");
+    let mut rec = Recorder::new(&fixture);
+    let endpoints: BTreeMap<String, BTreeMap<String, Vec<f64>>> = fixture.input("path_cases");
+    let arcs: Vec<f64> = fixture.input("path_arcs");
+    let alphas: Vec<f64> = fixture.input("path_alphas");
+
+    for (name, ends) in &endpoints {
+        let start = Point::new(ends["start"][0], ends["start"][1]);
+        let end = Point::new(ends["end"][0], ends["end"][1]);
+        for &arc in &arcs {
+            for &alpha in &alphas {
+                let case = format!("{name}@{}@{}", py_float(arc), py_float(alpha));
+                let want: Vec<f64> = Vec::from_value(&rec.expect("path_along_arc", &case), &case);
+                let got = rustim_math::paths::path_along_arc(arc, start, end, alpha);
+                close(got.x, want[0], &format!("{case}.x"));
+                close(got.y, want[1], &format!("{case}.y"));
+            }
+        }
+    }
+
+    rec.assert_exhaustive(&["path_along_arc"]);
+}
+
 // ---------------------------------------------------------------------------
 // the coverage guards
 // ---------------------------------------------------------------------------
@@ -1242,6 +1275,7 @@ const SPACE_OPS_GROUPS: &[&str] = &[
     "rotate_vector",
     "cartesian_to_spherical",
     "spherical_to_cartesian",
+    "path_along_arc",
 ];
 
 /// The case count of each file. A regeneration that silently drops cases is
@@ -1251,7 +1285,7 @@ fn fixture_case_counts_are_stable() {
     for (file, expected) in [
         ("manim-bezier.json", 282usize),
         ("manim-geometry.json", 145),
-        ("manim-space-ops.json", 68),
+        ("manim-space-ops.json", 288),
     ] {
         let fixture = Fixture::load(file);
         let total: usize = fixture.cases.values().map(BTreeMap::len).sum();

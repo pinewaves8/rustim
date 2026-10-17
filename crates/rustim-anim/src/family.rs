@@ -67,7 +67,7 @@ use rustim_math::{Affine2, Point, bezier};
 use rustim_mobject::{NodeId, SceneTree, Style, Subtree};
 
 use crate::Animation;
-use crate::ops::{lerp_affine, lerp_scalar};
+use crate::ops::{lerp_affine, lerp_scalar, path_point};
 
 /// Morphs the subtree at `source` into the subtree at `target`.
 ///
@@ -85,6 +85,10 @@ pub struct TransformGroup {
     plan: Option<NodePlan>,
     running: Option<Vec<Frame>>,
     duration: f64,
+    /// Manim's `path_arc` on the `Transform` that drives the family: every
+    /// paired point takes the same arc, which is why it belongs to the animation
+    /// rather than to each frame.
+    path_arc: Option<f64>,
 }
 
 /// One alignment, computed once in `begin`, applied every frame.
@@ -137,11 +141,27 @@ impl TransformGroup {
             plan: None,
             running: None,
             duration: 1.0,
+            path_arc: None,
         }
     }
 
     pub fn with_duration(mut self, seconds: f64) -> Self {
         self.duration = seconds;
+        self
+    }
+
+    /// Route every paired point along an arc of `radians` — Manim's
+    /// `Transform(path_arc=…)` applied to the whole family.
+    ///
+    /// Each child's route is measured in its **parent's** space, so a child that
+    /// moves only through its deferred transform still bends: the arc is taken
+    /// between `from_transform · a` and `to_transform · b`, and the child's own
+    /// transform becomes identity for the morph. See
+    /// [`Transform::with_path_arc`](crate::Transform::with_path_arc) for why that
+    /// folding is necessary and what it costs. As there, the endpoints are
+    /// written rather than computed.
+    pub fn with_path_arc(mut self, radians: f64) -> Self {
+        self.path_arc = Some(radians);
         self
     }
 
@@ -208,15 +228,28 @@ impl Animation for TransformGroup {
             let Some(m) = tree.get_mut(frame.id) else {
                 continue;
             };
-            m.points = frame
-                .from_points
-                .iter()
-                .zip(frame.to_points.iter())
-                .map(|(a, b)| {
-                    Point::new(lerp_scalar(a.x, b.x, alpha), lerp_scalar(a.y, b.y, alpha))
-                })
-                .collect();
-            m.set_transform(lerp_affine(frame.from_transform, frame.to_transform, alpha));
+            m.points = match self.path_arc {
+                Some(arc) => frame
+                    .from_points
+                    .iter()
+                    .zip(frame.to_points.iter())
+                    .map(|(a, b)| {
+                        path_point(arc, frame.from_transform, *a, frame.to_transform, *b, alpha)
+                    })
+                    .collect(),
+                None => frame
+                    .from_points
+                    .iter()
+                    .zip(frame.to_points.iter())
+                    .map(|(a, b)| {
+                        Point::new(lerp_scalar(a.x, b.x, alpha), lerp_scalar(a.y, b.y, alpha))
+                    })
+                    .collect(),
+            };
+            m.set_transform(match self.path_arc {
+                Some(_) => Affine2::IDENTITY,
+                None => lerp_affine(frame.from_transform, frame.to_transform, alpha),
+            });
             m.opacity = lerp_scalar(frame.from_opacity, frame.to_opacity, alpha);
             m.style = Style::lerp(frame.from_style, frame.to_style, alpha);
             m.dirty.style = true;
@@ -452,6 +485,38 @@ mod tests {
         anim.interpolate(0.5, &mut tree);
 
         assert_eq!(centre(&tree, s0), Point::new(0.0, 0.0));
+    }
+
+    /// The arc applies to every child, and to a child whose *whole* motion is in
+    /// its deferred transform — the case a naive local-array arc would draw
+    /// straight.
+    #[test]
+    fn a_family_morph_bends_every_child_when_asked() {
+        use std::f64::consts::PI;
+
+        let mut tree = SceneTree::new();
+        let source = insert_group(&mut tree);
+        let s0 = square_at(&mut tree, source, (-2.0, 0.0));
+        let target = insert_group(&mut tree);
+        let t0 = square_at(&mut tree, target, (2.0, 0.0));
+
+        let mut anim = TransformGroup::new(source, target).with_path_arc(PI);
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+
+        // Halfway round a half-turn is one radius below the chord's midpoint.
+        let mid = centre(&tree, s0);
+        assert!(
+            (mid.x).abs() < 1e-12 && (mid.y + 2.0).abs() < 1e-12,
+            "{mid:?}"
+        );
+
+        // And the ends are exact, as for a leaf.
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(
+            tree.get(s0).unwrap().materialize(),
+            tree.get(t0).unwrap().materialize()
+        );
     }
 
     /// Padding: the shorter side gains faded copies of its own children, and the

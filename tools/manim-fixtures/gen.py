@@ -867,6 +867,55 @@ def inventory():
     }
 
 
+# --------------------------------------------------------------------------
+# manim.utils.paths
+# --------------------------------------------------------------------------
+
+
+def collect_paths():
+    """`path_along_arc` — the route a `Transform(path_arc=...)` takes.
+
+    The angle list is chosen for the branches and boundaries, not for
+    coverage: `0.005` is under `STRAIGHT_PATH_THRESHOLD` (so Manim returns the
+    plain lerp, bits included), `0.01` is exactly on it (so it is an arc),
+    `0.3`/`-0.3` differ only in which way the path bows, `±π/2` are ordinary
+    arcs, `±π` are the half-turns — where the source special-cases `+π` and not
+    `−π` — and `2.5` is an angle past `π` that the 0.22 source accepts.
+    """
+    import manim.utils.paths as P
+
+    endpoints = {
+        "horizontal": ([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+        "skew": ([-2.0, 1.0, 0.0], [3.0, 4.0, 0.0]),
+        "reversed": ([2.0, -1.0, 0.0], [-3.0, 0.5, 0.0]),
+        # Zero-length chord: the centre is the point itself and every alpha
+        # must return it, which is a division-by-zero guard wearing a test.
+        "coincident": ([1.0, 1.0, 0.0], [1.0, 1.0, 0.0]),
+    }
+    arcs = (0.0, 0.005, 0.01, -0.01, 0.3, -0.3, np.pi / 2, -np.pi / 2, np.pi, -np.pi, 2.5)
+    alphas = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+    INPUTS["path_cases"] = {
+        name: {"start": start, "end": end} for name, (start, end) in endpoints.items()
+    }
+    INPUTS["path_arcs"] = list(arcs)
+    INPUTS["path_alphas"] = list(alphas)
+
+    for name, (start, end) in endpoints.items():
+        a = np.array(start, dtype=float)
+        b = np.array(end, dtype=float)
+        for arc in arcs:
+            path = P.path_along_arc(arc)
+            for alpha in alphas:
+                case(
+                    "path_along_arc",
+                    f"{name}@{arc}@{alpha}",
+                    lambda path=path, a=a, b=b, alpha=alpha: path(
+                        a[None, :], b[None, :], alpha
+                    )[0],
+                )
+
+
 def main(argv):
     if len(argv) != 2:
         print(__doc__.strip(), file=sys.stderr)
@@ -877,6 +926,7 @@ def main(argv):
     collect_bezier()
     collect_geometry()
     collect_space_ops()
+    collect_paths()
 
     # group -> the one file it belongs in. Groups are merged, never written one
     # at a time: each file is written once, or the later group would clobber the
@@ -923,6 +973,7 @@ def main(argv):
             "quaternion_from_angle_axis",
             "quaternion_mult",
             "rotate_vector",
+            "path_along_arc",
         ],
     }
 
@@ -968,6 +1019,9 @@ def main(argv):
             "origin_corner_square",
             "triangle_3d",
             "quaternion_mult_pair",
+            "path_cases",
+            "path_arcs",
+            "path_alphas",
         ],
     }
 

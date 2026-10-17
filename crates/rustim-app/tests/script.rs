@@ -613,6 +613,10 @@ fn a_script_can_add_the_coordinate_system_kinds() {
 /// The source still calls itself a square — the engine has no way to know a
 /// square became a circle, which is the documented limit of `Transform` — so the
 /// assertion is on the measured bounds, the quantity a reader is told.
+///
+/// The morph carries a `path_arc`, which is the wire's other half of the claim:
+/// the angle changes the route and not the destination, so a settled morph with
+/// an arc must measure exactly like one without.
 #[test]
 fn a_transform_command_morphs_a_shape_on_the_wire() {
     let script = scratch(
@@ -624,7 +628,7 @@ fn a_transform_command_morphs_a_shape_on_the_wire() {
             "\n",
             // 4294967297 and 4294967298 are the ids this session's first two adds
             // are given, which `--reply` would also hand back.
-            r#"{"action":"play","animation":{"target":4294967298,"type":"transform","into":4294967297,"duration":0.5}}"#,
+            r#"{"action":"play","animation":{"target":4294967298,"type":"transform","into":4294967297,"duration":0.5,"path_arc":1.2}}"#,
             "\n",
         ),
     );

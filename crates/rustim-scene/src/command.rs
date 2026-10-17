@@ -141,6 +141,19 @@ pub struct AnimationSpec {
     /// animation reads it once in `begin` and never writes to it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub into: Option<NodeId>,
+    /// A `transform`'s arc, in radians: the route every point takes instead of a
+    /// straight line. Read only by `transform`; the other kinds ignore it, the
+    /// same way they ignore `to` or `angle`.
+    ///
+    /// The sign chooses which way the path bows — positive curves one way,
+    /// negative the other — and `0`, or anything below
+    /// [`rustim_math::paths::STRAIGHT_PATH_THRESHOLD`], is the straight line.
+    /// Absent is omitted rather than written as `null`, and it is the spelling to
+    /// prefer for a straight morph: `0` draws the same route but folds the
+    /// object's deferred transform into its points, which an absent angle has no
+    /// reason to do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_arc: Option<f64>,
     /// A `group`'s or `succession`'s member animations, each a spec of its own.
     ///
     /// Nested rather than flat because a group is a tree: a member may itself be a
@@ -501,6 +514,13 @@ pub fn camera_duration(duration: Option<f64>) -> Result<Option<f64>, CommandErro
 ///   command that plays an empty beat must not answer as though it moved
 ///   something. Two *leaves* and two *groups* are both fine; the group case is
 ///   the one that pads child lists.
+/// * a non-finite `path_arc` — [`CommandError::OutOfRange`]. Manim 0.22 performs
+///   no range check on the angle (`utils/paths.py:96-140`) and neither does this
+///   engine: every finite value is a legitimate arc, and the sign chooses the
+///   side. A non-finite one is different in kind — every coordinate of the morph
+///   becomes `NaN`, so the object disappears while the beat still claims to
+///   play — and it is refused here for the same reason a non-finite `duration`
+///   is.
 /// * a negative or non-finite `duration` — [`CommandError::OutOfRange`]. `0.0` is
 ///   accepted: Manim refuses only `run_time < 0` (`animation/animation.py:175-181`)
 ///   and an instant snap is legitimate — `AnimationScheduler::update` already
@@ -636,7 +656,17 @@ pub fn animation_for(
                     },
                 });
             }
-            Box::new(TransformGroup::new(target, into).with_duration(duration))
+            let mut anim = TransformGroup::new(target, into).with_duration(duration);
+            if let Some(arc) = spec.path_arc {
+                if !arc.is_finite() {
+                    return Err(CommandError::OutOfRange {
+                        property: "path_arc".into(),
+                        detail: format!("{arc} is not a finite number of radians"),
+                    });
+                }
+                anim = anim.with_path_arc(arc);
+            }
+            Box::new(anim)
         }
     })
 }
@@ -901,11 +931,11 @@ mod tests {
             ),
             r#"{"action":"play","animation":{"type":"succession","duration":2.0,"animations":[{"target":4294967296,"type":"create"},{"target":4294967296,"type":"fade_out","duration":0.5}]}}"#
                 .to_owned(),
-            // A morph names its donor by id. The field sits between `about_point`
-            // and `animations` in declaration order, which is the order serde
-            // writes — a host diffing a replayed log depends on it.
+            // A morph names its donor by id. `into` and `path_arc` sit between
+            // `about_point` and `animations` in declaration order, which is the
+            // order serde writes — a host diffing a replayed log depends on it.
             format!(
-                r#"{{"action":"play","animation":{{"target":{id},"type":"transform","duration":0.8,"into":{id}}}}}"#
+                r#"{{"action":"play","animation":{{"target":{id},"type":"transform","duration":0.8,"into":{id},"path_arc":1.5}}}}"#
             ),
             // The camera command, in its full and partial spellings. The full
             // one exercises every optional field at once; the partial one is what
@@ -1158,6 +1188,7 @@ mod tests {
                     factor: None,
                     about_point: None,
                     into: None,
+                    path_arc: None,
                     animations: None,
                     lag_ratio: None,
                 },
@@ -1190,6 +1221,7 @@ mod tests {
             factor: None,
             about_point: None,
             into: None,
+            path_arc: None,
             animations: None,
             lag_ratio: None,
         }
@@ -1551,6 +1583,7 @@ mod tests {
             factor: None,
             about_point: None,
             into: None,
+            path_arc: None,
             animations: Some(members),
             lag_ratio: None,
         }
@@ -1833,6 +1866,57 @@ mod tests {
             tree.get(id).unwrap().points,
             tree.get(circle).unwrap().points
         );
+    }
+
+    /// `path_arc` crosses the wire and reaches the morph. The donor is *translated*
+    /// — its motion lives entirely in the deferred transform — because that is the
+    /// request the parameter exists for: an arc that only bent local point arrays
+    /// would draw this straight.
+    #[test]
+    fn a_transform_command_carries_its_path_arc() {
+        use std::f64::consts::PI;
+
+        let mut tree = SceneTree::new();
+        let source = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        let donor = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        tree.get_mut(donor)
+            .unwrap()
+            .set_transform(Affine2::translate((4.0, 0.0)));
+
+        let mut what = spec(source, AnimationKind::Transform);
+        what.into = Some(donor);
+        what.path_arc = Some(PI);
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+
+        let centre = tree
+            .get(source)
+            .unwrap()
+            .critical_point((0.0, 0.0))
+            .unwrap();
+        // Halfway round a half-turn over a 4-unit chord: (2, 0) pushed one radius
+        // along `cross(OUT, v)`, which for v = (+4, 0) is −y.
+        assert!(
+            (centre.x - 2.0).abs() < 1e-12 && (centre.y + 2.0).abs() < 1e-12,
+            "{centre:?}"
+        );
+    }
+
+    /// Absent means straight, but a number that arrived has to be a number. The
+    /// engine propagates a non-finite angle as `NaN` geometry and cannot say so;
+    /// this is the layer that can.
+    #[test]
+    fn a_non_finite_path_arc_is_refused() {
+        let (mut tree, id) = scene_with_a_blank();
+        let donor = tree.insert(Mobject::new(rustim_mobject::shapes::square(1.0, 1.0)));
+        let mut what = spec(id, AnimationKind::Transform);
+        what.into = Some(donor);
+        what.path_arc = Some(f64::NAN);
+        assert!(matches!(
+            animation_for(&tree, &what),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "path_arc"
+        ));
     }
 
     #[test]

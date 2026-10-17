@@ -476,10 +476,13 @@ impl Animation for Scale {
 ///   (`shapes::square` / `circle` / `right_triangle`) is childless with all its
 ///   geometry in `points`, so a shape-to-shape morph is fully covered, but a
 ///   morph between two *grouped* mobjects would align only the top-level array.
-/// * **`path_arc` / `path_func`.** Manim's default is a straight lerp anyway —
-///   `path_arc = 0` is below `STRAIGHT_PATH_THRESHOLD` (`utils/paths.py:30`,
-///   `:208-209`), so the default path is `straight_path()`. The seam is a single
-///   function pointer, so curvature is additive later.
+/// * **`path_func` as a user-supplied closure.** Manim takes one; the only
+///   built-in it ships is `path_along_arc`, which this type offers as
+///   [`Transform::with_path_arc`]. An arbitrary Python callable has no
+///   counterpart that could cross a serde command boundary, and the AI layer
+///   names an animation by data, so the angle is the vocabulary. (Manim's own
+///   default is a straight lerp: `path_arc = 0` is below
+///   `STRAIGHT_PATH_THRESHOLD`, `utils/paths.py:30`.)
 /// * **Sheen.** [`Style`] has no `sheen_direction` / `sheen_factor`; there is
 ///   nothing to interpolate.
 ///
@@ -497,6 +500,9 @@ pub struct Transform {
     target: Mobject,
     start: Option<Start>,
     duration: f64,
+    /// Manim's `path_arc`: the angle each point's route subtends. `None` is a
+    /// straight lerp, which is what Manim does when no `path_func` is given.
+    path_arc: Option<f64>,
 }
 
 /// What `begin` captured, once, never to be recomputed.
@@ -527,11 +533,39 @@ impl Transform {
             target,
             start: None,
             duration: 1.0,
+            path_arc: None,
         }
     }
 
     pub fn with_duration(mut self, seconds: f64) -> Self {
         self.duration = seconds;
+        self
+    }
+
+    /// Route every point along an arc of `radians` instead of a straight line.
+    ///
+    /// Manim's `Transform(path_arc=…)`, which builds
+    /// [`path_along_arc`](rustim_math::paths::path_along_arc). The sign chooses
+    /// which way the path bows; `0`, and anything smaller than
+    /// `STRAIGHT_PATH_THRESHOLD`, is the straight line.
+    ///
+    /// # The arc is measured in the parent's space, and costs the deferred form
+    ///
+    /// Manim's points *are* world points, so its arc bows the real route. Here a
+    /// node's points are local and part of its displacement may sit in
+    /// [`Mobject::transform`]. Arcing only the local arrays would make
+    /// `path_arc` a no-op for the commonest request — "move this there along an
+    /// arc", expressed as a translated target — so the arc is computed between
+    /// the two *parent-space* points (`from_transform · a` and
+    /// `to_transform · b`) and the result is written back as local points with an
+    /// identity transform.
+    ///
+    /// That is the one cost, and it is paid only when an arc is asked for: the
+    /// object stops being a deferred transform for the duration of the morph.
+    /// Plain `Transform` keeps it, which is the O(1) property the architecture
+    /// is built on.
+    pub fn with_path_arc(mut self, radians: f64) -> Self {
+        self.path_arc = Some(radians);
         self
     }
 }
@@ -571,18 +605,42 @@ impl Animation for Transform {
         // `alpha = 0` that is what grows a 3-curve triangle into the 4-curve shape
         // the target is expressed in. Manim assigns wholesale too
         // (`mobject.py:3303`).
-        m.points = start
-            .from_points
-            .iter()
-            .zip(start.to_points.iter())
-            .map(|(a, b)| Point::new(lerp_scalar(a.x, b.x, alpha), lerp_scalar(a.y, b.y, alpha)))
-            .collect();
+        m.points = match self.path_arc {
+            // Manim applies the path function to the *aligned* arrays, per point,
+            // and to nothing else — the affine and the style still interpolate
+            // linearly. Its arrays are world points; see `path_point` for why
+            // these are folded into the parent's space first.
+            Some(arc) => start
+                .from_points
+                .iter()
+                .zip(start.to_points.iter())
+                .map(|(a, b)| {
+                    path_point(
+                        arc,
+                        start.from_transform,
+                        *a,
+                        self.target.transform,
+                        *b,
+                        alpha,
+                    )
+                })
+                .collect(),
+            None => start
+                .from_points
+                .iter()
+                .zip(start.to_points.iter())
+                .map(|(a, b)| {
+                    Point::new(lerp_scalar(a.x, b.x, alpha), lerp_scalar(a.y, b.y, alpha))
+                })
+                .collect(),
+        };
 
-        m.set_transform(lerp_affine(
-            start.from_transform,
-            self.target.transform,
-            alpha,
-        ));
+        m.set_transform(match self.path_arc {
+            // The arc branch wrote parent-space coordinates into `points`;
+            // carrying the lerped affine as well would apply the motion twice.
+            Some(_) => Affine2::IDENTITY,
+            None => lerp_affine(start.from_transform, self.target.transform, alpha),
+        });
         m.opacity = lerp_scalar(start.from_opacity, self.target.opacity, alpha);
         m.style = Style::lerp(start.from_style, self.target.style, alpha);
         m.dirty.style = true;
@@ -885,6 +943,37 @@ pub(crate) fn lerp_affine(a: Affine2, b: Affine2, t: f64) -> Affine2 {
     Affine2::new(out)
 }
 
+/// One point's position at `alpha` when the morph follows an arc.
+///
+/// The two sides are folded through their own transforms first, because
+/// [`path_along_arc`](rustim_math::paths::path_along_arc) describes a route in
+/// the space the road is actually drawn in — Manim's points are world points, and
+/// a straight evaluation of the local arrays would be a no-op for every morph
+/// whose displacement lives in the deferred transform. The caller writes the
+/// result back with an identity transform, which is what keeps the route honest.
+///
+/// Both ends are **written, not computed**. `path_along_arc(arc, a, b, 1.0)` is a
+/// rotation that lands on `b` only to within rounding, so a settled animation
+/// would leave the object a few ulps from its target; a scene that then
+/// transforms *again* would drift. Manim computes both ends; this engine's
+/// "the end state is written" rule is the older claim, and it wins.
+pub(crate) fn path_point(
+    arc: f64,
+    from: Affine2,
+    a: Point,
+    to: Affine2,
+    b: Point,
+    alpha: f64,
+) -> Point {
+    if alpha <= 0.0 {
+        return from * a;
+    }
+    if alpha >= 1.0 {
+        return to * b;
+    }
+    rustim_math::paths::path_along_arc(arc, from * a, to * b, alpha)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,6 +1233,87 @@ mod tests {
             Affine2::translate((3.0, 0.0)),
             "halfway between the source's identity and the target's offset"
         );
+    }
+
+    /// `path_arc` has to bend a **translation**, not only a change of shape.
+    ///
+    /// "Move this there along an arc" is the request the parameter exists for,
+    /// and a translated target keeps its motion in the deferred transform. Arcing
+    /// the local arrays alone would draw a straight line with no sign that the
+    /// angle was ignored, which is the failure this test exists to prevent.
+    #[test]
+    fn a_path_arc_bends_a_translation() {
+        use std::f64::consts::PI;
+
+        let (mut tree, id) = scene(square());
+        let mut target = square();
+        target.transform = Affine2::translate((4.0, 0.0));
+
+        let mut anim = Transform::new(id, target).with_path_arc(PI);
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+
+        let centre = tree.get(id).unwrap().critical_point((0.0, 0.0)).unwrap();
+        // A half-turn over a 4-unit chord passes one radius (2) along
+        // `cross(OUT, v)`; for v = (+4, 0) that is −y. A straight morph would be
+        // at (2, 0).
+        assert!(
+            (centre.x - 2.0).abs() < 1e-12 && (centre.y + 2.0).abs() < 1e-12,
+            "{centre:?}"
+        );
+    }
+
+    /// Both ends are written, not computed: the start is the object's own
+    /// geometry and the end is the target's, exactly. `path_along_arc` at
+    /// `alpha = 1` is a rotation that lands on the endpoint only to within
+    /// rounding, and a morph that settles a few ulps off becomes a drift under a
+    /// second morph.
+    #[test]
+    fn a_path_arc_writes_both_ends_exactly() {
+        use std::f64::consts::FRAC_PI_2;
+
+        let (mut tree, id) = scene(square());
+        let before = tree.get(id).unwrap().materialize();
+        let mut target = square();
+        target.transform = Affine2::translate((4.0, 0.0));
+        let end = target.materialize();
+
+        let mut anim = Transform::new(id, target).with_path_arc(FRAC_PI_2);
+        anim.begin(&tree);
+        anim.interpolate(0.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().materialize(), before);
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().materialize(), end);
+    }
+
+    /// Below `STRAIGHT_PATH_THRESHOLD` an angle is Manim's straight path, and it
+    /// must agree with the un-arced morph. Compared in world space because the
+    /// two store it differently — the arc branch folds the transform into the
+    /// points, the plain one leaves it deferred.
+    #[test]
+    fn a_sub_threshold_path_arc_draws_the_same_line_as_no_arc() {
+        let run = |arc: Option<f64>| {
+            let (mut tree, id) = scene(square());
+            let mut target = square();
+            target.transform = Affine2::translate((4.0, 2.0));
+            let mut anim = Transform::new(id, target);
+            if let Some(arc) = arc {
+                anim = anim.with_path_arc(arc);
+            }
+            anim.begin(&tree);
+            anim.interpolate(0.5, &mut tree);
+            tree.get(id).unwrap().materialize()
+        };
+
+        let straight = run(None);
+        let tiny = run(Some(rustim_math::paths::STRAIGHT_PATH_THRESHOLD / 2.0));
+        assert_eq!(straight.len(), tiny.len());
+        for (a, b) in straight.iter().zip(&tiny) {
+            assert!(
+                (a.x - b.x).abs() < 1e-12 && (a.y - b.y).abs() < 1e-12,
+                "{a:?} vs {b:?}"
+            );
+        }
     }
 
     /// The donor is read-only.

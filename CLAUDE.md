@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **468 tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **479 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
@@ -160,9 +160,10 @@ from, which is why `/media` is in `.gitignore`. Render a reference frame with:
 /tmp/manim-venv/bin/python -m manim -s -r 1280,720 scene.py SceneName
 ```
 
-**Manim numerical parity (`rustim-math`).** `crates/rustim-math/src/bezier.rs` and `space_ops.rs` are
-literal ports of `manim.utils.bezier` and `manim.utils.space_ops`, and
-`crates/rustim-math/tests/manim_parity.rs` replays **495 recorded Manim results** against them
+**Manim numerical parity (`rustim-math`).** `crates/rustim-math/src/bezier.rs`, `space_ops.rs` and
+`paths.rs` are literal ports of `manim.utils.bezier`, `manim.utils.space_ops` and `manim.utils.paths`,
+and
+`crates/rustim-math/tests/manim_parity.rs` replays **715 recorded Manim results** against them
 (`tests/fixtures/manim-{bezier,geometry,space-ops}.json`, checked in — the suite needs no Python).
 The acceptance rule is `1e-9` absolute on every coordinate, with no "close enough" allowances: the
 ports reproduce Manim's *rounding paths*, not just its formulas, which is the only way the numbers
@@ -270,10 +271,10 @@ last property.
 
 | Crate | Contents | Status |
 |---|---|---|
-| `rustim-math` | Points, `Affine2`, rate functions, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` | Real |
+| `rustim-math` | Points, `Affine2`, rate functions, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` / `paths` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
-| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `TransformGroup` (family morph), `CameraMove`, `Wait` | Real |
+| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
@@ -585,11 +586,48 @@ The donor is read once and never written, and the source keeps its own `NodeId`,
 the same limit `Transform` has: nothing in the engine knows a square became a circle, so a caller
 that cares has to relabel (see "Accessibility" for what `--inspect` showed when one did not).
 
-On the wire it is `{"type":"transform","target":A,"into":B}`, with `into` a node id that must
-already exist (the field sits between `about_point` and `animations` in declaration order). Two morphs
+On the wire it is `{"type":"transform","target":A,"into":B}` (plus the optional `path_arc`, see the
+next section), with `into` a node id that must already exist. Two morphs
 the engine refuses by staying still — a shape into a group (`null_point_align` is not ported) and a
 node into itself or its own ancestor — are refused by `animation_for` with a `CommandError` instead,
 because a host told a beat played healthy should not find it did nothing.
+
+### Morph routes: `path_arc`
+
+Manim's `Transform(path_arc=…)` bends every point's route into an arc
+(`utils/paths.py:96-140`). `rustim_math::paths::path_along_arc` is a literal port of that function,
+covered by 220 recorded cases like the rest of the parity suite. Four things about it are decisions,
+not accidents:
+
+- **It is a per-point function of an angle, not a closure.** Manim builds a `path_func` closure and
+  stores it on the animation. A closure cannot cross the serde command boundary and the AI layer
+  names an animation by data, so the animation stores the `f64` and calls the function per point.
+  Dropping Manim's `axis` argument is what lets the signature be a plain `fn`: the only axis this
+  engine can express is out of the screen, so it is `OUT` by construction rather than by argument.
+- **The arc is measured in the parent's space, and costs the deferred transform.** Manim's points are
+  world points, so its arc bends the real route. Here a node's points are local and part of its
+  displacement may sit in `Mobject::transform`; arcing the local arrays alone would make `path_arc` a
+  **no-op for the commonest request** — "move this there along an arc", written as a translated
+  target. So both sides are folded through their own transforms first (`from_transform · a`,
+  `to_transform · b`), the arc is taken there, and the result is written back as local points with an
+  **identity** transform. A plain `Transform` keeps its O(1) deferred transform; only an arced one
+  pays with it, and only while it runs.
+- **Both ends are written, not computed.** `path_along_arc` at `alpha = 1` is a rotation that lands on
+  the endpoint only to within rounding; a morph that settles a few ulps off its target becomes a drift
+  under a second morph, and reduced motion must produce the full-motion settled frame. `path_point`
+  returns the endpoints exactly. This is a deliberate divergence from Manim, which computes both.
+- **`0` is the straight path, and so is anything below `STRAIGHT_PATH_THRESHOLD` (0.01).** The
+  sub-threshold branch is `(1 − a)·start + a·end`, in that order, because that is Manim's
+  `straight_path` — not `start + (end − start)·a`. The sign of the perpendicular is
+  `cross(OUT, v/2) = (−v.y/2, v.x/2)`; the other operand order is the same vector negated, which bows
+  the path inside out while every endpoint still matches.
+
+`TransformGroup::with_path_arc` applies the same rule per child, each in its own parent's space, so a
+child whose motion is entirely deferred still bends. On the wire it is one more optional field:
+`{"type":"transform","target":A,"into":B,"path_arc":1.2}`. Declaration order is
+`… duration, into, path_arc, animations`, so serde writes it in that order; absent is omitted, never
+`null`, and a non-finite angle is refused under `path_arc` (every *finite* angle is legitimate —
+Manim 0.22 performs no range check, and `±π` are its own `clockwise_path` / `counterclockwise_path`).
 
 ### Reduced motion
 
@@ -925,6 +963,17 @@ nothing, and that the fix must be checked in the image too. `bezier::anchors`, `
 control points sit at `r * sqrt(1 + k²)` ≈ 1.142 r. Any test asserting "every point is at radius r"
 is wrong; assert it of the on-curve points, and bound the curve's midpoint excursion (measured: under
 1/3000 of the radius).
+
+**A per-point route must be taken between parent-space points, not local ones.** Manim's `points`
+are world coordinates, so `path_along_arc`, `pointwise_become_partial` and every other per-point
+Manim routine assumes the array it is handed is the object actually travels in. Here points are
+local and a mobject's displacement can live entirely in its deferred `transform` — so a
+`path_arc` evaluated on the local arrays is **exactly a straight line for the commonest request**,
+"move this there along an arc", and the object still arrives where the caller asked, which is what
+makes it look like a feature that works. `path_arc` folds both sides through their own transforms
+before arcing and writes the result back with an identity transform (see "Morph routes"). The same
+question has to be asked of any future per-point operation: `align_points` is safe because it only
+pairs corresponding *local* points, but anything that measures a route is not.
 
 **Do not hand-derive a figure's bounds.** The Pythagorean figure is 10 units tall and 11 wide, not
 `a + b = 7` tall — the square on the hypotenuse reaches y = 7 while the largest square reaches y = −3.
@@ -1339,8 +1388,9 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   `null_point_align` and the transparent-placeholder padding with its per-child recursion
   (`mobject.py:3149-3227`) — every shape in `rustim-mobject` today is childless with all geometry in
   `points`, so a shape-to-shape morph is fully covered while a *group*-to-group morph would align only
-  the top-level array. `path_arc` / `path_func` (the default is a straight lerp, and the seam is one
-  function pointer, so it is additive later) and sheen (`Style` has no `sheen_direction`) are out for
+  the top-level array. `path_func` as a user-supplied closure is out — the one built-in it ships is
+  `path_along_arc`, which this engine does have (see "Morph routes: `path_arc`"), and an arbitrary
+  callable cannot cross a serde command boundary. Sheen (`Style` has no `sheen_direction`) is out for
   the same reason.
   **What the accessibility work learned from it:** a `Transform` moves geometry and says nothing
   about what the object *is*, and it cannot — nothing in the engine knows a triangle has become a
@@ -1414,8 +1464,8 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   Deferred at the time, since landed: **strokes in the mobject model** (see "Strokes") and
   `Create`/`Uncreate` (see "P3's Create/Uncreate"). Deferred on purpose: `Rotating` (an animation
   that never ends makes `is_playing` permanently true, which every "react when the timeline drains"
-  scene depends on), `path_arc` for a straight move, and `FadeIn`'s `shift`/`scale`; axes and plots
-  landed with P3's camera ("P3's coordinate systems are done").
+  scene depends on) and `FadeIn`'s `shift`/`scale`; `path_arc` landed with the P3 morph work (see
+  "Morph routes"), and axes and plots landed with P3's camera ("P3's coordinate systems are done").
 - **The command feed — the first slice of P3's "AI command surface at full width" — is done**, and it
   is the step that made the engine *drivable* rather than merely scriptable: `--script` applies a file
   of JSON commands or reads stdin line by line, `--reply` answers each one, and a windowed run takes
@@ -1523,8 +1573,21 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   refusals, the round-trip JSON case, and two `--script` runs (`--inspect` shows the source wearing
   the donor's measured size while keeping its own name; a missing `into` is refused under
   `"into"`). **No golden moved**: no compiled scene morphs a family yet, so the eight baselines are
-  unchanged. Deferred: `null_point_align` (a shape ↔ group morph, refused rather than approximated),
-  and per-child `path_arc`.
+  unchanged. Deferred: `null_point_align` (a shape ↔ group morph, refused rather than approximated).
+- **P3's morph routes — `path_arc` — are done**, on both `Transform` and `TransformGroup`. The step's
+  finding is that an arc has to be measured in the **parent's space**: Manim's points are world points,
+  so arcing the local arrays alone would draw a straight line for "move this there along an arc",
+  where the displacement sits in the deferred transform and the local arrays are identical on both
+  sides. `path_point` folds each side through its transform (`from_transform · a`,
+  `to_transform · b`), arcs there, and writes back with an **identity** transform — the one place the
+  deferred-transform architecture is deliberately set aside, and only while an arced morph runs. Both
+  ends are written rather than rotated into place (`path_along_arc` at `alpha = 1` lands on the
+  endpoint only to within rounding), so a settled morph is exactly its target and reduced motion is
+  the full-motion end frame. `rustim_math::paths` is a literal port with 220 recorded cases at 1e-9.
+  Evidence: three leaf tests (a *translated* donor bows; both ends are exact; a sub-threshold angle
+  draws the same line as no arc), one family twin, two command tests (the angle reaches the morph; a
+  non-finite one is refused under `path_arc`), the round-trip JSON case, and the `--script` morph now
+  carrying an arc — **with the eight goldens unchanged**, since no compiled scene asks for one.
 - **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration
