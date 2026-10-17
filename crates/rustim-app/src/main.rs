@@ -1455,6 +1455,17 @@ struct App {
     pending: Vec<(u64, String)>,
     /// Whether each command's reply is printed to stdout. Off unless `--reply`.
     reply: bool,
+    /// The bottom caption band, when `--captions` asked for one.
+    ///
+    /// `None` is the default and the normal path: with no band there is not one
+    /// extra draw op, which is what keeps every golden baseline byte-identical.
+    caption: Option<rustim_app::caption::Caption>,
+    /// The live region's text as of the frame currently on screen.
+    ///
+    /// Compared against the text after `a11y.update` so a caption is set once per
+    /// change rather than every frame — `set_text` re-shapes on a new string, and
+    /// sixty identical offers a second would be sixty layout passes.
+    last_live: String,
     /// Whether this run is an `--a11y-probe`: offer one announcement at startup
     /// and print what the accessibility layer did when the loop ends. Windowed
     /// only, enforced in `main`.
@@ -1787,7 +1798,19 @@ impl ApplicationHandler<AppEvent> for App {
                 // `&mut *` rather than `&mut self.scene`: a `Box<dyn Scene>` does
                 // not coerce to `&mut dyn Scene` in argument position without the
                 // reborrow.
+                if let Some(caption) = self.caption.as_mut() {
+                    // Wall clock, not virtual: a paused scene still has to stop
+                    // showing a line nobody is reading any more.
+                    caption.expire(Instant::now());
+                }
                 build_frame(&mut *self.scene, &mut self.ctx, &mut self.list, dt);
+                // The band goes after the scene's own ops, so it is a screen
+                // layer over the picture rather than a world object in it. It is
+                // also the tail of the list, which is what makes a caption change
+                // damage only the bottom `GlyphRun`'s box.
+                if let Some(caption) = self.caption.as_mut() {
+                    caption.push_ops(&mut self.list);
+                }
                 // What changed since the frame in the pixel buffer. An idle
                 // scene — paused, or a script that has finished — produces
                 // `None`, and the frame loop then skips both the rasteriser and
@@ -1850,6 +1873,20 @@ impl ApplicationHandler<AppEvent> for App {
                 // reader is told and what is on screen describe the same state.
                 if let Some(w) = self.windowed.as_mut() {
                     w.a11y.update(&self.ctx, Instant::now());
+                    // The caption shows what the live region is saying, which is
+                    // the same sentence a screen reader would. Reading it *after*
+                    // the update means the band is one frame behind the
+                    // announcement; reading it before would show last frame's
+                    // text twice.
+                    if self.caption.is_some() {
+                        let live = w.a11y.core().live_text().to_owned();
+                        if live != self.last_live {
+                            if let Some(caption) = self.caption.as_mut() {
+                                caption.set_text(live.clone());
+                            }
+                            self.last_live = live;
+                        }
+                    }
                 }
 
                 self.frame += 1;
@@ -1899,6 +1936,7 @@ fn main() {
     let mut script: Option<String> = None;
     let mut reply = false;
     let mut probe = false;
+    let mut captions = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1956,10 +1994,15 @@ fn main() {
                 probe = true;
                 i += 1;
             }
+            "--captions" => {
+                captions = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 println!(
                     "rustim-app [--frames N] [--png OUT.png | --inspect | --a11y-probe] \
-                     [--scene NAME] [--motion full|reduced] [--script PATH|-] [--reply]"
+                     [--scene NAME] [--motion full|reduced] [--script PATH|-] [--reply] \
+                     [--captions]"
                 );
                 println!("scenes: {}", scene_names());
                 println!("--inspect: print the accessibility tree as JSON to stdout");
@@ -1972,6 +2015,10 @@ fn main() {
                      and without --scene the script gets an empty one"
                 );
                 println!("--reply: answer each command with one JSON line on stdout");
+                println!(
+                    "--captions: draw the live region's text (narration, focus, \
+                     `animation ended`) at the bottom of the frame"
+                );
                 println!(
                     "--a11y-probe: open a window, offer one announcement, and report on stderr \
                      at exit whether a screen reader attached (600 frames if --frames is absent)"
@@ -2028,6 +2075,12 @@ fn main() {
     }
     if reply && inspect {
         eprintln!("--reply and --inspect both write to stdout; run them separately");
+        std::process::exit(2);
+    }
+    // Captions are pixels. `--inspect` prints a tree and never renders one, so
+    // accepting the pair would silently drop half of what was asked for.
+    if captions && inspect {
+        eprintln!("--captions needs a frame; --inspect prints a tree");
         std::process::exit(2);
     }
 
@@ -2125,6 +2178,35 @@ fn main() {
         let mut list = DrawList::default();
         settle(&mut *scene, &mut ctx, &mut list);
 
+        if captions {
+            // The still is taken at t = 10, so the caption is whatever line is
+            // due by then — the last one, for a script that paced itself — and
+            // the scene summary when there was no narration at all. Never the
+            // *text of a caption that would have expired*: expiry is a wall-clock
+            // policy for a window, and a still has to keep what it says.
+            let objects = ctx.semantic_tree(None).nodes.len().saturating_sub(1);
+            let due = ctx.take_narration();
+            let text = due
+                .last()
+                .cloned()
+                .unwrap_or_else(|| rustim_app::caption::scene_summary(&scene_name, objects));
+            match rustim_app::caption::Caption::new() {
+                Ok(mut caption) => {
+                    caption.set_text(text);
+                    // Rebuild the list **without advancing time**: a
+                    // `build_frame(.., 0.0)` would still let `advance` start the
+                    // next queued beat, which can change the picture a still is
+                    // supposed to freeze. `build_draw_list` clears first, so this
+                    // is the same frame `settle` ended on, plus the band.
+                    scene.build_draw_list(&ctx, &mut list);
+                    caption.push_ops(&mut list);
+                }
+                // A missing font disables captions, not the render: the picture
+                // is still the answer to the question that was asked.
+                Err(e) => eprintln!("captions: {e} (rendering without them)"),
+            }
+        }
+
         let mut renderer = CpuRenderer::new(WIDTH, HEIGHT);
         renderer.render(&list).expect("render");
         rustim_export::write_png(&renderer, &path).expect("write png");
@@ -2158,6 +2240,22 @@ fn main() {
         }
     }
 
+    // Built once for the whole run: the provider parses the bundled face, and a
+    // caption that reloaded it per line would make every announcement cost a
+    // font load. A missing `assets/fonts/` disables the band and leaves the rest
+    // of the run intact.
+    let caption = if captions {
+        match rustim_app::caption::Caption::new() {
+            Ok(caption) => Some(caption),
+            Err(e) => {
+                eprintln!("captions: {e} (continuing without them)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut app = App {
         windowed: None,
         proxy,
@@ -2175,6 +2273,8 @@ fn main() {
         pending: Vec::new(),
         reply,
         probe,
+        caption,
+        last_live: String::new(),
         feed: feed::Counts::default(),
         mods: ModifiersState::empty(),
         paused: false,

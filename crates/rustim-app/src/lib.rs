@@ -24,6 +24,7 @@
 
 pub mod a11y;
 pub mod announce;
+pub mod caption;
 pub mod feed;
 pub mod input;
 pub mod motion;
