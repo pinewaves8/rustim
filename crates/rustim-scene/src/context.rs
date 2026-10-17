@@ -6,7 +6,7 @@ use rustim_mobject::{NodeId, SceneTree};
 use rustim_render::{DrawList, DrawOp};
 
 use crate::a11y;
-use crate::command::{self, Command, CommandError, StateDiff};
+use crate::command::{self, Command, CommandError, CommandOutcome, StateDiff};
 
 /// A scene: the user-facing entry point, mirroring Manim's `construct()`.
 ///
@@ -321,12 +321,13 @@ impl SceneContext {
 
     /// Apply a command from outside the engine.
     ///
-    /// [`Command::Play`], [`Command::Camera`], [`Command::Motion`] and
-    /// [`Command::Narrate`] are answered **here** rather than in `command::apply`:
-    /// a play needs the playback machine, a camera command needs the playback
-    /// machine *or* the viewport's aspect ratio (for `focus`), a motion command
-    /// names a field on this context rather than in the tree, a narration needs
-    /// the virtual clock and its own track, and `apply`'s documented purity —
+    /// [`Command::Play`], [`Command::Camera`], [`Command::Motion`],
+    /// [`Command::Narrate`] and [`Command::Query`] are answered **here** rather
+    /// than in `command::apply`: a play needs the playback machine, a camera
+    /// command needs the playback machine *or* the viewport's aspect ratio (for
+    /// `focus`), a motion command names a field on this context rather than in
+    /// the tree, a narration needs the virtual clock and its own track, a query
+    /// needs the viewport to project bounds — and `apply`'s documented purity —
     /// "pure with respect to everything except `tree`: no clock, no I/O, no
     /// renderer" — is what makes the rest of the protocol testable in isolation
     /// and replayable.
@@ -356,15 +357,23 @@ impl SceneContext {
     /// tree change. It refuses two things a model can easily send: nothing to
     /// say (`text` trims to empty) and a delay that is negative or not finite
     /// (`at`). Both name the field that was wrong.
-    pub fn handle(&mut self, cmd: &Command) -> Result<StateDiff, CommandError> {
+    ///
+    /// A [`Command::Query`] is the one command answered with a *document* rather
+    /// than a diff: [`CommandOutcome::Queried`] carries the same
+    /// [`a11y::SemanticTree`] `--inspect` prints, projected against this
+    /// context's viewport and the tree's current camera. A `target` narrows it
+    /// to that node's subtree and is refused when the node does not exist. The
+    /// `live` field is `None` — the announcement text belongs to a host's
+    /// accessibility layer, not to the kernel.
+    pub fn handle(&mut self, cmd: &Command) -> Result<CommandOutcome, CommandError> {
         if let Command::Play { animation } = cmd {
             let anim = command::animation_for(&self.tree, animation)?;
             self.play_all([anim]);
-            return Ok(StateDiff::default());
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Motion { mode } = cmd {
             self.motion = (*mode).into();
-            return Ok(StateDiff::default());
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Narrate { text, at } = cmd {
             let text = text.trim();
@@ -385,7 +394,7 @@ impl SceneContext {
             // already is: a file feed applies every line at t = 0, so the delay
             // is the only thing that keeps the lecture in order.
             self.narration.push((self.clock + delay, text.to_owned()));
-            return Ok(StateDiff::default());
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Camera {
             center,
@@ -399,9 +408,26 @@ impl SceneContext {
                 None => self.tree.camera = to,
                 Some(seconds) => self.play(CameraMove::new(to).with_duration(seconds)),
             }
-            return Ok(StateDiff::default());
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
-        command::apply(&mut self.tree, cmd)
+        if let Command::Query { target } = cmd {
+            let tree = self.semantic_tree(None);
+            let tree = match target {
+                None => tree,
+                // The refusal is `NoSuchNode` rather than an empty subtree: a
+                // host that asked about a node it believes exists has a bug or
+                // a stale id, and a document with no nodes reads as "it is
+                // empty", which is a different (and false) answer.
+                Some(id) => tree
+                    .subtree(*id)
+                    .ok_or(CommandError::NoSuchNode { target: *id })?,
+            };
+            return Ok(CommandOutcome::Queried(tree));
+        }
+        Ok(CommandOutcome::Applied(command::apply(
+            &mut self.tree,
+            cmd,
+        )?))
     }
 
     /// Where the view is looking.
@@ -529,6 +555,15 @@ mod tests {
     /// The frame grid. Virtual time, never wall-clock — the same `1/60` the app's
     /// frame loop and the golden capture use.
     const DT: f64 = 1.0 / 60.0;
+
+    /// `handle` for the mutating commands these tests send, with the read half
+    /// spelled as the panic it would be to see here.
+    fn applied(ctx: &mut SceneContext, cmd: &Command) -> StateDiff {
+        match ctx.handle(cmd).expect("a well-formed command") {
+            CommandOutcome::Applied(diff) => diff,
+            CommandOutcome::Queried(_) => panic!("a query is not a mutation"),
+        }
+    }
 
     fn scene() -> SceneContext {
         scene_at(Motion::Full)
@@ -732,9 +767,93 @@ mod tests {
         let cmd: Command =
             serde_json::from_str(r#"{"action":"add","type":"square","params":{"width":3.0}}"#)
                 .unwrap();
-        let diff = ctx.handle(&cmd).unwrap();
+        let diff = applied(&mut ctx, &cmd);
         assert_eq!(ctx.root_ids(), diff.created.as_slice());
         assert_eq!(ctx.tree.len(), 1);
+    }
+
+    /// A query answers with the document `--inspect` prints — the *same*
+    /// projection, not a second read format — and with no diff.
+    ///
+    /// The camera is moved first on purpose: the snapshot must be of the tree
+    /// as it is now, and pixel bounds only mean something when the view that
+    /// produced them rides along.
+    #[test]
+    fn a_query_answers_with_the_semantic_tree() {
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        ctx.tree.get_mut(id).unwrap().label = Some("方块".to_owned());
+        applied(&mut ctx, &camera_cmd(Some([1.0, 0.0]), Some(2.0), None));
+
+        let outcome = ctx.handle(&Command::Query { target: None }).unwrap();
+        let CommandOutcome::Queried(tree) = outcome else {
+            panic!("a query is a read, not a mutation");
+        };
+        assert_eq!(tree.nodes.len(), 2, "the synthetic root and one mobject");
+        assert_eq!(tree.root, crate::a11y::ROOT);
+        assert_eq!(tree.camera.center, [1.0, 0.0]);
+        assert_eq!(tree.camera.zoom, 2.0);
+        assert!(
+            tree.live.is_none(),
+            "the announcement text belongs to the host, not the kernel"
+        );
+        let node = tree.get(id).expect("the square is in the document");
+        assert_eq!(node.name, "方块");
+        assert!(node.bounds.is_some(), "bounds are measured, not declared");
+        assert_eq!(
+            tree,
+            ctx.semantic_tree(None),
+            "a query is the accessibility projection, not a third view of the scene"
+        );
+    }
+
+    /// A targeted query keeps the node and everything under it, and refuses a
+    /// node that is not there rather than answering with an empty document.
+    #[test]
+    fn a_query_with_a_target_keeps_only_that_subtree() {
+        let mut ctx = scene();
+        let parent = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        let child = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Circle,
+            &ShapeParams::default(),
+        ));
+        let sibling = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Circle,
+            &ShapeParams::default(),
+        ));
+        assert!(ctx.tree.reparent(child, parent));
+
+        let outcome = ctx
+            .handle(&Command::Query {
+                target: Some(parent),
+            })
+            .unwrap();
+        let CommandOutcome::Queried(tree) = outcome else {
+            panic!("a query is a read");
+        };
+        assert_eq!(tree.root, parent, "the subtree is the document now");
+        let ids: Vec<NodeId> = tree.nodes.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&parent) && ids.contains(&child));
+        assert!(!ids.contains(&sibling), "a sibling is not in the subtree");
+        assert_eq!(tree.get(parent).unwrap().children, [child]);
+
+        let ghost = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Circle,
+            &ShapeParams::default(),
+        ));
+        ctx.tree.remove(ghost);
+        assert!(matches!(
+            ctx.handle(&Command::Query {
+                target: Some(ghost)
+            }),
+            Err(CommandError::NoSuchNode { .. })
+        ));
     }
 
     #[test]
@@ -1028,11 +1147,12 @@ mod tests {
             "full motion, a slice of the way: {partial}"
         );
 
-        let diff = ctx
-            .handle(&Command::Motion {
+        let diff = applied(
+            &mut ctx,
+            &Command::Motion {
                 mode: command::MotionMode::Reduced,
-            })
-            .expect("a motion command is a value, never a refusal");
+            },
+        );
         assert_eq!(ctx.motion, Motion::Reduced);
         assert_eq!(
             diff,
@@ -1126,7 +1246,7 @@ mod tests {
             },
         };
 
-        let diff = ctx.handle(&cmd).unwrap();
+        let diff = applied(&mut ctx, &cmd);
         assert!(
             diff.is_empty(),
             "the tree is unchanged until the beat plays"
@@ -1211,9 +1331,7 @@ mod tests {
     #[test]
     fn a_camera_command_without_a_duration_sets_the_camera_now() {
         let mut ctx = scene();
-        let diff = ctx
-            .handle(&camera_cmd(Some([2.0, -1.0]), Some(2.0), None))
-            .unwrap();
+        let diff = applied(&mut ctx, &camera_cmd(Some([2.0, -1.0]), Some(2.0), None));
         assert!(
             diff.is_empty(),
             "the view is not a node, so nothing changed"
@@ -1242,9 +1360,7 @@ mod tests {
     #[test]
     fn a_camera_command_with_a_duration_queues_one_beat() {
         let mut ctx = scene();
-        let diff = ctx
-            .handle(&camera_cmd(Some([2.0, 0.0]), None, Some(0.5)))
-            .unwrap();
+        let diff = applied(&mut ctx, &camera_cmd(Some([2.0, 0.0]), None, Some(0.5)));
         assert!(diff.is_empty());
         assert!(ctx.is_playing(), "the beat is queued");
         assert_eq!(
@@ -1310,6 +1426,10 @@ mod tests {
         ctx.handle(&Command::Narrate {
             text: text.to_owned(),
             at,
+        })
+        .map(|outcome| match outcome {
+            CommandOutcome::Applied(diff) => diff,
+            CommandOutcome::Queried(_) => panic!("narration is not a query"),
         })
     }
 

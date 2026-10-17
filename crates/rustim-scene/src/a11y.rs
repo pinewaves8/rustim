@@ -217,6 +217,43 @@ impl SemanticTree {
     pub fn get(&self, id: NodeId) -> Option<&SemanticNode> {
         self.nodes.iter().find(|n| n.id == id)
     }
+
+    /// This tree with only the nodes reachable from `root`, which becomes the
+    /// snapshot's root.
+    ///
+    /// `None` when the tree has no such node — the same refusal a command naming
+    /// a deleted id gets. The relation is read from the snapshot's own
+    /// `children` lists rather than from a `SceneTree`, so this is a projection
+    /// of *this* document: what a reader would navigate to from `root` is
+    /// exactly what it keeps.
+    ///
+    /// Order is the original draw order, because a subtree of a document is a
+    /// document and the fields (`camera`, `live`) describe the same frame as
+    /// before. `root` moves, which is the one difference a caller has to
+    /// notice: bounds downstream are still screen pixels, and the ids are
+    /// unchanged, so a host can keep addressing the nodes it already has.
+    pub fn subtree(&self, root: NodeId) -> Option<Self> {
+        self.get(root)?;
+        // A `Vec` rather than a set: these trees hold tens of nodes, and the
+        // preserve-draw-order promise is a property of `retain` over `nodes`,
+        // which a hash set would still need this list to drive.
+        let mut keep = vec![root];
+        let mut next = 0;
+        while next < keep.len() {
+            if let Some(node) = self.get(keep[next]) {
+                for child in &node.children {
+                    if !keep.contains(child) {
+                        keep.push(*child);
+                    }
+                }
+            }
+            next += 1;
+        }
+        let mut out = self.clone();
+        out.root = root;
+        out.nodes.retain(|node| keep.contains(&node.id));
+        Some(out)
+    }
 }
 
 /// Project a scene tree. Pure: no clock, no I/O, no renderer, so the same tree

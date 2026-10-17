@@ -250,6 +250,81 @@ fn the_reply_stream_names_each_command_and_what_it_changed() {
     );
 }
 
+/// A query is answered with the document `--inspect` prints, over the same
+/// transport.
+///
+/// The point of the test is the *shape* of the reply: a read carries `tree` and
+/// no `diff`, so a host reading the stream never mistakes a query for a mutation
+/// that changed nothing. The ids are the deterministic ones a fresh scene hands
+/// out (`4294967297` is the first slot's first generation), which is what lets a
+/// script file name the object it just added — the same convention the checked-in
+/// session fixture uses.
+#[test]
+fn a_query_answers_with_the_tree_and_no_diff() {
+    let script = scratch(
+        "query",
+        concat!(
+            r#"{"action":"add","type":"square","params":{"label":"方块"}}"#,
+            "\n",
+            r#"{"action":"query"}"#,
+            "\n",
+            r#"{"action":"query","target":4294967297}"#,
+            "\n",
+            r#"{"action":"query","target":999}"#,
+            "\n",
+        ),
+    );
+    // `--png` is what selects the headless run: `--script --reply` alone is a
+    // windowed session, and a test must not wait for someone to close a window.
+    let ran = run(&[
+        "--script",
+        script.to_str().unwrap(),
+        "--reply",
+        "--png",
+        out_path("query").to_str().unwrap(),
+    ]);
+    ran.ok("--script … --reply --png");
+    let replies = ran.replies();
+    assert_eq!(replies.len(), 4, "one reply per line, blank lines excluded");
+
+    let whole = replies[1]
+        .tree
+        .as_ref()
+        .expect("a query is answered with a document");
+    assert!(
+        replies[1].diff.is_none() && replies[1].error.is_none(),
+        "a read is neither a mutation nor a refusal"
+    );
+    assert_eq!(whole.nodes.len(), 2, "the synthetic root and the square");
+    assert!(
+        whole.nodes.iter().any(|n| n.name == "方块"),
+        "the label the add gave the object is in the document"
+    );
+    assert!(
+        whole
+            .nodes
+            .iter()
+            .all(|n| n.bounds.is_some() || n.name.is_empty()),
+        "bounds are measured for every real object, root excepted"
+    );
+
+    let subtree = replies[2].tree.as_ref().expect("the targeted query");
+    assert_eq!(subtree.nodes.len(), 1, "a leaf's subtree is itself");
+    assert_eq!(subtree.root.raw(), 4294967297);
+
+    // The refusal names the id **the engine holds**, which normalises the
+    // generation bit a host does not send — so the number in the message is
+    // `from_raw(999).raw()`, not the 999 that was typed. See `NodeId`'s doc.
+    let ghost = rustim_scene::NodeId::from_raw(999);
+    let expected = format!("no such node: {}", ghost.raw());
+    assert_eq!(
+        replies[3].error.as_ref().map(|e| format!("{e}")).as_deref(),
+        Some(expected.as_str()),
+        "a targeted query on a node that is not there is a value, not an empty document"
+    );
+    assert!(replies[3].tree.is_none());
+}
+
 /// A refused command is answered, and the session continues.
 ///
 /// This is the whole posture of the command layer — a refusal is a value, never a

@@ -248,15 +248,15 @@ impl Session {
         self.seq += 1;
         let seq = self.seq;
         let parsed = parse_command(line)?;
-        let outcome = parsed.and_then(|cmd| match self.ctx.handle(&cmd) {
-            Ok(diff) => {
-                // The scene-visible hook, called from every route that reached
-                // the tree — the feed and the keyboard on the desktop, the
-                // command box here.
-                self.scene.on_command(&diff, &mut self.ctx);
-                Ok(diff)
+        let outcome = parsed.and_then(|cmd| {
+            let outcome = self.ctx.handle(&cmd)?;
+            // The scene-visible hook, called from every route that reached the
+            // tree — the feed and the keyboard on the desktop, the command box
+            // here — and not for a query, which changed nothing.
+            if let Some(diff) = outcome.diff() {
+                self.scene.on_command(diff, &mut self.ctx);
             }
-            Err(e) => Err(e),
+            Ok(outcome)
         });
         Some(reply_line(seq, outcome))
     }

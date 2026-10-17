@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **589 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **595 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -1176,8 +1176,9 @@ neither.
 Deferred, deliberately: keyboard/pointer input and focus commands (the Web version promises "a
 screen reader can read the structure", not interaction); font subsetting and lazy loading (the
 two-page split is the packaging answer for now, and a CJK formula on the web needs fonts
-`from_embedded` does not carry); WebCodecs/`MediaRecorder` export (the `VideoSink` seam is the
-place it goes); and the query command, which is missing on both hosts.
+`from_embedded` does not carry); and WebCodecs/`MediaRecorder` export (the `VideoSink` seam is the
+place it goes). The query command is *not* deferred any more — `Session::apply` answers it through
+the same `reply_line` the desktop feed uses.
 
 ### Naming
 
@@ -1923,7 +1924,8 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   find in their own script; and `--reply` exposed that `--png` and the frame-rate line both wrote to
   stdout, so `main::note` now routes every informational line to stderr when stdout is protocol. What
   it deliberately leaves for P3+: the query command (no way to read a live tree), label addressing,
-  and a merged `--reply`/`--inspect`. See "The feed" under AI integration.
+  and a merged `--reply`/`--inspect`. See "The feed" under AI integration. **The query command has
+  since landed** (P3+ step 22a, below); label addressing and stop/interrupt are the remaining two.
 - **P3's camera is done** (the first half of the `axes`/`plot` step). `Viewport` was cut down to the
   window, `Camera` moved onto `SceneTree`, `CameraMove` joined the animation set, and
   `{"action":"camera","center"?,"zoom"?,"focus"?,"duration"?}` joined the protocol — see "The
@@ -2107,7 +2109,20 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   an id and refusing broken JSON; two artifacts at 629 375 B and 14 353 728 B gzip -9; 589 workspace
   tests and both wasm clippy runs clean. Deferred: keyboard/pointer input, font subsetting,
   WebCodecs export (above).
-- **P3+** — the AI command surface at full width.
+- **P3+ step 22a — the query command — is done.** `{"action":"query","target"?}` answers with the
+  `SemanticTree` `--inspect` prints, as a third reply presence beside `diff` and `error` (see "AI
+  integration" for the rules). The step's structural change is `CommandOutcome`: `handle` used to
+  return a `StateDiff`, and a read has no diff to give, so the two hosts now pass an
+  `Applied`/`Queried` value to `reply_line` and cannot disagree about which field answers which
+  command. `SemanticTree::subtree` is the targeted half — reachable-set walk over the document's own
+  `children`, draw order preserved, `root` moved to the target. Evidence: the round-trip case (both
+  spellings), a reply-shape test asserting all three presences and their absences, a context test
+  that a query equals `semantic_tree(None)` under a moved camera (so there is one projection, not a
+  second read format), a subtree test with a sibling outside it and a deleted id refused, a feed test
+  that a query reaches no `on_command`, a browser-session test, and an end-to-end `--script --reply`
+  case over the real binary. **No golden moved**: a query draws nothing.
+- **P3+** — the AI command surface at full width: label addressing (22b) and stop/interrupt (22c)
+  remain.
 
 ## AI integration
 
@@ -2144,6 +2159,21 @@ beat started** will be given, without touching the beat already running; `narrat
 the narration track, due `at` seconds after it arrived (see "Narration, captions and
 self-voicing").
 
+**`query` is the read half of the same surface** — `{"action":"query"}` or
+`{"action":"query","target":<id>}` — and it is answered with a *document*, not a diff:
+`{"seq":4,"tree":{…}}`, where the tree is exactly the `SemanticTree` `--inspect` prints, projected
+against the context's viewport and the scene's current camera. It lives in `handle` rather than
+`apply` because a pure tree-level function has no viewport to compute pixel bounds with. A `target`
+keeps that node and its descendants and sets the document's `root` to it; a missing node is
+`NoSuchNode`, never an empty tree, because "there is nothing under it" and "it is not there" are
+different answers and a host cannot tell them apart afterwards. The reply's `live` is always `null`:
+the announcement text belongs to a host's accessibility layer, not to the kernel.
+
+`CommandOutcome` is the in-memory vocabulary that keeps the two apart — `Applied(StateDiff)` versus
+`Queried(SemanticTree)` — and `reply_line` is the only thing that turns it into JSON, so the desktop
+feed and the browser bridge cannot answer a query two different ways. The hook fires only for
+`Applied`: a scene that re-fitted itself on every read would do work the question did not ask for.
+
 Two wire-format invariants are load-bearing, both pinned by tests:
 - **Commands round-trip byte-for-byte.** `to_string(parse(json)) == json`. A host logs, replays and
   diffs these, so anything that serialises back differently is a bug.
@@ -2165,10 +2195,11 @@ of I/O and of a JSON parser (it compiles to wasm).
 - **`--reply` answers every command with one JSON line on stdout**, and then stdout is *only* replies:
   every human-facing line the binary prints (`wrote out.png (1280x720)`, the frame-rate line) moves to
   stderr (`main::note`). A host cannot skip a line it did not expect.
-  `{"seq":1,"diff":{"created":[4294967297],"modified":[],"removed":[]}}` — **exactly one of `diff` and
-  `error` is present**, and the presence is the discriminant. `created` is the only way to learn the id
-  of what was just created; a `play` gets a present-but-**empty** diff, because queueing a beat changes
-  nothing in the tree.
+  `{"seq":1,"diff":{"created":[4294967297],"modified":[],"removed":[]}}` — **exactly one of `diff`,
+  `tree` and `error` is present**, and the presence is the discriminant. `created` is the only way to
+  learn the id of what was just created; a `play` gets a present-but-**empty** diff, because queueing
+  a beat changes nothing in the tree; a `query` gets a `tree` and no diff at all, because an empty
+  diff would read as a mutation that did nothing.
 - **`seq` is the 1-based *physical* line number**, blank lines included, so a human reading a log and a
   host reading the stream count the same way. A blank line is skipped silently and produces no reply.
 - **Every reply is flushed before the next line is read.** A file source is read whole; `-` is stdin,
@@ -2202,8 +2233,8 @@ of I/O and of a JSON parser (it compiles to wasm).
 until this step — now fires for every command that reached the tree, from the feed *and* from the
 keyboard/AT path. A command that was refused does not fire it.
 
-**Known limits, deliberately, and the first three are what "the AI command surface at full width"
-(P3+) means:** there is **no query command**, so a live session can only learn what changed through the
-reply diffs — for the whole tree, run `--script <file> --inspect`; commands address nodes by `NodeId`
-only (the "labels may be addressed" sentence above is a design question this step did not settle);
-`--reply` and `--inspect` cannot both own stdout; and `play` still cannot interrupt a running beat.
+**Known limits, deliberately:** commands address nodes by `NodeId` only (the "labels may be
+addressed" sentence above is a design question this step did not settle); `--reply` and `--inspect`
+cannot both own stdout; and `play` still cannot interrupt a running beat — a stop command is the
+next P3+ step, and it is not a variant of `play` for the same reason an interruption would be a
+command of its own.

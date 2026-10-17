@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::a11y::SemanticTree;
 use rustim_anim::{
     Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Succession,
     TransformGroup, Uncreate, WithRate,
@@ -96,6 +97,31 @@ pub enum Command {
     /// context rather than in the tree; the returned diff is empty for the same
     /// reason a camera command's is.
     Motion { mode: MotionMode },
+    /// Read the semantic tree back, changing nothing.
+    ///
+    /// The read half of the command surface. Until it existed a live session
+    /// could only learn what *changed* (through the reply diffs) or what the
+    /// whole tree was at the start (`--inspect`, a separate process); a model
+    /// that added three objects and wanted to check where they ended up had to
+    /// keep its own mirror, which is exactly the bookkeeping the reply protocol
+    /// exists to avoid.
+    ///
+    /// The answer is the same document `--inspect` prints — [`SemanticTree`],
+    /// measured bounds and camera included — because a second read format would
+    /// be a second thing to keep right. `target` names a node and keeps only its
+    /// subtree, which is what makes "what is under that group" expressible
+    /// without the host filtering the whole document itself.
+    ///
+    /// `live` is always absent from a query reply: the announcement text belongs
+    /// to the host's accessibility layer (the desktop adapter, the browser
+    /// overlay), not to the kernel, so the engine has nothing to say about it
+    /// here. A query is answered by [`crate::SceneContext::handle`] rather than
+    /// [`apply`], because projecting bounds needs the viewport and a pure
+    /// tree-level function has none.
+    Query {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<NodeId>,
+    },
 }
 
 /// The wire spelling of [`rustim_anim::Motion`].
@@ -335,25 +361,60 @@ impl StateDiff {
     }
 }
 
+/// What handling one command produced.
+///
+/// The distinction the reply protocol needed once reading joined writing: a
+/// command either **changed** the tree or **read** it, and a reply cannot say
+/// both. The enum is the in-memory half of [`CommandReply`]'s presence rules —
+/// hosts pass it straight to [`reply_line`], so the two cannot disagree about
+/// which field a query answers in.
+///
+/// `Applied` covers everything that mutated (including the host-answered
+/// commands whose diff is present and empty: `play`, `camera`, `motion`,
+/// `narrate`), and `Queried` carries the document a `query` asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandOutcome {
+    /// The command ran. The diff describes the tree change, which may be empty.
+    Applied(StateDiff),
+    /// The command read the tree and changed nothing.
+    Queried(SemanticTree),
+}
+
+impl CommandOutcome {
+    /// The tree change, for a command that mutated.
+    pub fn diff(&self) -> Option<&StateDiff> {
+        match self {
+            Self::Applied(diff) => Some(diff),
+            Self::Queried(_) => None,
+        }
+    }
+}
+
 /// What a host gets back for one line of a command feed.
 ///
-/// **Exactly one of `diff` and `error` is present, and the presence is the
-/// discriminant.** The absent one is omitted rather than written as `null`, the
-/// same rule the commands themselves follow — these are a model's output too.
+/// **Exactly one of `diff`, `tree` and `error` is present, and the presence is
+/// the discriminant.** The absent ones are omitted rather than written as
+/// `null`, the same rule the commands themselves follow — these are a model's
+/// output too.
 ///
 /// A host that sent a `play` gets a `diff` that is present and *empty*: queueing
 /// a beat changes nothing in the tree, and saying so is more useful than saying
 /// nothing. A host that sent an `add` gets the new id in `created`, which is the
 /// whole reason this type exists — it is the only way to learn the id of what
 /// was just created, and without it nothing could be done to that object
-/// afterwards.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// afterwards. A host that sent a `query` gets a `tree`, and no `diff`, because
+/// a read changes nothing and an empty diff would read as "a mutation that did
+/// nothing".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandReply {
     /// The 1-based *physical* line the command came from, so a human reading a
     /// session log and a host reading the stream count the same way.
     pub seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<StateDiff>,
+    /// The document a `query` asked for; see [`SemanticTree`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tree: Option<SemanticTree>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<CommandError>,
 }
@@ -364,6 +425,17 @@ impl CommandReply {
         Self {
             seq,
             diff: Some(diff),
+            tree: None,
+            error: None,
+        }
+    }
+
+    /// The reply to a command that read the tree.
+    pub fn queried(seq: u64, tree: SemanticTree) -> Self {
+        Self {
+            seq,
+            diff: None,
+            tree: Some(tree),
             error: None,
         }
     }
@@ -374,6 +446,7 @@ impl CommandReply {
         Self {
             seq,
             diff: None,
+            tree: None,
             error: Some(error),
         }
     }
@@ -404,9 +477,10 @@ pub fn parse_command(line: &str) -> Option<Result<Command, CommandError>> {
 }
 
 /// One reply line, without its newline.
-pub fn reply_line(seq: u64, outcome: Result<StateDiff, CommandError>) -> String {
+pub fn reply_line(seq: u64, outcome: Result<CommandOutcome, CommandError>) -> String {
     let reply = match outcome {
-        Ok(diff) => CommandReply::applied(seq, diff),
+        Ok(CommandOutcome::Applied(diff)) => CommandReply::applied(seq, diff),
+        Ok(CommandOutcome::Queried(tree)) => CommandReply::queried(seq, tree),
         Err(error) => CommandReply::refused(seq, error),
     };
     // A reply is built from types that already round-trip, so this cannot fail
@@ -466,6 +540,12 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // needs the virtual clock and the narration track — neither of which
             // is in the tree. A direct `apply` caller gets a harmless no-op, the
             // same round-trip every other host-answered command gives it.
+        }
+        Command::Query { .. } => {
+            // Answered by `SceneContext::handle` for a different missing
+            // ingredient: projecting a `SemanticTree` needs the viewport, and
+            // that lives on the context, not in the tree. Also, a query would
+            // not fit this function's return type — it has no diff to give.
         }
     }
     Ok(diff)
@@ -1114,6 +1194,10 @@ mod tests {
             // round trip that mangled it would be visible here.
             r#"{"action":"narrate","text":"先看这个三角形"}"#.to_owned(),
             r#"{"action":"narrate","text":"两条直角边是 3 和 4","at":2.0}"#.to_owned(),
+            // The read half: no target is the whole tree, and a target is a
+            // subtree. Neither writes a field it did not receive.
+            r#"{"action":"query"}"#.to_owned(),
+            format!(r#"{{"action":"query","target":{id}}}"#),
         ];
         for json in cases {
             let cmd: Command =
@@ -1143,22 +1227,47 @@ mod tests {
         }
     }
 
-    /// The two constructors are the only way to build one, so neither can
-    /// accidentally produce a reply carrying both halves or neither.
+    /// The three constructors are the only way to build one, so none can
+    /// accidentally produce a reply carrying more than one half or none.
     #[test]
     fn a_reply_carries_exactly_one_half() {
         let ok = CommandReply::applied(7, StateDiff::default());
-        assert!(ok.diff.is_some() && ok.error.is_none());
+        assert!(ok.diff.is_some() && ok.tree.is_none() && ok.error.is_none());
         assert!(!serde_json::to_string(&ok).unwrap().contains("error"));
 
-        let no = CommandReply::refused(
+        let read = CommandReply::queried(
             8,
+            crate::a11y::build(&SceneTree::new(), &Viewport::default(), None),
+        );
+        assert!(read.diff.is_none() && read.tree.is_some() && read.error.is_none());
+        assert!(!serde_json::to_string(&read).unwrap().contains("error"));
+
+        let no = CommandReply::refused(
+            9,
             CommandError::Unparseable {
                 detail: "nope".into(),
             },
         );
-        assert!(no.diff.is_none() && no.error.is_some());
+        assert!(no.diff.is_none() && no.tree.is_none() && no.error.is_some());
         assert!(!serde_json::to_string(&no).unwrap().contains("null"));
+    }
+
+    /// A query reply round-trips like every other document on this wire, so a
+    /// host can log a session that read the tree and replay the log byte for
+    /// byte. The document is built rather than pasted: a `SemanticTree` literal
+    /// here would pin the projection's field order, which is [`crate::a11y`]'s
+    /// business, not this test's.
+    #[test]
+    fn a_query_reply_round_trips_through_json() {
+        let mut tree = SceneTree::new();
+        tree.insert(Mobject::new(vec![]));
+        let reply = CommandReply::queried(6, crate::a11y::build(&tree, &Viewport::default(), None));
+        let json = serde_json::to_string(&reply).unwrap();
+        let parsed: CommandReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, reply);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        assert!(parsed.diff.is_none());
+        assert_eq!(parsed.tree.unwrap().nodes.len(), 2);
     }
 
     /// An unreadable line is a *refusal*, not a panic, and it reads as one to a
@@ -2521,26 +2630,49 @@ mod tests {
         );
     }
 
-    /// The presence of `diff` or `error` is the discriminant; the other field is
-    /// omitted, never written as null.
+    /// The presence of `diff`, `tree` or `error` is the discriminant; the others
+    /// are omitted, never written as null.
     #[test]
-    fn a_reply_carries_exactly_one_of_diff_and_error() {
-        let applied: serde_json::Value =
-            serde_json::from_str(&reply_line(3, Ok(StateDiff::default()))).unwrap();
+    fn a_reply_carries_exactly_one_of_diff_tree_and_error() {
+        let applied: serde_json::Value = serde_json::from_str(&reply_line(
+            3,
+            Ok(CommandOutcome::Applied(StateDiff::default())),
+        ))
+        .unwrap();
         assert_eq!(applied["seq"], 3);
         assert!(applied.get("diff").is_some());
+        assert!(applied.get("tree").is_none());
         assert!(applied.get("error").is_none());
 
-        let refused: serde_json::Value = serde_json::from_str(&reply_line(
+        // A read says so by carrying a document and no diff at all. An empty
+        // diff here would be read as a mutation that did nothing, which is the
+        // one thing a query is not.
+        let queried: serde_json::Value = serde_json::from_str(&reply_line(
             4,
+            Ok(CommandOutcome::Queried(crate::a11y::build(
+                &SceneTree::new(),
+                &Viewport::default(),
+                None,
+            ))),
+        ))
+        .unwrap();
+        assert_eq!(queried["seq"], 4);
+        assert!(queried.get("tree").is_some());
+        assert!(queried.get("diff").is_none());
+        assert!(queried.get("error").is_none());
+        assert_eq!(queried["tree"]["nodes"].as_array().unwrap().len(), 1);
+
+        let refused: serde_json::Value = serde_json::from_str(&reply_line(
+            5,
             Err(CommandError::Unparseable {
                 detail: "expected value".to_owned(),
             }),
         ))
         .unwrap();
-        assert_eq!(refused["seq"], 4);
+        assert_eq!(refused["seq"], 5);
         assert!(refused.get("error").is_some());
         assert!(refused.get("diff").is_none());
+        assert!(refused.get("tree").is_none());
         assert_eq!(refused["error"]["error"], "unparseable");
     }
 }

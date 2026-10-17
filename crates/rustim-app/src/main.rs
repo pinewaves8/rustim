@@ -1753,8 +1753,14 @@ impl ApplicationHandler<AppEvent> for App {
                         // The hook a scene reacts to commands through. Until
                         // this line existed it was declared and never called,
                         // so a scene could not have reacted to anything even in
-                        // principle.
-                        Ok(diff) => self.scene.on_command(&diff, &mut self.ctx),
+                        // principle. A query has nothing to react to; nothing on
+                        // this path issues one today, but the match has to say
+                        // so rather than treat a read as a mutation.
+                        Ok(outcome) => {
+                            if let Some(diff) = outcome.diff() {
+                                self.scene.on_command(diff, &mut self.ctx);
+                            }
+                        }
                         // A refusal is a value, not a panic — the rule an AI's
                         // command follows, and this path is reachable by
                         // pressing a key or by an assistive technology naming a

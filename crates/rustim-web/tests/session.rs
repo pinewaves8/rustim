@@ -186,6 +186,48 @@ fn apply_answers_like_the_desktop_feed() {
     assert_eq!(after["seq"], 5);
 }
 
+/// A query over the browser's bridge is answered with the semantic tree and no
+/// diff — the same reply the desktop feed writes, because it is the same two
+/// functions.
+#[test]
+fn a_query_answers_with_the_tree_and_no_diff() {
+    let mut session = Session::new(WIDTH, HEIGHT, "pythagorean").expect("the scene builds");
+
+    let whole: serde_json::Value =
+        serde_json::from_str(&session.apply(r#"{"action":"query"}"#).unwrap()).unwrap();
+    assert_eq!(whole["seq"], 1);
+    assert!(whole.get("diff").is_none() && whole.get("error").is_none());
+    let nodes = whole["tree"]["nodes"].as_array().expect("a document");
+    assert_eq!(nodes.len(), 5, "the root and the four figures");
+    assert!(
+        nodes.iter().any(|n| n["name"] == "直角三角形"),
+        "the query sees the same names the DOM layer does"
+    );
+    // `live` is present and null, exactly as it is in `--inspect`: the
+    // announcement text belongs to the host's accessibility layer, and the
+    // kernel has none to offer.
+    assert!(whole["tree"]["live"].is_null());
+
+    // A targeted query keeps the node and its descendants; a figure has none,
+    // so its subtree is itself, rooted at its own id.
+    let id = nodes[1]["id"].as_u64().expect("an id is a number");
+    let subtree: serde_json::Value = serde_json::from_str(
+        &session
+            .apply(&format!(r#"{{"action":"query","target":{id}}}"#))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(subtree["tree"]["root"].as_u64(), Some(id));
+    assert_eq!(subtree["tree"]["nodes"].as_array().unwrap().len(), 1);
+
+    // And a node that is not there is a refusal, not an empty document.
+    let refused: serde_json::Value =
+        serde_json::from_str(&session.apply(r#"{"action":"query","target":999}"#).unwrap())
+            .unwrap();
+    assert!(refused.get("tree").is_none());
+    assert_eq!(refused["error"]["error"], "no_such_node");
+}
+
 /// The formula page's scene, under the feature that creates it.
 ///
 /// Typst is the one dependency this crate carries optionally, so a build

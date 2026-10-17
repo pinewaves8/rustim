@@ -49,7 +49,7 @@ pub mod command;
 pub mod context;
 
 pub use a11y::{CameraView, SemanticNode, SemanticRole, SemanticTree, SemanticValue};
-pub use command::{Command, CommandError, CommandReply, StateDiff};
+pub use command::{Command, CommandError, CommandOutcome, CommandReply, StateDiff};
 pub use context::{Scene, SceneContext};
 
 /// Re-exported so scene authors do not have to depend on the mobject crate

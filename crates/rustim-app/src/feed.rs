@@ -109,16 +109,18 @@ pub fn apply_all(
         let Some(parsed) = parse_command(&line) else {
             continue;
         };
-        let outcome = parsed.and_then(|cmd| match ctx.handle(&cmd) {
-            Ok(diff) => {
-                // The hook the trait has carried since it was written and that
-                // nothing had ever called. A scene that wants to react to what a
-                // host did to it — relabel, re-fit, script the next beat — has
-                // exactly here to do it.
-                scene.on_command(&diff, ctx);
-                Ok(diff)
+        let outcome = parsed.and_then(|cmd| {
+            let outcome = ctx.handle(&cmd)?;
+            // The hook the trait has carried since it was written and that
+            // nothing had ever called, firing for every command that reached the
+            // tree — including the host-answered ones whose diff is empty, and
+            // not for a query, which changed nothing to react to. A scene that
+            // wants to react to what a host did to it — relabel, re-fit, script
+            // the next beat — has exactly here to do it.
+            if let Some(diff) = outcome.diff() {
+                scene.on_command(diff, ctx);
             }
-            Err(e) => Err(e),
+            Ok(outcome)
         });
 
         match outcome {
@@ -415,6 +417,40 @@ mod tests {
         // And `camera` is a command, not an animation kind: `--help` must keep
         // saying so.
         assert!(!animation_kinds().contains("camera"));
+    }
+
+    /// A query is answered with a document and **does not fire `on_command`**.
+    ///
+    /// The hook exists for scenes reacting to a change; a read changed nothing,
+    /// and a scene that re-fitted itself on every query would do work the
+    /// question did not ask for. The count still says applied — the question was
+    /// answered — which is what keeps `feed: N of M refused` honest.
+    #[test]
+    fn a_query_is_answered_with_a_document_and_does_not_reach_the_scene() {
+        let mut scene = Recorder::default();
+        let mut ctx = context();
+        let (_, replies) = feed(
+            &mut scene,
+            &mut ctx,
+            &[r#"{"action":"add","type":"square","params":{"label":"方块"}}"#],
+        );
+        let id = replies[0].diff.as_ref().expect("an add diffs").created[0];
+        assert_eq!(scene.seen.len(), 1, "the add did reach the scene");
+
+        let line = format!(r#"{{"action":"query","target":{}}}"#, id.raw());
+        let (counts, replies) = feed(&mut scene, &mut ctx, &[line.as_str()]);
+        assert_eq!(
+            counts,
+            Counts {
+                applied: 1,
+                refused: 0
+            }
+        );
+        let tree = replies[0].tree.as_ref().expect("a document came back");
+        assert_eq!(tree.nodes.len(), 1);
+        assert_eq!(tree.root, id);
+        assert!(replies[0].diff.is_none());
+        assert_eq!(scene.seen.len(), 1, "a read is not a change to react to");
     }
 
     /// A narration is a command like a `play`: applied, answered with an
