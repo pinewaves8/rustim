@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (25 actions, 11 shapes, 11 animations, 10
+//!    the build actually has (26 actions, 11 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -155,7 +155,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 25, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 26, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -454,6 +454,61 @@ fn attention_commands_work_through_the_wire() {
         .error
         .expect("dim above 1 is refused");
     assert!(format!("{error}").contains("dim"), "{error}");
+
+    finish(client, &png);
+}
+
+/// The first `explain.*` template is still an ordinary command on the wire: it
+/// answers with the group first and addressable pieces after it, and the group
+/// declares the union of their boxes so the whole explanation can be placed,
+/// focused or queried as one object. The caption is typeset by the host, which
+/// is why this also proves the real binary's typesetter reaches the templates.
+#[test]
+fn the_equation_template_builds_one_addressable_group() {
+    let (mut client, png) = client("equation");
+
+    let created = expect_diff(
+        &mut client,
+        r#"{"action":"explain.equation","formula":"a^2 + b^2 = c^2","position":[0.5,0.5],"caption":"勾股定理","label":"定理"}"#,
+    )
+    .created;
+    assert_eq!(created.len(), 3, "the group, the formula root, the caption");
+
+    let group = created[0];
+    let tree = client
+        .send_raw(&format!(r#"{{"action":"query","target":{}}}"#, group.raw()))
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert_eq!(tree.root, group);
+    assert_eq!(tree.nodes[0].name, "定理", "the label names the group");
+    assert!(
+        tree.nodes[0].bounds.is_some(),
+        "the group declares the union of its pieces"
+    );
+    assert!(
+        tree.nodes.iter().any(|node| node.name == "公式"),
+        "the formula keeps its own name under the group: {:?}",
+        tree.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+    );
+
+    // A caption that says nothing is refused by field, and the group does not
+    // survive the refusal.
+    let error = client
+        .send_raw(r#"{"action":"explain.equation","formula":"x^2","caption":"   ","label":"空的"}"#)
+        .expect("a refusal is a reply")
+        .error
+        .expect("a blank caption is refused");
+    assert!(format!("{error}").contains("caption"), "{error}");
+    let tree = client
+        .send_raw(r#"{"action":"query"}"#)
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert!(
+        !tree.nodes.iter().any(|node| node.name == "空的"),
+        "a refused template left its group behind"
+    );
 
     finish(client, &png);
 }

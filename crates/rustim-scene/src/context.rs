@@ -14,7 +14,7 @@ use rustim_render::{DrawList, DrawOp};
 use crate::a11y;
 use crate::command::{self, Capabilities, Command, CommandError, CommandOutcome, StateDiff};
 use crate::event::{Event, EventKind, MAX_EVENTS};
-use crate::typeset::{TextSpec, TypesetError, Typesetter};
+use crate::typeset::{TextSpec, Typesetter, typeset_error};
 
 /// A scene: the user-facing entry point, mirroring Manim's `construct()`.
 ///
@@ -1197,7 +1197,9 @@ impl SceneContext {
                         feature: "text".to_owned(),
                     });
                 };
-                typesetter.text(text, &spec).map_err(typeset_error)?
+                typesetter
+                    .text(text, &spec)
+                    .map_err(|error| typeset_error(error, "text"))?
             };
             // The label's own size decides where it goes, so the caller's box
             // is the typesetter's, not a guess from the string length. A block
@@ -1246,6 +1248,41 @@ impl SceneContext {
                 diff.created.push(self.tree.insert(arrow));
             }
             return Ok(CommandOutcome::Applied(diff));
+        }
+        if let Command::ExplainEquation {
+            formula,
+            position,
+            scale,
+            color,
+            caption,
+            caption_size,
+            label,
+        } = cmd
+        {
+            if !self.supports_formula() {
+                return Err(CommandError::Unsupported {
+                    feature: "formula".to_owned(),
+                });
+            }
+            let Some(typesetter) = self.typesetter.as_mut() else {
+                // Unreachable by the line above — `supports_formula` reads the
+                // same field — and answered rather than unwrapped because this
+                // path takes input a model wrote.
+                return Err(CommandError::Unsupported {
+                    feature: "formula".to_owned(),
+                });
+            };
+            let args = crate::templates::Equation {
+                formula,
+                position: *position,
+                scale: *scale,
+                color: *color,
+                caption: caption.as_deref(),
+                caption_size: *caption_size,
+                label: label.as_deref(),
+            };
+            return crate::templates::equation(&mut self.tree, typesetter.as_mut(), args)
+                .map(CommandOutcome::Applied);
         }
         if let Command::Highlight {
             target,
@@ -1417,7 +1454,7 @@ impl SceneContext {
             };
             let block = typesetter
                 .text(params.text(), &spec)
-                .map_err(typeset_error)?;
+                .map_err(|error| typeset_error(error, "text"))?;
             // Built through the same `shapes::build` every other kind uses, so
             // the label, colour, `position` and `scale` arrive by the one code
             // path. An empty string is a legitimate text object — it has a
@@ -1430,40 +1467,13 @@ impl SceneContext {
 
         let formula = typesetter
             .formula(params.text(), &mut self.tree)
-            .map_err(typeset_error)?;
-        let (root, nodes) = (formula.root, formula.nodes);
-        // The compiler produces geometry and no style, so the command's colour
-        // is applied to every glyph and rule here. It has to be applied *now*
-        // rather than left to a later `set` of the root: opacity and paint do
-        // not inherit in this draw walk, which is also why `FormulaScene`
-        // colours its glyphs one by one. The root keeps its own label and
-        // transform, which are the parts a subtree *can* own.
-        let color = params.color.map_or(rustim_color::FG, |[r, g, b]| {
-            rustim_color::Srgb::from_rgba8(r, g, b, 255)
-        });
-        for id in &nodes {
-            if let Some(m) = self.tree.get_mut(*id) {
-                m.style.fill = color;
-                m.style.fill_opacity = 1.0;
-                m.style.stroke_opacity = 0.0;
-            }
-        }
-        if let Some(m) = self.tree.get_mut(root) {
-            // `shapes::build` would have done exactly this and cannot: the
-            // compiler owns the root. Same order as `build` — scale first, then
-            // place — because `*` applies its right operand first.
-            if params.label.is_some() {
-                m.label = params.label.clone();
-            }
-            if let Some([x, y]) = params.position {
-                m.transform = Affine2::translate((x, y));
-            }
-            let scale = params.scale();
-            if scale != 1.0 {
-                m.transform *= Affine2::scale(scale);
-            }
-            diff.created.push(root);
-        }
+            .map_err(|error| typeset_error(error, "text"))?;
+        // `shapes::build` would have done exactly this and cannot: the compiler
+        // owns the root. The styling is shared with the `explain.*` templates,
+        // so a formula's colour lands on the same nodes whichever route built
+        // it.
+        crate::typeset::style_formula(&mut self.tree, &formula, params);
+        diff.created.push(formula.root);
         Ok(diff)
     }
 
@@ -1633,16 +1643,6 @@ impl SceneContext {
 /// `text` for both kinds is deliberate — it is the field the command carried,
 /// and a refusal that named `formula` would send a model looking for a field it
 /// never wrote.
-fn typeset_error(error: TypesetError) -> CommandError {
-    match error {
-        TypesetError::Invalid { detail } => CommandError::OutOfRange {
-            property: "text".to_owned(),
-            detail,
-        },
-        TypesetError::Failed { detail } => CommandError::Typeset { detail },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1653,7 +1653,7 @@ mod tests {
     use rustim_mobject::{Mobject, NodeKind, TextBlock, TextRun};
     use rustim_render::TextGlyph;
 
-    use crate::typeset::TypesetFormula;
+    use crate::typeset::{TypesetError, TypesetFormula};
 
     /// The frame grid. Virtual time, never wall-clock — the same `1/60` the app's
     /// frame loop and the golden capture use.
@@ -3125,6 +3125,214 @@ mod tests {
         assert_eq!(ctx.tree.len(), before, "a refused callout creates nothing");
     }
 
+    // ---- the explain.equation template ------------------------------------
+
+    fn explain_equation(
+        formula: &str,
+        position: Option<[f64; 2]>,
+        scale: Option<f64>,
+        caption: Option<&str>,
+        label: Option<&str>,
+    ) -> Command {
+        Command::ExplainEquation {
+            formula: formula.to_owned(),
+            position,
+            scale,
+            color: Some([100, 181, 246]),
+            caption: caption.map(str::to_owned),
+            caption_size: None,
+            label: label.map(str::to_owned),
+        }
+    }
+
+    /// One group, two addressable pieces, and a caption measured off the
+    /// formula's own ink rather than placed at a fixed offset.
+    ///
+    /// The fake reports a 2×2 formula box and a 4×1 caption, so the numbers are
+    /// exact: with the group at `(0.5, 1)` and `scale = 1.2` the formula's world
+    /// bottom is `1 - 1.2 = -0.2`, and the caption's centre sits one default gap
+    /// plus half its height below that — `-2.05` in the group's frame. The group
+    /// declares the union of the two boxes, which is what makes `next_to` and
+    /// `camera focus` work on a template's result.
+    #[test]
+    fn an_equation_groups_a_formula_and_its_caption() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let before = ctx.tree.len();
+        let diff = applied(
+            &mut ctx,
+            &explain_equation(
+                "a^2 + b^2 = c^2",
+                Some([0.5, 1.0]),
+                Some(1.2),
+                Some("勾股定理"),
+                Some("定理"),
+            ),
+        );
+
+        assert_eq!(diff.created.len(), 3, "the group, the formula, the caption");
+        assert_eq!(
+            ctx.tree.len(),
+            before + 4,
+            "the formula's own glyph is in the tree but not in the diff"
+        );
+        let (group, formula, caption) = (diff.created[0], diff.created[1], diff.created[2]);
+
+        let g = ctx.tree.get(group).unwrap();
+        assert_eq!(g.kind, NodeKind::Group);
+        assert_eq!(
+            g.label.as_deref(),
+            Some("定理"),
+            "the caller's label names the group"
+        );
+        assert_eq!(ctx.tree.get(formula).unwrap().kind, NodeKind::Formula);
+        assert_eq!(
+            ctx.tree.get(formula).unwrap().label.as_deref(),
+            Some("公式"),
+            "the formula keeps its own name under the group's"
+        );
+        assert_eq!(ctx.tree.get(caption).unwrap().kind, NodeKind::Text);
+
+        // The formula sits at the group's origin and carries the post-typeset
+        // scale; an undeclared scale would land the box at ±1 instead of ±1.2.
+        let ink = ctx.tree.world_bounds(formula).unwrap();
+        assert!((ink.x0 + 0.7).abs() < 1e-12, "{ink:?}");
+        assert!((ink.x1 - 1.7).abs() < 1e-12, "{ink:?}");
+        assert!((ink.y0 + 0.2).abs() < 1e-12, "{ink:?}");
+
+        // Measured from that bottom: one gap (0.35) and half the 1-tall caption.
+        let text = ctx.tree.world_bounds(caption).unwrap();
+        assert!((text.center().x - 0.5).abs() < 1e-12, "{text:?}");
+        assert!((text.center().y + 1.05).abs() < 1e-12, "{text:?}");
+
+        // The colour reaches every glyph of the formula, because opacity and
+        // paint do not inherit in this draw walk.
+        let paint = rustim_color::Srgb::from_rgba8(100, 181, 246, 255);
+        let glyph = ctx
+            .tree
+            .draw_order()
+            .into_iter()
+            .find(|id| !diff.created.contains(id))
+            .expect("the fake inserted one glyph under the formula");
+        assert_eq!(ctx.tree.get(glyph).unwrap().style.fill, paint);
+        assert_eq!(ctx.tree.get(caption).unwrap().style.fill, paint);
+
+        // The declared box is the union in the group's frame, and it is what
+        // `world_bounds` answers with — there are no points to measure.
+        let declared = ctx.tree.get(group).unwrap().local_bounds.unwrap();
+        assert!((declared.x0 + 2.0).abs() < 1e-12, "{declared:?}");
+        assert!((declared.x1 - 2.0).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y0 + 2.55).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y1 - 1.2).abs() < 1e-12, "{declared:?}");
+        let world = ctx.tree.world_bounds(group).unwrap();
+        assert!((world.x0 + 1.5).abs() < 1e-12, "{world:?}");
+        assert!((world.y1 - 2.2).abs() < 1e-12, "{world:?}");
+    }
+
+    /// Every refusal is atomic, and each names the field that caused it. The
+    /// capability refusals come first so a client with no typesetter learns the
+    /// build cannot do it before it spends a round trip on its parameters.
+    #[test]
+    fn an_equation_refuses_before_creating_anything() {
+        let mut bare = scene();
+        let before = bare.tree.len();
+        assert!(
+            matches!(
+                bare.handle(&explain_equation("x^2", None, None, None, None)),
+                Err(CommandError::Unsupported { ref feature }) if feature == "formula"
+            ),
+            "a build with no typesetter cannot compile a formula"
+        );
+        assert_eq!(bare.tree.len(), before);
+
+        for (cmd, field) in [
+            (
+                explain_equation("x^2", None, Some(0.0), None, None),
+                "scale",
+            ),
+            (
+                explain_equation("x^2", None, Some(f64::NAN), None, None),
+                "scale",
+            ),
+            (
+                explain_equation("x^2", None, None, Some("   "), None),
+                "caption",
+            ),
+            (
+                explain_equation("x^2", Some([f64::INFINITY, 0.0]), None, None, None),
+                "position",
+            ),
+        ] {
+            let mut ctx = with_typesetter(FakeTypesetter::both());
+            let before = ctx.tree.len();
+            assert!(
+                matches!(
+                    ctx.handle(&cmd),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == field
+                ),
+                "{cmd:?} refused as the wrong field"
+            );
+            assert_eq!(ctx.tree.len(), before, "{cmd:?} left nodes behind");
+        }
+
+        // A caption on a build that typesets formulas but not text.
+        let mut ctx = with_typesetter(FakeTypesetter {
+            text: false,
+            ..FakeTypesetter::both()
+        });
+        let before = ctx.tree.len();
+        assert!(matches!(
+            ctx.handle(&explain_equation("x^2", None, None, Some("注解"), None)),
+            Err(CommandError::Unsupported { ref feature }) if feature == "text"
+        ));
+        assert_eq!(ctx.tree.len(), before);
+    }
+
+    /// A typesetter that accepts the formula and then fails on the caption —
+    /// the one window in which the group already holds a compiled formula. The
+    /// rollback is the claim: a refused template leaves no half an equation.
+    struct CaptionFails(FakeTypesetter);
+
+    impl Typesetter for CaptionFails {
+        fn supports_text(&self) -> bool {
+            true
+        }
+
+        fn supports_formula(&self) -> bool {
+            true
+        }
+
+        fn text(&mut self, _text: &str, _spec: &TextSpec) -> Result<TextBlock, TypesetError> {
+            Err(TypesetError::invalid("no glyphs in this font"))
+        }
+
+        fn formula(
+            &mut self,
+            source: &str,
+            tree: &mut SceneTree,
+        ) -> Result<TypesetFormula, TypesetError> {
+            self.0.formula(source, tree)
+        }
+    }
+
+    #[test]
+    fn a_late_refusal_rolls_the_group_back() {
+        let mut ctx = scene();
+        ctx.set_typesetter(Box::new(CaptionFails(FakeTypesetter::both())));
+        let before = ctx.tree.len();
+        let err = ctx
+            .handle(&explain_equation("x^2", None, None, Some("注解"), None))
+            .expect_err("the caption cannot be shaped");
+        assert!(
+            matches!(&err, CommandError::OutOfRange { property, .. } if property == "caption"),
+            "{err}"
+        );
+        assert_eq!(
+            ctx.tree.len(),
+            before,
+            "the group and the compiled formula went with the refusal"
+        );
+    }
+
     // ---- the camera -------------------------------------------------------
 
     fn camera_cmd(center: Option<[f64; 2]>, zoom: Option<f64>, duration: Option<f64>) -> Command {
@@ -3443,7 +3651,15 @@ mod tests {
             if let Some(error) = self.refuse.clone() {
                 return Err(error);
             }
-            let root = tree.insert(Mobject::new(Vec::new()).with_kind(NodeKind::Formula));
+            // The real compiler declares its ink box (a formula's root has no
+            // points); the fake does the same so template placement can be
+            // measured in a test. Its one glyph is a default 2x2 square, so the
+            // box is 2x2 centred on the origin.
+            let root = tree.insert(
+                Mobject::new(Vec::new())
+                    .with_kind(NodeKind::Formula)
+                    .with_local_bounds(rustim_math::Rect::new(-1.0, -1.0, 1.0, 1.0)),
+            );
             let glyph = tree.insert(rustim_mobject::shapes::build(
                 ShapeKind::Square,
                 &ShapeParams::default(),

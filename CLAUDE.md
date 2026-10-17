@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **842 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **846 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -372,8 +372,8 @@ last property.
 | `rustim-mobject` | `Mobject` (points / declared `local_bounds` / a wire-shaped `text: Option<TextBlock>` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot` / `group`) and `AxesScale`, `text` (`TextBlock` / `TextRun` / `FontData` — the glyph geometry a shaper hands over), `critical_point`, `world_anchors`, `ids_with_label` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
-| `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it) and `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) | Real |
-| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. Templates, the linter and `ScenePlan` are deferred; nothing here does I/O and nothing names a model | Real (layout, attention, annotation) |
+| `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it), `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) and `templates` (the `explain.*` thick tools: one group, addressable pieces, a declared box and an atomic rollback) | Real |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the remaining five templates, the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; the first template lives one crate up) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -2020,9 +2020,52 @@ fixtures (the full spelling and the minimal one), and the conformance case exten
 labelled square and read the label back. `ACTIONS` 24 → 25. **All eight goldens are unchanged**,
 and the count moved 836 → 842.
 
+**The fourth slice is `explain.equation` — the first of the six templates — and it is the point at
+which the teaching tier becomes a layer rather than a set of verbs.** The templates live in
+`rustim-scene::templates`, **not** in the director, because they typeset: the director's dependency
+set has no `rustim-text` and Typst must never reach the kernel. Every template builds its picture as
+one `NodeKind::Group` with addressable pieces under it, and four rules make that shape work:
+
+- **`created[0]` is always the group**, and the pieces follow it. A lecture names the group to fade,
+  move or focus the whole explanation as one object, and names a piece to style one part of it. A
+  formula's glyphs are **not** listed — they are the formula's own subtree, the same rule `add`
+  follows when it reports a formula's root and not its symbols.
+- **The group declares its box.** A group has no points, so `world_bounds` cannot measure it;
+  `Build::finish` writes the union of the pieces' world boxes — converted into the group's frame by
+  subtracting its origin — into the group's `local_bounds`, which is the declared-box fallback a text
+  mobject already uses. That is what lets `next_to`, `camera focus` and `query`'s `bounds` treat a
+  template's result as one object. It is a **snapshot**: a later `set position` on a piece moves that
+  piece and leaves the group's box where it was; the module doc says so and treats re-placing the
+  group as the caller's move.
+- **Pieces are placed in the group's frame.** `Build::text` inserts a piece at a group-local position
+  and *then* reparents it under the group, so the group's translation applies exactly once. The first
+  version added the origin in both places and put every caption at twice the requested offset — a bug
+  no golden could see, because no compiled scene uses a template yet. It is the same class as the
+  `path_arc` trap: a piece's transform is relative to its parent, and reparenting is what decides
+  which parent that is.
+- **Refusals are atomic, and the group is the unit of rollback.** Parameters are validated before the
+  group is inserted, and the typesetting half runs inside a closure whose error path calls
+  `Build::rollback` → `remove_subtree(group)`. A blank caption, a non-positive `scale` or
+  `caption_size`, a non-finite `position`, a missing typesetter, or a compiler failure leaves
+  **nothing** behind.
+
+`explain.equation` compiles through the same `Typesetter` seam `add` uses and colours through
+`typeset::style_formula`, which was extracted from `add_typeset` for exactly this reason — the two
+paths cannot drift on which nodes a formula's colour lands on. The caption is placed by measurement:
+the formula root's world bottom, less `DEFAULT_GAP` (0.35), less half the caption's own height, so a
+scaled-up formula pushes its caption down rather than overlapping it. The capability refusal names
+the missing feature (`"formula"`, or `"text"` for a caption on a formula-only build), and the arm
+lives in `handle` because `apply` may not read fonts. Evidence: two context tests (the
+group/pieces/caption geometry including the declared box, and every refusal leaving the tree
+unchanged), a rollback test whose fake typesetter succeeds on the formula and fails on the caption —
+the only window in which the group already holds geometry — two round-trip fixtures, and a
+conformance case that drives the real binary's typesetter through the template and reads the group's
+declared bounds back; `ACTIONS` 25 → 26. **All eight goldens are unchanged**, and the count moved
+842 → 846.
+
 Deferred, and named so they are not rediscovered as gaps: labels that *follow* their subject, the
-six `explain.*` templates, the linter (out of frame, overlap, size, contrast, pacing) and
-`ScenePlan`. Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
+remaining five `explain.*` templates (`plot`, `geometry`, `matrix`, `chart`, `algorithm`), the linter
+(out of frame, overlap, size, contrast, pacing) and `ScenePlan`. Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
 arrow is a static node placed once; re-placing it is a `point_at` again, and following would need a
 per-frame constraint the tree does not have), and spotlight-beyond-opacity (a true mask over the
 rest of the scene). Several subjects at once is a `group` — `target` names one node, and the group's
@@ -2864,8 +2907,20 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   re-sending `annotate` is how a host re-anchors one. Evidence: three director tests, three context
   tests, two round-trip fixtures and the extended conformance case; `ACTIONS` 24 → 25. **All eight
   goldens are unchanged**, and the count moved 836 → 842.
-  Deliberately deferred: labels that follow their subject, the `explain.*` templates, the linter and
-  `ScenePlan`.
+  Deliberately deferred: labels that follow their subject, the remaining `explain.*` templates, the
+  linter and `ScenePlan`.
+- **Phase 2's fifth slice — the first template, `explain.equation` — is done.** The `explain.*` thick
+  tools now exist as a layer (`rustim-scene::templates`), and the first one compiles a formula, styles
+  it, measures its world bottom and hangs an optional typeset caption one `DEFAULT_GAP` below it, all
+  inside a `NodeKind::Group` whose `local_bounds` is the union of the pieces. `created = [group,
+  formula root, caption]`; a formula's glyphs stay its own subtree and are not reported. The group is
+  the address for the whole explanation (so `next_to` / `camera focus` / `play` work on it), while the
+  pieces remain individually addressable. Refusals validate before insertion and roll the group back
+  on a late typesetter error, so a failed template leaves no half an equation. The arm lives in
+  `SceneContext::handle` because compiling needs the host's `Typesetter`; `apply` keeps a no-op arm
+  so a replayed log passes through. `ACTIONS` 25 → 26. Evidence: two context tests, a rollback test
+  over a typesetter that fails only on the caption, two round-trip fixtures and a conformance case;
+  **all eight goldens unchanged**, count 842 → 846.
 
 ## AI integration
 
@@ -2891,7 +2946,7 @@ the AI surface" below.
 session. It does not touch the tree; it answers with a `capabilities` document — the protocol version,
 the engine's version string, and the exact action / shape / animation / property / rate names this
 build accepts, plus its limits and two advisory profiles. The lists are **derived from serde over the
-same enums the parser uses** — `actions` from `Command::action_name` (25 verbs), `PROPERTY_NAMES`,
+same enums the parser uses** — `actions` from `Command::action_name` (26 verbs), `PROPERTY_NAMES`,
 `AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` for the nouns — so an advertised name is
 accepted by construction, and a conformance test feeds every advertised word back through the binary
 (see `crates/rustim-app/tests/conformance.rs`). A new variant that misses its `ALL`/name table fails a

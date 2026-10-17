@@ -48,6 +48,7 @@ pub mod a11y;
 pub mod command;
 pub mod context;
 pub mod event;
+mod templates;
 pub mod text;
 pub mod typeset;
 

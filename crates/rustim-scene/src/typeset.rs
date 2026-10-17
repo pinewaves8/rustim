@@ -30,7 +30,11 @@
 //!
 //! [`CommandError`]: crate::CommandError
 
+use rustim_math::Affine2;
+use rustim_mobject::shapes::ShapeParams;
 use rustim_mobject::{NodeId, SceneTree, TextBlock};
+
+use crate::command::CommandError;
 
 /// What a caller wants shaped, beyond the string itself.
 ///
@@ -157,5 +161,56 @@ pub trait Typesetter {
         _tree: &mut SceneTree,
     ) -> Result<TypesetFormula, TypesetError> {
         Err(TypesetError::failed("this host does not typeset formulas"))
+    }
+}
+
+/// The protocol's spelling of a typesetter refusal.
+///
+/// `property` is the command field the source came from, so a refusal names the
+/// slot the caller actually wrote: `text` for an `add`, `formula` or `caption`
+/// for a template. A refusal that named the wrong field would send a model to
+/// rewrite the half of its payload that was fine.
+pub(crate) fn typeset_error(error: TypesetError, property: &str) -> CommandError {
+    match error {
+        TypesetError::Invalid { detail } => CommandError::OutOfRange {
+            property: property.to_owned(),
+            detail,
+        },
+        TypesetError::Failed { detail } => CommandError::Typeset { detail },
+    }
+}
+
+/// Apply a command's colour, label and transform to a compiled formula.
+///
+/// The compiler produces **geometry and no style**, so the colour has to be
+/// applied to every glyph and rule here rather than left to a later `set` of the
+/// root: opacity and paint do not inherit in this draw walk, which is also why
+/// `FormulaScene` colours its glyphs one by one. The root keeps its own label
+/// and transform, which are the parts a subtree *can* own.
+///
+/// Shared by `add` and the `explain.*` templates so the two cannot drift on
+/// which slot a formula's colour lands in.
+pub(crate) fn style_formula(tree: &mut SceneTree, formula: &TypesetFormula, params: &ShapeParams) {
+    let color = params.color.map_or(rustim_color::FG, |[r, g, b]| {
+        rustim_color::Srgb::from_rgba8(r, g, b, 255)
+    });
+    for id in &formula.nodes {
+        if let Some(m) = tree.get_mut(*id) {
+            m.style.fill = color;
+            m.style.fill_opacity = 1.0;
+            m.style.stroke_opacity = 0.0;
+        }
+    }
+    if let Some(m) = tree.get_mut(formula.root) {
+        if params.label.is_some() {
+            m.label = params.label.clone();
+        }
+        if let Some([x, y]) = params.position {
+            m.transform = Affine2::translate((x, y));
+        }
+        let scale = params.scale();
+        if scale != 1.0 {
+            m.transform *= Affine2::scale(scale);
+        }
     }
 }

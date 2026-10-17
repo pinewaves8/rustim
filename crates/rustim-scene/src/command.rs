@@ -291,6 +291,43 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// Compose a one-line equation: a typeset formula, optionally captioned.
+    ///
+    /// The first of the six `explain.*` templates — the *thick tools* of the
+    /// teaching tier. A primitive `add` of a `formula` asks for a symbol tree; a
+    /// template asks for an explanation, and the engine decides how the parts
+    /// sit relative to one another. Here the caption goes **under the formula's
+    /// own ink**, measured after the formula is compiled, so a tall fraction
+    /// pushes its caption down and a long one does not move it sideways.
+    ///
+    /// `scale` is the post-typeset uniform scale (the same slot an `add` of a
+    /// formula carries, and the only way to say "make this bigger" without
+    /// re-typesetting); `caption_size` is the caption's em size in world units.
+    /// `position` is where the template's **group** lands; the pieces are
+    /// placed in the group's own frame, so moving the group moves all of it.
+    ///
+    /// The reply's `created` is `[group, formula_root, caption?]`: the group is
+    /// what a lecture fades, moves or highlights as one thing, and the two
+    /// pieces stay addressable under it. Answered by [`crate::SceneContext::handle`]
+    /// — typesetting is the host's — and refused with
+    /// [`CommandError::Unsupported`] under `formula` (or `text`, for a caption)
+    /// before anything is inserted when the build cannot typeset.
+    #[serde(rename = "explain.equation")]
+    ExplainEquation {
+        formula: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scale: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<[u8; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Dim everything but an object for a moment, then bring it back.
     ///
     /// The attention helper a spoken explanation needs and `point_at` does not
@@ -631,6 +668,7 @@ pub const ACTIONS: &[&str] = &[
     "camera",
     "checkpoint",
     "events",
+    "explain.equation",
     "fit",
     "hello",
     "highlight",
@@ -670,6 +708,7 @@ impl Command {
             Self::Fit { .. } => "fit",
             Self::PointAt { .. } => "point_at",
             Self::Annotate { .. } => "annotate",
+            Self::ExplainEquation { .. } => "explain.equation",
             Self::Highlight { .. } => "highlight",
             Self::Play { .. } => "play",
             Self::Stop => "stop",
@@ -1815,6 +1854,10 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // fonts. The arm keeps `apply` total, so a direct caller replaying a
             // session log meets a no-op rather than a panic.
         }
+        Command::ExplainEquation { .. } => {
+            // Answered by `SceneContext::handle`: a template compiles a formula
+            // and typesets a caption, and `apply` may not read fonts.
+        }
         Command::Narrate { .. } => {
             // Answered by `SceneContext::handle`, because scheduling narration
             // needs the virtual clock and the narration track — neither of which
@@ -2661,6 +2704,12 @@ mod tests {
                 r#"{{"action":"annotate","target":{id},"text":"两条直角边是 3 和 4","direction":"up","buff":0.2,"length":1.5,"thickness":0.05,"arrow":false,"color":[100,181,246],"size":0.6,"max_width":4.0,"label":"注释"}}"#
             ),
             r#"{"action":"annotate","target":"三角形","text":"看这里"}"#.to_owned(),
+            // The first template: a formula with every slot filled, then the
+            // minimal spelling. The tag carries the template name, so a client
+            // sees six actions in `capabilities.actions` rather than one action
+            // with a sixth field to branch on.
+            r#"{"action":"explain.equation","formula":"a^2 + b^2 = c^2","position":[0.0,0.5],"scale":1.2,"color":[100,181,246],"caption":"勾股定理","caption_size":0.5,"label":"定理"}"#.to_owned(),
+            r#"{"action":"explain.equation","formula":"x^2"}"#.to_owned(),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for json in cases {
@@ -2740,6 +2789,15 @@ mod tests {
                 color: None,
                 size: None,
                 max_width: None,
+                label: None,
+            },
+            Command::ExplainEquation {
+                formula: "x^2".to_owned(),
+                position: None,
+                scale: None,
+                color: None,
+                caption: None,
+                caption_size: None,
                 label: None,
             },
         ] {
