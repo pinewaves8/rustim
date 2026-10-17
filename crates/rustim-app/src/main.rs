@@ -1460,6 +1460,21 @@ struct App {
     /// `None` is the default and the normal path: with no band there is not one
     /// extra draw op, which is what keeps every golden baseline byte-identical.
     caption: Option<rustim_app::caption::Caption>,
+    /// The self-voicing backend, when `--speak` found one.
+    ///
+    /// `None` also covers `--speak` on a machine with no synthesiser: the flag
+    /// asks, the machine answers, and the run continues with captions alone.
+    speaker: Option<rustim_app::speech::Speaker>,
+    /// The canonical scene name, for the opening summary.
+    scene_name: String,
+    /// Whether the opening summary is still owed.
+    ///
+    /// Owed on the **first frame**, after its accessibility update, not during
+    /// `resumed`: the live region has one slot and `was_animating` starts true,
+    /// so a static scene offers `animation ended` on frame one and would replace
+    /// a summary announced earlier. Injected on the frame's narration drain
+    /// instead, which is after that update has run.
+    summary_pending: bool,
     /// The live region's text as of the frame currently on screen.
     ///
     /// Compared against the text after `a11y.update` so a caption is set once per
@@ -1794,6 +1809,30 @@ impl ApplicationHandler<AppEvent> for App {
                     self.feed.refused += counts.refused;
                 }
 
+                // Narration due by the clock this frame's commands saw. Taken
+                // after them, so an `at: 0` line in a stdin feed is due in the
+                // same frame it arrived.
+                let mut narration = self.ctx.take_narration();
+                if std::mem::take(&mut self.summary_pending) && narration.is_empty() {
+                    // A script that opens with narration is saying something
+                    // more specific than "this is the scene"; do not talk over
+                    // it. With no narration, the summary is the opening line.
+                    let objects = self.ctx.semantic_tree(None).nodes.len().saturating_sub(1);
+                    narration.push(rustim_app::caption::scene_summary(
+                        &self.scene_name,
+                        objects,
+                    ));
+                }
+                if let Some(last) = narration.last()
+                    && let Some(caption) = self.caption.as_mut()
+                {
+                    // Set before the list is built, so a due line is drawn in
+                    // *this* frame rather than the next one. Speech happens
+                    // after the update below, where the AT's presence is known
+                    // for this frame rather than the previous one.
+                    caption.set_text(last.clone());
+                }
+
                 let t0 = Instant::now();
                 // `&mut *` rather than `&mut self.scene`: a `Box<dyn Scene>` does
                 // not coerce to `&mut dyn Scene` in argument position without the
@@ -1873,18 +1912,58 @@ impl ApplicationHandler<AppEvent> for App {
                 // reader is told and what is on screen describe the same state.
                 if let Some(w) = self.windowed.as_mut() {
                     w.a11y.update(&self.ctx, Instant::now());
+                    // Has anything ever listened? The push counters only move
+                    // inside `update_if_active`, whose closure does not run while
+                    // no assistive technology is attached. A screen reader that
+                    // later attaches turns self-voicing off on its own, and
+                    // detaching turns it back on — the counters do not reset.
+                    let attached = w.a11y.full_pushes() + w.a11y.incremental_pushes() > 0;
                     // The caption shows what the live region is saying, which is
                     // the same sentence a screen reader would. Reading it *after*
                     // the update means the band is one frame behind the
                     // announcement; reading it before would show last frame's
                     // text twice.
-                    if self.caption.is_some() {
-                        let live = w.a11y.core().live_text().to_owned();
-                        if live != self.last_live {
-                            if let Some(caption) = self.caption.as_mut() {
-                                caption.set_text(live.clone());
+                    let live = w.a11y.core().live_text().to_owned();
+                    if live != self.last_live {
+                        if let Some(caption) = self.caption.as_mut() {
+                            caption.set_text(live.clone());
+                        }
+                        // Two voices saying the same sentence is worse than one,
+                        // so the built-in synthesiser yields to a real reader.
+                        if !live.is_empty()
+                            && !attached
+                            && let Some(speaker) = self.speaker.as_ref()
+                        {
+                            speaker.say(&live);
+                        }
+                        self.last_live = live;
+                    }
+                    // Narration is content, not an event: it bypasses the
+                    // announcer (which drops anything less than 750 ms after the
+                    // last line) and is said in full, in order. The live region
+                    // can only hold one sentence, so a screen reader hears the
+                    // last line of a burst; a same-frame burst is a script
+                    // pacing problem, and `at` is the fix.
+                    if let Some(last) = narration.last() {
+                        if !attached && let Some(speaker) = self.speaker.as_ref() {
+                            for line in &narration {
+                                speaker.say(line);
                             }
-                            self.last_live = live;
+                        }
+                        // Written after the flush above, so the newest line is
+                        // what an attached reader receives on the next frame.
+                        w.a11y.core().narrate(last.clone());
+                        // The live region now says this line. Recording it keeps
+                        // the next frame from treating its own narration as a
+                        // fresh change and speaking it a second time.
+                        self.last_live = last.clone();
+                        // The caption was set from the narration before the
+                        // list was built; the live-change branch above may have
+                        // put an announcement ("动画结束") in its place since.
+                        // Put the narration back, so the word on screen matches
+                        // the word spoken.
+                        if let Some(caption) = self.caption.as_mut() {
+                            caption.set_text(last.clone());
                         }
                     }
                 }
@@ -1937,6 +2016,7 @@ fn main() {
     let mut reply = false;
     let mut probe = false;
     let mut captions = false;
+    let mut speak = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1998,11 +2078,15 @@ fn main() {
                 captions = true;
                 i += 1;
             }
+            "--speak" => {
+                speak = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 println!(
                     "rustim-app [--frames N] [--png OUT.png | --inspect | --a11y-probe] \
                      [--scene NAME] [--motion full|reduced] [--script PATH|-] [--reply] \
-                     [--captions]"
+                     [--captions] [--speak]"
                 );
                 println!("scenes: {}", scene_names());
                 println!("--inspect: print the accessibility tree as JSON to stdout");
@@ -2018,6 +2102,10 @@ fn main() {
                 println!(
                     "--captions: draw the live region's text (narration, focus, \
                      `animation ended`) at the bottom of the frame"
+                );
+                println!(
+                    "--speak: read the same text aloud with the platform's speech \
+                     synthesiser (silent while a screen reader is attached)"
                 );
                 println!(
                     "--a11y-probe: open a window, offer one announcement, and report on stderr \
@@ -2081,6 +2169,13 @@ fn main() {
     // accepting the pair would silently drop half of what was asked for.
     if captions && inspect {
         eprintln!("--captions needs a frame; --inspect prints a tree");
+        std::process::exit(2);
+    }
+    // Speech takes seconds and a headless run has no time axis: the still is
+    // captured in microseconds and the process exits, so every sentence would
+    // be cut off. Same discipline as `--a11y-probe`.
+    if speak && (inspect || png.is_some()) {
+        eprintln!("--speak needs the window; a headless run has no time to speak during");
         std::process::exit(2);
     }
 
@@ -2256,6 +2351,36 @@ fn main() {
         None
     };
 
+    // Built once, before the loop. A missing backend is a report and a `None`,
+    // not a refusal: the run itself is still exactly what was asked for, and a
+    // machine with no `espeak-ng` is the common case this path has to survive.
+    let speaker = if speak {
+        match rustim_app::speech::Platform::current() {
+            None => {
+                eprintln!(
+                    "speech: self-voicing is not implemented on this platform; \
+                     --captions still works"
+                );
+                None
+            }
+            Some(platform) => {
+                let found = std::env::var_os("PATH")
+                    .and_then(|path| rustim_app::speech::find_any_in(&path, platform.programs()));
+                match found {
+                    Some((program, _)) => Some(rustim_app::speech::Speaker::spawn(
+                        rustim_app::speech::ProcessVoice::new(program, platform),
+                    )),
+                    None => {
+                        eprintln!("{}", rustim_app::speech::missing_report(platform));
+                        None
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     let mut app = App {
         windowed: None,
         proxy,
@@ -2274,6 +2399,13 @@ fn main() {
         reply,
         probe,
         caption,
+        speaker,
+        scene_name: scene_name.clone(),
+        // The opening summary is only for a run that can *show* or *say* it —
+        // `--captions` or `--speak`. A plain run's live region keeps its
+        // existing behaviour, and the probe's own announcement is not competing
+        // with a scene description it did not ask for.
+        summary_pending: (captions || speak) && !probe,
         last_live: String::new(),
         feed: feed::Counts::default(),
         mods: ModifiersState::empty(),

@@ -215,6 +215,28 @@ impl A11yCore {
         self.announcer.offer(text);
     }
 
+    /// Say scripted narration now, **without** the announcement throttle.
+    ///
+    /// Narration is content, not an event. It is paced by its own script (`at`
+    /// on the wire), and pushing it through [`A11yCore::offer`] would silently
+    /// drop it: the announcer keeps one pending slot and a 750 ms window, so two
+    /// lecture lines closer together than that — or two due in the same frame —
+    /// would leave only the last one. Losing a sentence is a different failure
+    /// from coalescing two focus announcements, and it is not acceptable for the
+    /// channel the product exists to speak through.
+    ///
+    /// Writing the live text directly means the next [`A11yCore::to_update`]
+    /// carries it and resends the live node, because its text changed. It does
+    /// **not** touch the announcer's pending slot or its dedupe memory: an
+    /// announcement offered later still flushes, and being the newer event it
+    /// wins the single live slot. The caller that also captions or speaks the
+    /// line must do so from the narration itself rather than from
+    /// [`A11yCore::live_text`], so that a narration overwritten in the same frame
+    /// is still read aloud.
+    pub fn narrate(&mut self, text: impl Into<String>) {
+        self.live = text.into();
+    }
+
     /// Project the scene into an AccessKit update — complete the first time,
     /// differential afterwards.
     ///
@@ -996,6 +1018,31 @@ mod tests {
         let later = now + core.announcer.min_interval();
         core.flush(later);
         assert_eq!(core.live_text(), "动效：完整");
+    }
+
+    /// Narration is content, not an event: it is said immediately, two lines in
+    /// a row both land, and it does not consume the announcer's pending slot.
+    #[test]
+    fn narration_is_said_at_once_and_is_not_throttled() {
+        let mut core = A11yCore::new();
+        core.narrate("第一句");
+        assert_eq!(
+            core.live_text(),
+            "第一句",
+            "narration must not wait for the 750 ms window"
+        );
+        core.narrate("第二句");
+        assert_eq!(core.live_text(), "第二句");
+
+        // An announcement offered before the narration is still pending; being
+        // the newer event, it flushes over the narration.
+        core.offer("动画结束");
+        assert_eq!(core.live_text(), "第二句", "offered, not yet spoken");
+        core.flush(Instant::now());
+        assert_eq!(core.live_text(), "动画结束");
+
+        core.narrate("第三句");
+        assert_eq!(core.live_text(), "第三句");
     }
 
     #[test]

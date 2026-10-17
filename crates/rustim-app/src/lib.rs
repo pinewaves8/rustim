@@ -28,6 +28,7 @@ pub mod caption;
 pub mod feed;
 pub mod input;
 pub mod motion;
+pub mod speech;
 pub mod text;
 
 pub use a11y::{A11y, A11yCore, Request};
