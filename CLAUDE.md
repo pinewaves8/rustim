@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **611 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **621 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -245,8 +245,12 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   registry and the suite disagree in either direction, so a new scene cannot skip its baseline.
 - **A missing baseline fails.** Never skip: that is how a whole platform goes unchecked. The failing
   run leaves its render in `target/golden-artifacts/`, which the CI job uploads, so bootstrapping a
-  platform is "download, review, commit" — the macOS and Windows baselines were made that way, not on
-  this machine.
+  platform is "download, review, commit". **Only `linux-aarch64.png` is checked in for each scene
+  today.** The macOS and Windows baselines have *not* been made: this machine cannot reach
+  `github.com`, so the artifacts the CI job would have uploaded are unreachable from here, and the
+  suite therefore fails on those two platforms by design rather than skipping them. That is
+  development-list item 1, blocked on how the artifacts are to be obtained (see the memory note and
+  the roadmap); do not invent baselines or weaken the missing-baseline rule to make the job green.
 - **The thresholds are §5.2's measured ones and are not to be relaxed**: identical content bounding
   boxes, zero pixels differing by more than 8, maximum channel error 3. The comparison lives in
   `rustim_export::compare` (not in the test), and the `rustim-compare` CLI is a thin shell over the
@@ -299,7 +303,8 @@ matched pair: the `scene_by_name` match (~:997) and the literal array in `scene_
 `--help` prints. The baseline guarantee above reads `--help`, so a scene wired into the match but not
 into that array is *not* offered by `--help`, and the suite's check cannot see it — it compiles, runs,
 and silently skips its baseline. Register it in both, then bootstrap the baseline for the arch you
-are on; the other two platforms are bootstrapped from the CI artifact (above).
+are on; the other two platforms would be bootstrapped from the CI artifact, which is still owed
+(above).
 
 ## Architecture
 
@@ -322,7 +327,7 @@ last property.
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
-| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
+| `rustim-app` | The winit event loop, softbuffer presentation, keyboard and pointer input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
 | `rustim-web` | The browser host: `Session` (scene + context + renderer + draw list, target-independent and testable natively), `aria` (the semantic tree → flat ARIA projection), `web` (the wasm shell: canvas, rAF loop, DOM/ARIA overlay), the command bridge and the optional `formula` scene | Real (Chrome-verified) |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
@@ -454,6 +459,70 @@ pixel bounds back to world coordinates without re-deriving the projection. `text
 take the **composed world→device transform** (`SceneContext::affine()`), not a `Viewport`: there is
 deliberately no camera-free variant, because a caller that forgot the camera would draw
 correct-looking text in the wrong place while every filled path moved correctly.
+
+### Pointer input
+
+The window handles three pointer events and they are the camera's manual controls: **left-button
+drag pans**, **wheel/trackpad scroll zooms about the cursor**. Before this there were no pointer
+events at all — the event loop matched keys, resize and redraw and dropped everything else.
+
+- **The arithmetic is pure, in `rustim-math`.** `Camera::panned(viewport, delta_px)` is one division
+  by `pixels_per_unit`: dragging 90 px at zoom 1 moves the centre by one world unit, with the y sign
+  flipped because winit's y runs down. `Camera::zoomed_about(viewport, factor, cursor_px)` zooms
+  first, then shifts the centre by the displacement that puts the **same world point back under the
+  cursor**, so the view grows around the pointer rather than jumping. Both return `self` on a
+  degenerate viewport, zoom or delta: pointer input has no error channel, and the tree's invariant —
+  finite, positive zoom — has to survive whatever the platform sends.
+- **The wheel's factor is multiplicative, `exp(k · delta)`.** Equal scroll steps multiply the zoom by
+  equal ratios, so ten notches in and ten out return to the start and a notch feels the same at every
+  scale; adding a constant would be a huge jump zoomed out and invisible zoomed in. winit reports
+  notches (`LineDelta`) and trackpad pixels (`PixelDelta`), which are not convertible — the OS decides
+  how many pixels a notch is — so `input::WheelDelta` keeps the unit and gives each its own rate
+  (`0.25`/line ⇒ ×1.284 per notch, `0.002`/px). Horizontal scroll is dropped rather than folded in.
+- **The clamp is the host's, and it clamps the factor rather than the zoom.** `0.05..=64` is the range
+  in which a gesture stays reversible; a script may still ask the command layer for any positive
+  zoom. `input::clamped_zoom_factor(current, factor)` re-expresses the factor so the product lands on
+  the limit exactly — clamping the resulting zoom instead would move the centre and break the
+  cursor-anchor invariant.
+- **Both gestures end at the command layer**, as `{"action":"camera","center":…,"zoom":…}` with no
+  `duration` — the same command an AI or a script sends, through the same validator. A pointer is one
+  more host of the protocol, not a side door into `tree.camera`. An instant write is not an
+  animation, so pointer input is motion-mode independent; and an in-flight `CameraMove` still owns
+  its subject, so a drag during one is overwritten until the move ends (the documented contract
+  `Set position` has with `MoveTo`).
+- **`MouseWheel` and `MouseInput` carry no position**, so `App` tracks the last `CursorMoved` in
+  `cursor: Option<(f64, f64)>`; a wheel before the pointer ever entered has no anchor and is ignored.
+  The drag is released on `CursorLeft` and on losing focus, because the button-up can happen outside
+  the window where no `MouseInput` follows — coming back in must not pan with a button nobody holds.
+  `Drag::press` deliberately keeps the last position, so the first movement after the button goes
+  down produces a correct delta instead of being swallowed as the anchor.
+- **A gesture continues from the previous gesture, not from the screen.** A cursor can move several
+  times between two frames, and each delta has to apply to the camera the *earlier delta of that
+  frame* produced — reading `tree.camera` every time keeps only the last move and makes a fast drag
+  trail the pointer. `input::gesture_base(pending, live)` is that one decision; `App` clears the
+  pending camera once the frame has applied its commands.
+
+The classifier is winit-free except for two-line adapters (`WheelDelta::from_winit`,
+`KeyPress::from_event`), so the gesture arithmetic is tested in CI where there is no window: the pan
+follows the pointer at every zoom, zooming about a cursor keeps its world point fixed to `1e-12` at
+four start zooms × four cursor corners × four factors, malformed factors are the identity, and the
+clamp lands exactly on both limits.
+
+The real-machine evidence is an external gesture, because no unit test can prove winit delivered
+anything: `xdotool` drags the window by 100 px over 1600×900 (112.5 px/unit, so the query reply's
+`camera.center.x` becomes exactly `-0.888888…`) and sends one wheel event (`xdotool mousedown 4`,
+which makes `zoom` exactly `1.2840254166877414 = e^0.25`), read back through `--script - --reply`
+and a `query`; the cursor's world point is the same before and after the zoom. **All eight goldens
+are unchanged** — the step adds an input path, not a drawing one. Deferred, deliberately: touch and
+pinch, inertia, right/middle-button gestures, pointer capture beyond the window edge, and having a
+click move keyboard focus.
+
+One measurement trap belongs here because it cost a confusing run: **`xdotool click 4` is not one
+notch.** It sends a button press *and* a release, and winit 0.30's X11 backend maps buttons 4–7 to
+`MouseWheel` on both (`event_processor.rs:1083-1091` ignores the event's press/release state for
+those buttons), so a `click 4` zooms twice and the reply reads `e^0.5`. A real wheel is unaffected —
+the same source notes evdev reports it as axis motion, which arrives as one event — but an
+automated check has to use `mousedown 4`, or assert `e^0.5` and say why.
 
 ### Axes, number lines and plots
 
@@ -881,7 +950,10 @@ the description, position lives in `bounds`, which the backends only report when
 The conversation with a platform is deliberately narrow: Tab/Shift+Tab move focus, the arrow keys
 become `Property::Opacity` **commands** (the same ones an AI sends, through the same validator),
 space toggles playback, `,`/`.` step a frame, Enter re-reads the focused object, Escape drops focus,
-and `m` flips the motion mode (`{"action":"motion"}` — see "Reduced motion").
+and `m` flips the motion mode (`{"action":"motion"}` — see "Reduced motion"). The pointer has two
+gestures of its own — drag to pan, wheel to zoom — which also become commands rather than direct
+writes (see "Pointer input"); a click does not move the keyboard focus, because "focus follows
+click" is a decision about the Tab order and not a side effect of panning.
 `rustim-app::announce` throttles announcements and holds rather than drops a burst, so an animation
 ending says where things ended up instead of narrating the whole transition.
 
@@ -1737,8 +1809,8 @@ Deferred, deliberately, and reported rather than dropped: `Formula::skipped_shap
 `FrameItem::Shape` cases that are neither a rule nor a rect (a `Geometry::Curve` needs a real
 stroker) and any `FrameItem::Image`; per-run colour is not carried over (every glyph takes the
 engine's colour), link annotations are ignored, and `GroupItem::clip` is not applied — math nests
-groups for layout but does not clip them. macOS and Windows `formula` baselines are bootstrapped
-from the CI artifact like the other scenes'.
+groups for layout but does not clip them. The macOS and Windows `formula` baselines are owed like
+every other scene's — only `linux-aarch64.png` is checked in (see "Golden images").
 
 The two commands that catch the failure modes above are
 `cargo tree -p rustim-text -i skrifa@0.44.0` and `cargo tree -i ttf-parser` — **and the version is
@@ -1933,10 +2005,11 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   camera". The regression evidence is the strongest kind this repository has: the seven goldens
   rendered **pixel-identical with no rebless**, because the default camera reproduces the old
   projection bit-for-bit. The `--inspect` snapshot gained `camera: CameraView` so a host can map its
-  pixel bounds back to world coordinates. Deferred, deliberately: pointer pan/wheel zoom (the
-  repository still handles no pointer events at all — input wiring is its own step), a `Rotating`
-  animation (`duration = ∞` makes `alpha = age/∞ = 0`, freezing it while `is_playing` stays true;
-  this needs a scheduler concept for perpetual animations), and any announcement of a camera change.
+  pixel bounds back to world coordinates. Pointer pan/wheel zoom was deferred here and **landed as
+  P3+ step 23** (see "Pointer input" and the roadmap entry below). Still deferred, deliberately:
+  a `Rotating` animation (`duration = ∞` makes `alpha = age/∞ = 0`, freezing it while `is_playing`
+  stays true; this needs a scheduler concept for perpetual animations), and any announcement of a
+  camera change.
 - **P3's coordinate systems are done** (the second half). `ShapeKind::{NumberLine, Axes, Plot}` with
   the `range`/`x_range`/`y_range`/`step`/`tick_size`/`points` parameters, `NodeKind::NumberLine`,
   `AxesScale`, the a11y rules and the wire-round-trip cases all landed, and the `axes` scene put them
@@ -1946,9 +2019,10 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   baseline are deliberate: the parabola is `0.25x² − 1.75` rather than ending at the range's floor
   (an apex at `-2` ran through the y axis's own `-2` label), and samples above `y_range` are dropped
   so the curve ends on the frame. Deferred, deliberately: an expression language (the host samples,
-  per decision), pointer pan/zoom, axis arrows and subticks, automatic label layout and number
-  formatting, `focus` on a group (its bounding box would need descendants), per-tick
-  addressability/styling, and text bounds — which is why `focus` still refuses a text node.
+  per decision), axis arrows and subticks, automatic label layout and number formatting, `focus` on a
+  group (its bounding box would need descendants), per-tick addressability/styling, and text bounds
+  — which is why `focus` still refuses a text node. Pointer pan/zoom was on this list and landed in
+  step 23.
 - **P3's strokes are done.** `SceneContext::build_draw_list` emits a `DrawOp::StrokePath` beside the
   fill, each pass carrying its own multiplicative alpha, with the width in **world units** so it
   scales with the camera — see "Strokes" for the four properties and the two vocabulary consequences.
@@ -2168,6 +2242,22 @@ pairing end to end, because each unit hop can stay green while the scene stops s
 - **P3+ — the AI command surface at full width: done** — query (22a), label addressing (22b),
   stop/interrupt (22c). The only known limit left is that `--reply` and `--inspect` both want
   stdout, which is a transport question rather than a protocol one.
+- **P3+ step 23 — pointer interaction is done**, and it is a host-layer step: no kernel, renderer or
+  protocol change, and no scene has one more draw op. `Camera::panned` / `Camera::zoomed_about` are
+  pure functions in `rustim-math`; `rustim-app::input` gained `Drag`, `WheelDelta`, `zoom_factor`
+  and `clamped_zoom_factor` as winit-free state and arithmetic; `main.rs` handles `CursorMoved`,
+  `MouseInput` and `MouseWheel` and pushes `Command::Camera` through the ordinary queue. See
+  "Pointer input" for the pan/zoom algebra, why the wheel is `exp(k · delta)`, and why the clamp is
+  applied to the factor rather than the zoom. Evidence: three `rustim-math` tests (pointer-following,
+  cursor-anchor invariance to `1e-12` over a 4×4×4 grid, degenerate inputs) and seven `input.rs` tests
+  (drag state, first-move anchoring, unit-preserving scroll adapter, multiplicative zoom, malformed
+  deltas, the clamp's exact limits, and per-frame gesture accumulation), plus an **external** real-machine check with `xdotool`: a
+  100 px drag over a 1600×900 frame makes the `query` reply's `camera.center.x` exactly
+  `-0.888888…`, and one wheel event (`xdotool mousedown 4`) makes `zoom` exactly
+  `1.2840254166877414 = e^0.25`, with the cursor's world point unchanged. (`xdotool click 4`
+  would zoom twice — see the measurement trap under "Pointer input".) **All eight goldens
+  are unchanged**, and the count moved 611 → 621. Deferred: touch/pinch, inertia, right- and
+  middle-button gestures, capture outside the window, and click-to-focus.
 
 ## AI integration
 

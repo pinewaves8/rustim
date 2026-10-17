@@ -82,6 +82,73 @@ impl Camera {
     pub fn visible_height(&self) -> f64 {
         Self::WORLD_HEIGHT / self.zoom
     }
+
+    /// The camera after the content has been dragged by `delta_px`.
+    ///
+    /// `delta_px` is a **screen** delta — y down, the way winit reports a
+    /// pointer — and the content follows it: dragging right moves the world
+    /// right, which means the centre moves left. Dividing by
+    /// [`Viewport::pixels_per_unit`] is what makes the drag stay under the
+    /// pointer: at any zoom, a pixel of pointer travel is a pixel of world
+    /// travel on screen.
+    ///
+    /// A degenerate viewport (zero frame height, or a camera that is already
+    /// invalid) returns `self` rather than writing `NaN` into the tree. This is
+    /// pointer input, where a resize race can hand over any rectangle at all;
+    /// it is not a command boundary, so there is no error value to return.
+    pub fn panned(self, viewport: &Viewport, delta_px: (f64, f64)) -> Self {
+        let scale = viewport.pixels_per_unit(&self);
+        if !scale.is_finite() || scale <= 0.0 {
+            return self;
+        }
+        let center = (
+            self.center.0 - delta_px.0 / scale,
+            self.center.1 + delta_px.1 / scale,
+        );
+        if !center.0.is_finite() || !center.1.is_finite() {
+            return self;
+        }
+        Self {
+            center,
+            zoom: self.zoom,
+        }
+    }
+
+    /// The camera after zooming by `factor` about a screen point.
+    ///
+    /// The world point under `cursor_px` is **invariant**: the zoom happens
+    /// first, then the centre is shifted by whatever displacement puts the same
+    /// world point back under the pointer. That is what makes wheel zoom feel
+    /// like a view control rather than a jump — and `factor > 1` zooms in.
+    ///
+    /// A non-finite or non-positive factor, or one that would make the zoom
+    /// itself invalid, returns `self`. The guards are the same posture as
+    /// [`Self::panned`]'s: pointer input has no error channel, and the tree's
+    /// invariant — finite, positive zoom — must survive whatever the platform
+    /// sends.
+    pub fn zoomed_about(self, viewport: &Viewport, factor: f64, cursor_px: (f64, f64)) -> Self {
+        if !factor.is_finite() || factor <= 0.0 {
+            return self;
+        }
+        let zoom = self.zoom * factor;
+        if !zoom.is_finite() || zoom <= 0.0 {
+            return self;
+        }
+        let anchor = viewport.to_world(&self, cursor_px);
+        let next = Self {
+            center: self.center,
+            zoom,
+        };
+        let after = viewport.to_world(&next, cursor_px);
+        let center = (
+            next.center.0 + (anchor.0 - after.0),
+            next.center.1 + (anchor.1 - after.1),
+        );
+        if !center.0.is_finite() || !center.1.is_finite() {
+            return self;
+        }
+        Self { center, zoom }
+    }
 }
 
 /// `zoom = 1.0` by hand, not by derive.
@@ -252,5 +319,76 @@ mod tests {
         assert_eq!(camera.zoom, 1.0);
         assert_eq!(camera.visible_height(), Camera::WORLD_HEIGHT);
         assert!(camera.visible_height().is_finite());
+    }
+
+    /// A drag moves the content under the pointer, one screen pixel per pixel
+    /// of travel — at every zoom, and with the y sign flipped.
+    #[test]
+    fn a_pan_moves_the_content_with_the_pointer() {
+        let vp = Viewport::default();
+        let camera = Camera::new((1.0, 2.0), 1.0);
+        // Drag right and down by 90 px: one world unit each way, at zoom 1.
+        let panned = camera.panned(&vp, (90.0, 90.0));
+        assert_eq!(panned.center, (0.0, 3.0));
+        assert_eq!(panned.zoom, camera.zoom);
+
+        // The content really followed: a world point that was at screen (640,
+        // 360) is now at (730, 450).
+        let before = vp.to_screen(&camera, camera.center);
+        let after = vp.to_screen(&panned, camera.center);
+        assert_eq!(after, (before.0 + 90.0, before.1 + 90.0));
+    }
+
+    /// Zooming about a cursor leaves the world point under that cursor exactly
+    /// where it was, at any starting zoom.
+    #[test]
+    fn zooming_about_a_point_keeps_that_point_under_the_pointer() {
+        let vp = Viewport::default();
+        for camera in [
+            Camera::default(),
+            Camera::new((1.25, -0.75), 2.0),
+            Camera::new((-3.0, 4.0), 0.5),
+        ] {
+            for cursor in [(0.0, 0.0), (640.0, 360.0), (1000.0, 120.0), (1279.0, 719.0)] {
+                let anchor = vp.to_world(&camera, cursor);
+                for factor in [0.5, 1.1, 2.0, 8.0] {
+                    let zoomed = camera.zoomed_about(&vp, factor, cursor);
+                    assert_eq!(zoomed.zoom, camera.zoom * factor);
+                    let after = vp.to_world(&zoomed, cursor);
+                    assert!(
+                        (after.0 - anchor.0).abs() < 1e-12 && (after.1 - anchor.1).abs() < 1e-12,
+                        "{camera:?} x{factor} at {cursor:?}: {anchor:?} -> {after:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pointer input has no error channel, so a bad value has to leave the
+    /// camera alone rather than write a zoom the projection cannot survive.
+    #[test]
+    fn degenerate_pointer_cameras_are_unchanged() {
+        let vp = Viewport::default();
+        let camera = Camera::new((1.0, 2.0), 2.0);
+        for factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                camera.zoomed_about(&vp, factor, (640.0, 360.0)),
+                camera,
+                "factor {factor}"
+            );
+        }
+        // A frame with no height has no scale to pan in, and a crashed window
+        // can hand one over before its first `Resized`.
+        let flat = Viewport {
+            frame_width: 1280,
+            frame_height: 0,
+        };
+        assert_eq!(camera.panned(&flat, (10.0, 10.0)), camera);
+        // A camera whose zoom is already degenerate is the other route in.
+        let broken = Camera::new((0.0, 0.0), 0.0);
+        assert_eq!(broken.panned(&vp, (10.0, 10.0)), broken);
+        // Panning a valid camera with a valid viewport is exact, not approximate:
+        // it is one division and two subtractions.
+        assert!(camera.panned(&vp, (10.0, 10.0)).center.0.is_finite());
     }
 }

@@ -42,7 +42,7 @@ use rustim_scene::command::{Command, MotionMode};
 use rustim_scene::{Scene, SceneContext};
 use rustim_text::{FontProvider, ShapedText, TextStyle};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
@@ -1461,6 +1461,25 @@ struct App {
     /// own event, so this is tracked across events rather than read off the
     /// keypress — a Shift+Tab that read `event` alone would look like a Tab.
     mods: ModifiersState,
+    /// The last cursor position winit reported, in window pixels.
+    ///
+    /// `MouseWheel` and `MouseInput` carry no position — winit reports the
+    /// pointer separately — so the anchor for "zoom about the cursor" is the
+    /// last `CursorMoved`. Before the pointer has ever entered the window there
+    /// is no anchor, and a wheel event is ignored rather than zooming about an
+    /// invented position.
+    cursor: Option<(f64, f64)>,
+    /// The left button's drag, for panning the camera.
+    drag: input::Drag,
+    /// The camera the pointer has asked for since the last frame.
+    ///
+    /// A cursor can move several times between two frames — a 1000 Hz mouse, a
+    /// slow frame — and each delta has to apply to the **previous gesture's**
+    /// result. Reading `tree.camera` each time would compute every move from
+    /// the camera still on screen and throw all but the last away, so a fast
+    /// drag would trail the pointer. Cleared once the frame has applied the
+    /// commands it produced.
+    pointer_camera: Option<Camera>,
     /// Whether the animation clock runs. Space toggles it.
     paused: bool,
     /// Frames owed to `,` and `.`, signed. Clamped so that holding the key does
@@ -1486,6 +1505,50 @@ impl App {
     fn request_redraw(&self) {
         if let Some(w) = &self.windowed {
             w.window.request_redraw();
+        }
+    }
+
+    /// Adopt a pointer gesture's camera.
+    ///
+    /// Both gestures end here, and they end at the **command layer**, not by
+    /// writing `tree.camera` directly: a pointer is one more host of the same
+    /// protocol an AI and a script use, so a zoom the command validator would
+    /// refuse cannot arrive through the mouse instead. The command has no
+    /// `duration`, which is what makes it an instant write — the picture
+    /// follows the hand rather than animating behind it.
+    fn queue_camera(&mut self, camera: Camera) {
+        self.queued.push(Command::Camera {
+            center: Some([camera.center.0, camera.center.1]),
+            zoom: Some(camera.zoom),
+            focus: None,
+            duration: None,
+        });
+    }
+
+    /// A left-button drag, in screen pixels. The content follows the pointer.
+    fn pan(&mut self, delta_px: (f64, f64)) {
+        // The *pending* camera, not the one on screen: a cursor moving faster
+        // than the frame rate produces several deltas before any of them is
+        // applied, and each has to continue from the previous one.
+        let camera = input::gesture_base(self.pointer_camera, *self.ctx.camera());
+        let next = camera.panned(&self.ctx.viewport, delta_px);
+        if next != camera {
+            self.pointer_camera = Some(next);
+            self.queue_camera(next);
+        }
+    }
+
+    /// A wheel scroll about `at`, clamped to the range a gesture can undo.
+    fn zoom(&mut self, delta: input::WheelDelta, at: (f64, f64)) {
+        let camera = input::gesture_base(self.pointer_camera, *self.ctx.camera());
+        let factor = input::clamped_zoom_factor(camera.zoom, input::zoom_factor(delta));
+        if factor == 1.0 {
+            return;
+        }
+        let next = camera.zoomed_about(&self.ctx.viewport, factor, at);
+        if next != camera {
+            self.pointer_camera = Some(next);
+            self.queue_camera(next);
         }
     }
 
@@ -1719,6 +1782,32 @@ impl ApplicationHandler<AppEvent> for App {
                     self.handle_intent(intent);
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                let at = (position.x, position.y);
+                self.cursor = Some(at);
+                if let Some(delta) = self.drag.moved(at) {
+                    self.pan(delta);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => self.drag.press(),
+                        ElementState::Released => self.drag.release(),
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(at) = self.cursor {
+                    self.zoom(input::WheelDelta::from_winit(delta), at);
+                }
+            }
+            // The button-up can happen outside the window, where no
+            // `MouseInput` follows. Dropping the drag here means coming back in
+            // does not pan with a button nobody is holding.
+            WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => {
+                self.drag.release();
+            }
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
                     if let Some(w) = self.windowed.as_mut() {
@@ -1768,6 +1857,10 @@ impl ApplicationHandler<AppEvent> for App {
                         Err(e) => eprintln!("command refused: {e}"),
                     }
                 }
+                // The gesture commands above have been applied (or refused);
+                // either way the next gesture starts from the camera that is
+                // now in the tree.
+                self.pointer_camera = None;
 
                 // The lines a feed delivered since the last frame. Through
                 // `feed::apply_all` rather than `ctx.handle` in a loop, so the
@@ -2586,6 +2679,9 @@ fn main() {
         last_live: String::new(),
         feed: feed::Counts::default(),
         mods: ModifiersState::empty(),
+        cursor: None,
+        drag: input::Drag::new(),
+        pointer_camera: None,
         paused: false,
         step: 0,
         was_animating: true,
