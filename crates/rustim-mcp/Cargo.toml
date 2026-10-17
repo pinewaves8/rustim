@@ -1,0 +1,36 @@
+[package]
+name = "rustim-mcp"
+description = "The MCP adapter: rustim's command protocol behind the Model Context Protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The adapter is a *host*, and a deliberately thin one: the protocol layer
+# (`src/mcp.rs`) knows serde and the command vocabulary, nothing else. The
+# session it drives comes from `rustim-daemon`'s library, which is the same
+# `Hub`/`SessionHandle` the socket server builds — so an MCP tool call and a
+# WebSocket method meet in one `SceneContext::handle`, and neither transport can
+# grow a capability the other lacks. The dependency is on the daemon's *library*
+# (its crate docs demonstrate embedding `Hub` under a different listener); this
+# crate never opens a socket.
+[dependencies]
+rustim-scene.workspace = true
+rustim-daemon.workspace = true
+# `float_roundtrip` for the same reason every other crate names it: a reply
+# carries computed floats, and a document echoed back to a model must be the one
+# the engine wrote, to the byte.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# Only the runtime that owns the session channels. The session thread builds its
+# own current-thread runtime inside `rustim-daemon`; the main thread blocks on
+# one here, because stdio is a blocking transport.
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+# The envelope's unit tests drive a bare `SceneContext` on the test thread —
+# the same engine the binary runs, without the session thread or the clock
+# driver. `rustim-scene` re-exports `SceneContext`; these two supply the
+# viewport and the motion policy its constructor takes.
+[dev-dependencies]
+rustim-anim.workspace = true
+rustim-math.workspace = true
+

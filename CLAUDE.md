@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **780 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **803 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -76,7 +76,10 @@ protocol's framing promises are checked by a client that has no access to engine
 "External drivers and the AI surface". The **daemon** is verified over real loopback WebSockets:
 `crates/rustim-daemon/tests/daemon.rs` dials a real listener with twelve clients and asserts
 sessions, reconnects, refusal vocabulary, transport error codes, clocks and the multi-client event
-fan-out — see "The daemon". The count is not
+fan-out — see "The daemon". The **MCP adapter** is verified over a real stdio pipe:
+`crates/rustim-mcp/tests/mcp.rs` launches the binary eleven times and asserts the handshake, the
+tool catalogue, batch/validate/query through the session thread, the two failure vocabularies, the
+manual clock, and CJK text and a formula typeset through the pipe — see "MCP". The count is not
 decoration — every one of those claims is re-run by the commands below, and the P2 rows in the
 roadmap say which step last moved it.
 
@@ -149,6 +152,9 @@ cargo run -p rustim-app -- --script crates/rustim-app/tests/fixtures/script/sess
 cargo run -p rustim-daemon           # ws://127.0.0.1:7300, blank scene, auto clock
 cargo run -p rustim-daemon -- --scene pythagorean --clock manual --no-typeset
 #   a client attaches over WebSocket/JSON-RPC; see 驱动协议v1.md §1.2 and 使用说明.md §4.5
+cargo build --release -p rustim-mcp  # the MCP server a client launches on stdio
+cargo run -p rustim-mcp -- --scene blank --clock manual   # speak JSON-RPC on stdin by hand
+#   initialize / tools/list / tools/call; see 驱动协议v1.md §1.3 and 使用说明.md §4.6
 cargo test --workspace               # unit tests across all crates
 cargo test -p rustim-math ease_in_out       # a single test by name
 cargo test -p rustim-math --test manim_parity   # replay the checked-in Manim fixtures
@@ -163,6 +169,8 @@ cargo test -p rustim-app --test conformance     # the protocol, driven only thro
 cargo test -p rustim-client          # the client's framing rules, over in-memory streams
 cargo test -p rustim-daemon          # sessions, RPC envelope, and real loopback WebSockets
 cargo test -p rustim-daemon --test daemon   # ...only the socket-level integration suite
+cargo test -p rustim-mcp            # the MCP envelope and tools, natively
+cargo test -p rustim-mcp --test mcp # ...only the real-process stdio suite
 cargo test -p rustim-export --test compare_cli  # the visual-regression CLI's exit codes
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo test -p rustim-web             # the browser session core, natively (no Chrome, no wasm)
@@ -370,6 +378,7 @@ last property.
 | `rustim-app` | The winit event loop, softbuffer presentation, keyboard and pointer input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, `typeset` (the desktop `Typesetter`: parley text, Typst formulas, installed on every `SceneContext` the binary builds), the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
 | `rustim-web` | The browser host: `Session` (scene + context + renderer + draw list, target-independent and testable natively), `aria` (the semantic tree → flat ARIA projection), `pointer` (DOM wheel/pointer units and signs → `rustim-math::gesture`, pure and natively tested), `typeset` (the formula-only `Typesetter`, `from_embedded`, under the `formula` feature), `web` (the wasm shell: canvas, rAF loop, pointer/wheel listeners, DOM/ARIA overlay), the command bridge and the optional `formula` scene | Real (Chrome-verified) |
 | `rustim-daemon` | The long-running WebSocket host: `rpc` (the JSON-RPC envelope, method vocabulary and error codes), `session` (`Hub`, `SessionHandle`, `AttachSpec`, `ClockMode` — one thread and one `current_thread` runtime per session), `typeset` (the `Typesetter`: parley text and Typst formulas, built lazily), `server` (accept loop, per-connection dispatch, event fan-out), and the `rustim-daemon` binary (`--listen`, `--scene`, `--clock`, `--no-typeset`) | Real (loopback-verified) |
+| `rustim-mcp` | The MCP host: `mcp` (the JSON-RPC 2.0 envelope over newline-delimited stdio — `initialize`, `ping`, `tools/list`, `tools/call`, version negotiation, and the rule that a refusal is an `isError` tool result rather than a protocol error) and `tools` (the five-tool catalogue and the arguments → protocol-command translation) | Real (stdio-verified) |
 | `rustim-client` | The **client half** of the command protocol: `read_reply` (one reply line, the presence rule enforced) and `StdioClient` (spawn, `send`, `send_raw`, `write_raw`, `hello`, `close`, seq checking). No engine logic, no rendering, no platform code — it spawns a process, which is a host's job, so it is **not** one of the six wasm kernel crates | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
@@ -377,7 +386,11 @@ if the renderer ever grows a heavier surface, `DrawList` should move down instea
 beside `rustim-app`, not under it: both are hosts of the same kernel, and neither depends on the
 other. `rustim-daemon` is a third host on the same shelf — it depends on `rustim-scene`,
 `rustim-scenes` and `rustim-text`, never on `rustim-app` or `rustim-web`, and it names no
-rasteriser of its own — it never renders, so it emits no `frame_ready`. `rustim-client` is not a
+rasteriser of its own — it never renders, so it emits no `frame_ready`. `rustim-mcp` is a fourth
+host and the thinnest: it depends on `rustim-scene` and on `rustim-daemon`'s *library*, because it
+embeds the daemon's `Hub` rather than owning a second session mechanism. That is the design, not an
+accident — a tool call over MCP and a method over a WebSocket must meet in one
+`SceneContext::handle`, and re-using the hub is what makes that structural rather than a promise. `rustim-client` is not a
 host and not a kernel crate: it is the workspace's own *external*
 consumer of `rustim-scene`'s protocol, existing so that the conformance suite cannot lean on
 anything a driver outside the workspace lacks.
@@ -2449,9 +2462,9 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   linter, daemon/MCP) are in `贾维斯集成方案.md`; the wire itself is `驱动协议v1.md`, and
   `使用说明.md` §4 documents the handshake for a user. Deliberately not done here: label addressing
   already existed (step 22b), and no second transport, no MCP surface, no checkpointing — those are
-  later phases and the documents say so. Three of those have since landed — checkpointing/undo,
-  the `hello` teaching profile, and the WebSocket/JSON-RPC transport (`rustim-daemon`) — see the
-  Phase 1 bullets below; MCP is still planned.
+  later phases and the documents say so. Four of those have since landed — checkpointing/undo,
+  the `hello` teaching profile, the WebSocket/JSON-RPC transport (`rustim-daemon`) and the MCP
+  adapter (`rustim-mcp`) — see the Phase 1 bullets below.
 - **Phase 1's first slice — wire-level `text` / `formula` / `group` — is done.** `add` now accepts
   the three kinds that made a scripted lecture impossible: a sentence, a Typst formula and a group
   that adopts existing nodes by `Target`, all through the ordinary command feed. The structural
@@ -2608,6 +2621,32 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   eight goldens are unchanged** — the daemon draws nothing — and the count moved 745 → 780.
   Deliberately deferred: authentication (loopback is the boundary), persistence and resumable
   sessions, audio scheduling for `narrate`, a target-scoped stop, and any rendering/`frame_ready`.
+- **Phase 1's eighth slice — `rustim-mcp` — is done**, and it is the transport that lets a model
+  drive the engine without a bespoke client. A new crate with a binary: newline-delimited JSON-RPC
+  2.0 on stdio (MCP 2025-11-25, accepting 2024-11-05 / 2025-03-26 / 2025-06-18 as well), five thick
+  tools — `rustim_capabilities` / `rustim_batch` / `rustim_validate` / `rustim_query` /
+  `rustim_advance` — and **no session machinery of its own**: the binary embeds
+  `rustim_daemon::Hub`, attaches one session and blocks on `SessionHandle` from a current-thread
+  runtime, so the three transports meet in one `SceneContext::handle`. The design decisions are in
+  "MCP: the same protocol behind tools" — thin framing rather than a second protocol, a tool
+  catalogue that is the engine's own `hello` document, the two failure vocabularies (a kernel
+  refusal is an `isError: true` result whose body is protocol v1's own refusal document; malformed
+  *arguments* are JSON-RPC `-32602`), and the deliberate non-goals (no rendering/snapshot, no event
+  forwarding, no model state). Evidence: 12 unit tests over the envelope and tool translation (the
+  handshake and version negotiation, the catalogue, the batch/query round trip, a refusal that
+  keeps the session alive, malformed arguments that touch nothing, notifications never answered,
+  the clock), and **11 real-process integration tests** in `crates/rustim-mcp/tests/mcp.rs` that
+  launch the binary and speak the wire over its pipes — handshake and catalogue, capabilities being
+  the engine's own `hello`, a batch building a scene and a query reading it back, an engine refusal
+  as a tool result with the process still answering, validate changing nothing, manual vs auto
+  clocks, the protocol error codes, notifications unanswered, CJK text and a Typst formula
+  typeset through the pipe, `--no-typeset` reporting the honest profile and refusing text, and
+  `--scene` honoured. **All eight goldens are unchanged** — the adapter draws nothing — and the
+  count moved 780 → 803.
+  Deliberately deferred: MCP resources, prompts and sampling (tools are the whole surface); SSE and
+  streamable-HTTP transports (stdio only, per `贾维斯集成方案.md`'s local-first rule); forwarding
+  the event stream as MCP notifications; and any rendering or frame snapshot — a host that needs
+  pixels uses the daemon or `--png`.
 
 ## AI integration
 
@@ -2888,11 +2927,12 @@ feature to add:
   a mismatch is refused with both numbers. An assistant adapted to one build can therefore be told
   by another build, before it sends anything, whether it will be understood.
 
-The transports are deliberately not part of the kernel, and **two are implemented**:
-`--script - --reply` (newline-delimited JSON over stdio, one client, one process lifetime) and
-`rustim-daemon` (WebSocket/JSON-RPC, many sessions, reconnects and event push — see "The daemon").
-Both end at the same `SceneContext::handle`; a second transport is a wrapper around this protocol,
-never a second dialect of it. `rustim-client` is the stdio transport's client half: `read_reply`
+The transports are deliberately not part of the kernel, and **three are implemented**:
+`--script - --reply` (newline-delimited JSON over stdio, one client, one process lifetime),
+`rustim-daemon` (WebSocket/JSON-RPC, many sessions, reconnects and event push — see "The daemon") and
+`rustim-mcp` (the Model Context Protocol over stdio — see "MCP"). All three end at the same
+`SceneContext::handle`; a further transport is a wrapper around this protocol, never a second
+dialect of it. `rustim-client` is the stdio transport's client half: `read_reply`
 enforces the one-presence rule, `send_raw` enforces `seq`, `hello` is one call, and `close` returns
 the exit status. The conformance suite in `crates/rustim-app/tests/conformance.rs` is written against
 that crate only — it spawns the real binary, never reaching into `rustim-app`'s modules — so a passing
@@ -2902,10 +2942,10 @@ that ids and labels agree across `add`/`set`/`query`, that a foreign protocol is
 the feed continues, that blank lines are skipped and counted, and that two clients replay one log to
 one tree. The daemon's socket-level suite is the same claim in the other transport's terms:
 `crates/rustim-daemon/tests/daemon.rs` attaches two clients to one session and asserts each sees the
-same events, and a reconnect sees the objects the dropped socket created. An MCP tool surface
-(`rustim-mcp`) is **not implemented** and must map onto the same `SceneContext::handle`. The
-teaching-tier tools (`rustim-director`) and the two tool tiers are roadmap items in
-`贾维斯集成方案.md`; nothing in this repository currently claims them.
+same events, and a reconnect sees the objects the dropped socket created. The MCP adapter's own
+suite is the same claim a third time, and the tool surface adds no verb the protocol lacks — see
+"MCP". The teaching-tier tools (`rustim-director`) are roadmap items in `贾维斯集成方案.md`;
+nothing in this repository currently claims them.
 (Checkpoint/undo/seek, `pause`/`resume`/`tempo`, the list commands, the event stream and the daemon
 transport **are** implemented — see "AI integration".)
 
@@ -2987,6 +3027,84 @@ is the artifact to replay), and does not emit audio (`narrate` queues lines on t
 speaking them is the client's business). The typesetter is built lazily per session and caches a
 failure, so `--no-typeset` is honest in `hello` and a missing font directory costs one report rather
 than one per `add`.
+
+### MCP: the same protocol behind tools
+
+`rustim-mcp` is the fourth transport and the thinnest: an MCP client launches the binary, says
+`initialize` / `tools/list` / `tools/call`, and each tool call becomes the protocol command a script
+would have sent. It is a **host**, like `rustim-daemon`, and it re-uses the daemon's session
+machinery instead of owning a second one — the crate depends on `rustim-daemon`'s *library*, embeds
+`Hub`, and never opens a socket. That dependency is the design: an MCP tool call and a WebSocket
+method end in one `SceneContext::handle`, so the two transports cannot drift apart in what they can
+express.
+
+**The wire is newline-delimited JSON-RPC 2.0 on stdio.** One message per line (JSON escapes newlines
+inside strings, so the framing is total), stdout carries protocol only, and the one informational
+line goes to stderr. Four methods are served — `initialize`, `ping`, `tools/list`, `tools/call` —
+and anything else is `-32601`. A JSON-RPC **batch array** is `-32600`: MCP does not use batches, and
+the protocol's own `batch` *action* is where a list of commands belongs, so accepting one would be a
+second spelling of the same thing. `notifications/*` is executed if it is a request-shaped method
+and never answered, even if a confused client attached an `id`.
+
+**Version negotiation echoes what it knows.** `SUPPORTED_PROTOCOL_VERSIONS` is
+`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`; a requested revision in that set is echoed,
+and anything else is answered with `2025-11-25` (the newest implemented), which is the protocol's
+rule — the client decides whether it can proceed. The method set is identical across the four, so no
+payload depends on the revision.
+
+**Five thick tools, and the command documents pass through untouched.**
+
+| Tool | Command |
+|---|---|
+| `rustim_capabilities` | `{"action":"hello","protocol":1}` |
+| `rustim_batch` | `{"action":"batch","commands":[…]}` |
+| `rustim_validate` | `{"action":"validate","commands":[…]}` |
+| `rustim_query` | `{"action":"query","target"?:…}` |
+| `rustim_advance` | the daemon's manual-clock `advance` |
+
+Nineteen primitive tools would make a real-time model worse at choosing, and every primitive is
+already reachable inside `batch`. `tools::translate` checks only *shape* (a missing `commands`, a
+`target` that is neither a non-negative integer nor a string) — whether `{"type":"hexagon"}` is
+legal is the engine's answer, and a second validator here would drift from the first.
+
+**Two failure vocabularies, and the split is MCP's own requirement.** A malformed request — unknown
+tool, bad argument shape, a line that is not JSON — is a JSON-RPC `error` (`-32700` parse, `-32600`
+invalid request, `-32601` method, `-32602` params, `-32603` when the session ended) and executes
+nothing. An **engine refusal** is a *successful* `tools/call` result with `isError: true` whose body
+is the protocol's refusal document (`in_batch` and its `cause` intact), carried twice: as text
+(`content[0].text`) and as `structuredContent` when the document is an object. That is not a style
+choice — MCP requires tool-level errors to be results precisely so the model sees the refusal and can
+correct itself; burying a `no_such_label` in a transport error hides the one thing it needed.
+
+**One session per process, created at startup.** An MCP server lives as long as its client's pipe,
+so there is no `attach` tool: the process *is* the attach. The session comes from `Hub::attach`
+exactly as the daemon's does — same clock, same `DaemonTypesetter`, same `--no-typeset` honesty —
+and the binary's flags (`--scene`, `--clock`, `--motion`, `--width`, `--height`, `--no-typeset`)
+are that session's properties.
+
+**The blocking bridge is the `Session` trait.** `SceneContext` is not `Send` and `SessionHandle` is
+async, so the envelope knows only `command(Command)` and `advance(f64)`; the binary implements them
+over a current-thread runtime plus `block_on`, and the unit tests implement them over a bare
+`SceneContext` on the test thread. `advance` reads `clock_now()` *after* the oneshot resolves,
+which is correct because the daemon writes the watch before it sends the reply (see "The daemon").
+
+**What it deliberately is not.** It does not forward events (`beat_started` / `animation_done`
+belong to daemon subscribers), does not render (`rustim_query`'s semantic tree is what an AI needs
+to plan; a picture is a display host's job, and the daemon's own crate docs make the same
+distinction), keeps no model state, and speaks stdio only — streamable HTTP is a deployment question
+for a later step.
+
+**Evidence.** Twelve unit tests in `src/mcp.rs` (handshake and catalogue, batch→query through a real
+`SceneContext`, a refusal as a tool error that leaves the session usable, validate-then-apply, four
+invalid-argument paths, the envelope's batch/bad-JSON/unknown-method answers, notifications silent,
+advance's clock), five in `src/tools.rs` (catalogue shape, untouched commands, argument messages,
+target spelling, unknown-tool candidates), and eleven in `tests/mcp.rs` over the real binary:
+handshake and version negotiation, the engine's own capability profile, batch + query with the text
+half equal to `structuredContent`, refusal-then-ping, validate not changing the tree, manual vs auto
+clock, argument errors touching nothing, notifications and blank lines unanswered, CJK text and a
+Typst formula typeset through the pipe (with MathML reaching `query`), `--no-typeset` refusing text
+with `unsupported`, and `--scene pythagorean` holding the four named figures. The count moved
+780 → 803 and **all eight goldens passed unchanged** — a transport draws nothing.
 
 ### The feed: a session is a file of commands
 

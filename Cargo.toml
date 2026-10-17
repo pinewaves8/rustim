@@ -13,6 +13,7 @@ members = [
     "crates/rustim-web",
     "crates/rustim-client",
     "crates/rustim-daemon",
+    "crates/rustim-mcp",
     "crates/rustim-app",
 ]
 # Throwaway Phase-0 probes with their own target dirs; not part of the engine.
@@ -37,6 +38,7 @@ rustim-scenes = { path = "crates/rustim-scenes" }
 rustim-web = { path = "crates/rustim-web" }
 rustim-client = { path = "crates/rustim-client" }
 rustim-daemon = { path = "crates/rustim-daemon" }
+rustim-mcp = { path = "crates/rustim-mcp" }
 
 # Pinned to versions verified on 2026-10-16 (see 方案建议.md 3.6).
 kurbo = "0.13.1"

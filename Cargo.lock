@@ -3323,6 +3323,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustim-mcp"
+version = "0.0.0"
+dependencies = [
+ "rustim-anim",
+ "rustim-daemon",
+ "rustim-math",
+ "rustim-scene",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rustim-mobject"
 version = "0.0.0"
 dependencies = [
