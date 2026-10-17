@@ -1,6 +1,6 @@
 //! Moblet storage, addresses and the deferred transform.
 
-use rustim_math::{Affine2, BezPath, Point, Rect, bezier};
+use rustim_math::{Affine2, BezPath, Camera, Point, Rect, bezier};
 use slotmap::{SlotMap, new_key_type};
 use std::collections::HashMap;
 
@@ -325,12 +325,25 @@ pub fn bezier_path_from_points(points: impl IntoIterator<Item = Point>) -> BezPa
 }
 
 /// The scene tree: the storage the rest of the engine addresses mobjects through.
+///
+/// It holds the world *and the window onto it*: [`SceneTree::camera`] is scene
+/// state, not a node. The reason is the animation contract — `interpolate` is
+/// handed `&mut SceneTree` and nothing else, so the tree is the only place a
+/// camera move can be written from; Manim arrives at the same arrangement by
+/// making the camera frame a mobject. It is a field rather than a node because
+/// everything that walks the tree (draw order, tab order, the semantic tree,
+/// `len()`) is about objects the user can see or address, and a camera is
+/// neither.
 #[derive(Debug, Default)]
 pub struct SceneTree {
     nodes: SlotMap<NodeId, Mobject>,
     /// Draw order per parent bucket. Renderers walk this rather than the
     /// `SlotMap`, whose iteration order is not meaningful.
     order: HashMap<Option<NodeId>, Vec<NodeId>>,
+    /// Where the view is looking. Not a node — see the struct doc. Animations
+    /// mutate it through `&mut SceneTree`, and `SceneContext::build_draw_list`
+    /// folds it into the frame's one global transform.
+    pub camera: Camera,
 }
 
 impl SceneTree {
@@ -525,9 +538,16 @@ impl SceneTree {
         self.nodes.is_empty()
     }
 
+    /// Empty the tree **and reset the view**.
+    ///
+    /// The camera goes with the objects: `SceneContext::reset` is the one path a
+    /// rewritten scene takes, and a new scene that opened zoomed into the
+    /// previous scene's subject would be a bug with no visible cause. Clearing
+    /// is the only place this could be forgotten, so the reset lives here.
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.order.clear();
+        self.camera = Camera::default();
     }
 }
 
@@ -535,6 +555,35 @@ impl SceneTree {
 mod tests {
     use super::*;
     use crate::style::Style;
+
+    /// The camera is state, not a node: nothing that walks objects may see it.
+    #[test]
+    fn the_camera_is_not_a_node() {
+        let mut tree = SceneTree::new();
+        let a = tree.insert(Mobject::new(vec![]));
+        tree.insert(Mobject::new(vec![]));
+        let before = (tree.len(), tree.root_ids().to_vec(), tree.draw_order());
+
+        tree.camera = Camera::new((2.0, 1.0), 3.0);
+
+        assert_eq!(before.0, tree.len());
+        assert_eq!(before.1, tree.root_ids());
+        assert_eq!(before.2, tree.draw_order());
+        assert!(tree.get(a).is_some());
+    }
+
+    /// `SceneContext::reset` clears the tree, and the view goes with it.
+    #[test]
+    fn clear_restores_the_default_camera() {
+        let mut tree = SceneTree::new();
+        tree.insert(Mobject::new(vec![]));
+        tree.camera = Camera::new((2.0, 1.0), 3.0);
+
+        tree.clear();
+
+        assert_eq!(tree.camera, Camera::default());
+        assert!(tree.is_empty());
+    }
 
     #[test]
     fn ids_are_not_reused_after_deletion() {

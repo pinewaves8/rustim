@@ -48,7 +48,7 @@ pub mod a11y;
 pub mod command;
 pub mod context;
 
-pub use a11y::{SemanticNode, SemanticRole, SemanticTree, SemanticValue};
+pub use a11y::{CameraView, SemanticNode, SemanticRole, SemanticTree, SemanticValue};
 pub use command::{Command, CommandError, CommandReply, StateDiff};
 pub use context::{Scene, SceneContext};
 

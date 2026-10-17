@@ -7,11 +7,16 @@
 //! ([`Transform`], the morph), which is what puts Manim's `align_points`
 //! machinery to work.
 //!
+//! [`CameraMove`] is the one animation that writes no object at all — it moves
+//! the view — and it is here rather than beside the command layer because it is
+//! an ordinary beat: the same scheduler, the same `Sequence`, the same
+//! reduced-motion branch.
+//!
 //! [`Wait`] is the last and has no shape at all: it writes nothing and only
 //! occupies the clock, which is exactly what makes a pause an animation like any
 //! other.
 
-use rustim_math::{Affine2, Point, bezier};
+use rustim_math::{Affine2, Camera, Point, bezier};
 use rustim_mobject::{Mobject, NodeId, SceneTree, Style};
 
 use crate::{Animation, RateFunc, rate};
@@ -528,6 +533,83 @@ impl Animation for Transform {
     }
 }
 
+/// Pans and zooms the view.
+///
+/// The one animation that writes no mobject: it moves `SceneTree::camera`, which
+/// is why the camera lives in the tree at all. It is otherwise an animation like
+/// every other — a beat of its own via `SceneContext::play`, or one member of a
+/// parallel beat (`play(camera_move, fade)`), and it takes the reduced-motion
+/// branch through the same code path.
+///
+/// # Zoom is interpolated geometrically
+///
+/// `center` is lerped linearly; `zoom` is lerped **in log space**, so that equal
+/// fractions of the duration multiply the zoom by equal factors. Zoom is a
+/// multiplicative quantity: a linear 1 → 9 spends most of the animation outside
+/// 5, which reads as a lurch at the end. (Manim's `CameraFrame` interpolates its
+/// *width* linearly, which is the same mistake in reciprocal form; this engine
+/// stores zoom, so it interpolates zoom the way it is measured.)
+///
+/// # `alpha == 1.0` is an exact assignment
+///
+/// The end state is written verbatim, not computed. `x0 + (x1 - x0) * 1.0` is
+/// not always bitwise `x1`, and reduced motion lands a beat by evaluating
+/// `interpolate(ease(1.0))` — so the frame a reduced-motion run settles on must be
+/// *the* destination, not a value that rounds to it. `Transform` makes the same
+/// distinction for its style fields (see the `INFINITY` test there), and the
+/// goldens depend on both.
+#[derive(Debug, Clone)]
+pub struct CameraMove {
+    to: Camera,
+    from: Option<Camera>,
+    duration: f64,
+}
+
+impl CameraMove {
+    pub fn new(to: Camera) -> Self {
+        Self {
+            to,
+            from: None,
+            duration: 1.0,
+        }
+    }
+
+    pub fn with_duration(mut self, seconds: f64) -> Self {
+        self.duration = seconds;
+        self
+    }
+}
+
+impl Animation for CameraMove {
+    fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    fn begin(&mut self, tree: &SceneTree) {
+        // Wherever the view is now, not where it was when this was constructed:
+        // a camera move may be queued several beats ahead of its turn.
+        self.from = Some(tree.camera);
+    }
+
+    fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
+        let Some(from) = self.from else { return };
+        // See the doc: the endpoints are exact, the interior is interpolated.
+        tree.camera = if alpha <= 0.0 {
+            from
+        } else if alpha >= 1.0 {
+            self.to
+        } else {
+            Camera {
+                center: (
+                    lerp_scalar(from.center.0, self.to.center.0, alpha),
+                    lerp_scalar(from.center.1, self.to.center.1, alpha),
+                ),
+                zoom: lerp_scalar(from.zoom.ln(), self.to.zoom.ln(), alpha).exp(),
+            }
+        };
+    }
+}
+
 /// A pause. It writes nothing; it only occupies the clock.
 ///
 /// Manim's `Wait` (`animation/animation.py:584-638`), and `Scene.wait` is nothing
@@ -633,6 +715,79 @@ mod tests {
         let mut tree = SceneTree::new();
         let id = tree.insert(m);
         (tree, id)
+    }
+
+    /// The end state is written, not computed: `x0 + (x1 - x0) * 1.0` is not
+    /// always bitwise `x1`, and reduced motion lands a beat exactly here.
+    #[test]
+    fn a_camera_move_lands_exactly_on_its_end_state() {
+        let mut tree = SceneTree::new();
+        tree.camera = Camera::new((0.3, -0.7), 1.7);
+        let target = Camera::new((-1.0 / 3.0, 2.0 / 7.0), 3.0);
+
+        let mut anim = CameraMove::new(target);
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        assert_eq!(tree.camera, target);
+    }
+
+    /// The midpoint of 1 → 9 is 3, not 5: zoom is multiplicative.
+    #[test]
+    fn a_camera_move_zooms_geometrically() {
+        let mut tree = SceneTree::new();
+        let mut anim = CameraMove::new(Camera::new((0.0, 0.0), 9.0));
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+        assert!(
+            (tree.camera.zoom - 3.0).abs() < 1e-12,
+            "midpoint zoom was {}",
+            tree.camera.zoom
+        );
+    }
+
+    /// `begin` captures where the view *is*, not where it was when the move was
+    /// constructed: a beat may be queued long before its turn.
+    #[test]
+    fn a_camera_move_starts_from_the_camera_it_finds() {
+        let mut tree = SceneTree::new();
+        let mut anim = CameraMove::new(Camera::new((4.0, 4.0), 2.0));
+        // Constructed before the camera moved, begun after.
+        tree.camera = Camera::new((1.0, 0.0), 1.0);
+        anim.begin(&tree);
+        anim.interpolate(0.0, &mut tree);
+        assert_eq!(tree.camera, Camera::new((1.0, 0.0), 1.0));
+    }
+
+    /// The boxed route is how every mixed beat plays. `finish` was the method a
+    /// blanket impl silently missed once; this pins that the *new* animation
+    /// survives the box too, rather than trusting the impl to have every method.
+    #[test]
+    fn a_boxed_camera_move_still_drives_the_tree() {
+        use crate::AnimationScheduler;
+
+        let mut tree = SceneTree::new();
+        let target = Camera::new((2.0, -1.0), 4.0);
+        let mut sched = AnimationScheduler::new();
+        sched.add_boxed(Box::new(CameraMove::new(target).with_duration(0.5)));
+        sched.update(1.0, &mut tree);
+        assert_eq!(tree.camera, target);
+    }
+
+    /// Under reduced motion a beat is begun and driven to `ease(1.0)` once, not
+    /// interpolated — so the camera must be *exactly* the destination there too.
+    #[test]
+    fn a_reduced_camera_move_lands_on_its_end_state_exactly() {
+        use crate::{Motion, Sequence};
+
+        let mut tree = SceneTree::new();
+        tree.camera = Camera::new((0.0, 0.0), 1.0);
+        let target = Camera::new((1.0 / 9.0, -2.0 / 11.0), 2.5);
+        let mut seq = Sequence::new();
+        seq.push([CameraMove::new(target).with_duration(0.8)]);
+        let mut sched = crate::AnimationScheduler::new();
+        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
+        assert_eq!(tree.camera, target);
     }
 
     #[test]

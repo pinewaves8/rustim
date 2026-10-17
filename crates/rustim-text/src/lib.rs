@@ -483,8 +483,9 @@ impl FontProvider {
     /// backend multiplies the run's transform into the glyph geometry itself
     /// (glifo absorbs the scale, and hints against the size it produces), so the
     /// run is simply in world units and the viewport does the rest. Pass
-    /// [`rustim_math::Viewport::scale`] instead only for a caller that draws in
-    /// the draw list's own pixel space with no transform of its own.
+    /// [`rustim_math::Viewport::pixels_per_unit`] for the current camera instead
+    /// only for a caller that draws in the draw list's own pixel space with no
+    /// transform of its own.
     ///
     /// It is an argument rather than a field because it belongs to the *scene*:
     /// the provider has no business caching a frame size it could be asked about

@@ -81,7 +81,14 @@ typst-assets = { version = "0.15.1", features = ["fonts"] }
 # cannot reach the `wasm32-unknown-unknown` build. `rustim-app` is not a kernel
 # crate and is the one place it is a real dependency — the `--inspect` surface
 # has to emit JSON for a host to read (`crates/rustim-app/src/main.rs`).
-serde_json = "1"
+#
+# `float_roundtrip` is not an optimisation: without it serde_json's float parser
+# can land one ULP from the number it wrote, so `to_string(from_str(s)) == s`
+# fails for a value it serialised itself. The protocol's promise is that a host
+# can log, replay and diff these documents, and the camera's `visible` field —
+# a computed aspect-ratio product, not a number anyone typed — is where the
+# discrepancy showed up first (`the_live_text_rides_along_with_the_snapshot`).
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [profile.release]
 opt-level = 3

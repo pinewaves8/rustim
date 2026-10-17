@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **336 tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **366 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all seven golden scenes match their checked-in
@@ -262,10 +262,10 @@ last property.
 
 | Crate | Contents | Status |
 |---|---|---|
-| `rustim-math` | Points, `Affine2`, rate functions, the `Viewport` world→screen transform, and literal ports of Manim's `bezier` / `space_ops` | Real |
+| `rustim-math` | Points, `Affine2`, rate functions, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree`, stable `NodeId`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow`), `critical_point`, `world_anchors` | Real |
-| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `FadeOut`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `Wait` | Real |
+| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `FadeOut`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `CameraMove`, `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait, `DrawList`, the `vello_cpu` backend | Real (CPU only) |
@@ -286,6 +286,53 @@ winit event loop → Scene::update(dt) → SceneContext::advance(dt) → Animati
 `SceneContext::build_draw_list` is the only place world coordinates are materialised. Everything
 upstream mutates *local* points and an `Affine2`; the flattening step folds each mobject's transform
 together with its ancestors' and emits paths.
+
+### The camera
+
+`rustim_math::Viewport` is the **window** — a frame size in physical pixels — and knows nothing
+about what part of the world fills it. `Camera { center, zoom }` is the **view**, and it lives on
+`SceneTree` as `tree.camera`, not in `SceneContext`. That placement is forced: `interpolate` is
+handed `&mut SceneTree` and nothing else, so a camera move has to be an ordinary `Animation`, and
+`rustim-anim` cannot depend on `rustim-scene` (that would be a cycle). Manim's camera frame is a
+mobject for the same reason. **The camera is a field, not a node** — `len()`, `root_ids()`,
+`draw_order()`, the accessibility tree and the Tab order never see it, and `SceneTree::clear()` puts
+it back to the default so a rewritten scene does not stay zoomed into the previous one.
+
+`visible_height() = Camera::WORLD_HEIGHT / zoom` with `WORLD_HEIGHT = 8.0` (Manim's default frame),
+`pixels_per_unit = frame_height / visible_height`, and
+`affine = T(W/2, H/2) · S(s, -s) · T(-center)`. **The default camera reproduces the pre-camera
+projection bit-for-bit** (`8.0 / 1.0 == 8.0`, `720 / 8.0 == 90.0`, same operation order) — that is
+the invariant the seven pre-existing goldens were re-rendered against, unchanged, when the camera
+landed. `Camera::default()` is hand-written because a derived one would be `zoom = 0.0`, a camera
+that divides by zero.
+
+`CameraMove` lerps `center` linearly and `zoom` **in log space** (zoom is multiplicative; a linear
+lerp gives most of the visual speed to the first half). `alpha >= 1.0` assigns the destination
+verbatim rather than computing `from + (to - from) * 1.0`, so reduced motion and repeated runs land
+on bitwise-identical state.
+
+The wire command is `{"action":"camera", "center"?, "zoom"?, "focus"?, "duration"?}`, answered by
+`SceneContext::handle` (it needs the playback machine, or the viewport's aspect ratio for `focus`):
+
+- **without `duration` the camera is written now; with one — including `0.0` — a single
+  `CameraMove` beat is queued.** An instant write is *overwritten by a move already in flight*, the
+  same contract `Set position` has with a running `MoveTo`: an animation owns its subject until it
+  ends.
+- `focus` frames a node by its **world bounding box** with a `1.2` margin; the tighter axis decides
+  the zoom, and one zero dimension is fitted by the other (a horizontal line is a legitimate
+  subject). Then explicit `center` and `zoom` override only their own half. A text mobject has no
+  points, so `focus` on one is refused rather than silently doing nothing.
+- It returns an **empty `StateDiff`**, for `play`'s reason: the view is not a node.
+- Refusals are values: a missing `focus` node is `NoSuchNode`; no geometry/zero extent, a
+  non-finite or non-positive `zoom`, a bad `duration`, or a command naming none of the three is
+  `OutOfRange`.
+
+`a11y::build` projects the bounds with `tree.camera`, and `SemanticTree.camera: CameraView` travels
+with them (`center`, `zoom`, frame pixels, and the visible world width/height) so a host can map the
+pixel bounds back to world coordinates without re-deriving the projection. `text_ops`/`push_text`
+take the **composed world→device transform** (`SceneContext::affine()`), not a `Viewport`: there is
+deliberately no camera-free variant, because a caller that forgot the camera would draw
+correct-looking text in the wrong place while every filled path moved correctly.
 
 ### The timeline: three layers
 
@@ -589,6 +636,15 @@ typed.
 both backends expose) rather than reaching for a conversion that does not exist. `Point` also has no
 scalar multiplication or point addition — go through `Vec2` (`p.to_vec2()`, `Vec2::hypot`).
 
+**`serde_json` without its `float_roundtrip` feature does not round-trip every float it writes.**
+Its parser can land one ULP away from the number serde_json itself serialised, so
+`to_string(from_str(s)) == s` — the byte-for-byte property the command/reply protocol rests on —
+fails for long mantissas. Nothing noticed until `SemanticTree.camera.visible` (an aspect-ratio
+product like `14.222222222222221`, not a number anyone typed) made the whole-tree comparison in
+`the_live_text_rides_along_with_the_snapshot` fail. The feature is enabled in both the workspace
+manifest and `rustim-scene`'s own `serde_json` line; turning it off restores a class of one-ULP
+replay differences rather than a visible bug, which is exactly why it needs to be written down.
+
 **Manim's point array is read four points per curve, not three.** A flat array is
 `(start, c1, c2, end)` per curve, and each curve **restates the previous curve's endpoint as its own
 start**, so a closed 4-cubic circle is **16** points and a square is 4 curves, not 4 points. Reading
@@ -716,9 +772,10 @@ scene lives in `rustim-app`.
 
 Issues the tutorial's sketches leave open, and where each stands now:
 
-- **Coordinate system** — *resolved.* `rustim_math::Viewport` maps Y-up centred world units to
-  Y-down pixel space. Scene code contains no pixel constants; the viewport is applied once, at the
-  head of the draw list. The tutorial's own `RightTriangle` sketch has the right angle at the
+- **Coordinate system** — *resolved.* `rustim_math::Viewport` (pixels) and `rustim_math::Camera`
+  (where the pixels look) together map Y-up centred world units to Y-down pixel space. Scene code
+  contains no pixel constants; the composed transform is applied once, at the head of the draw
+  list, and `SceneContext::affine()` is the only way to get it. The tutorial's own `RightTriangle` sketch has the right angle at the
   top-left despite its comment claiming bottom-left, under Y-down.
 - **Animation lifetimes** — *resolved*, by ids rather than borrows (above).
 - **Hardcoded viewport** — *resolved.* The app's `Resized` handler resizes the renderer and the
@@ -1008,7 +1065,17 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   stdout, so `main::note` now routes every informational line to stderr when stdout is protocol. What
   it deliberately leaves for P3+: the query command (no way to read a live tree), label addressing,
   and a merged `--reply`/`--inspect`. See "The feed" under AI integration.
-- **P3+** — camera (pan/zoom/focus); video export; the AI command surface at full width; Web (WASM).
+- **P3's camera is done** (the first half of the `axes`/`plot` step). `Viewport` was cut down to the
+  window, `Camera` moved onto `SceneTree`, `CameraMove` joined the animation set, and
+  `{"action":"camera","center"?,"zoom"?,"focus"?,"duration"?}` joined the protocol — see "The
+  camera". The regression evidence is the strongest kind this repository has: the seven goldens
+  rendered **pixel-identical with no rebless**, because the default camera reproduces the old
+  projection bit-for-bit. The `--inspect` snapshot gained `camera: CameraView` so a host can map its
+  pixel bounds back to world coordinates. Deferred, deliberately: pointer pan/wheel zoom (the
+  repository still handles no pointer events at all — input wiring is its own step), a `Rotating`
+  animation (`duration = ∞` makes `alpha = age/∞ = 0`, freezing it while `is_playing` stays true;
+  this needs a scheduler concept for perpetual animations), and any announcement of a camera change.
+- **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration
 

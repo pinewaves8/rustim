@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use rustim_anim::{Animation, FadeIn, FadeOut, MoveTo, Rotate, Scale};
-use rustim_math::{Affine2, Point};
+use rustim_math::{Affine2, Camera, Point, Viewport};
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree};
 
@@ -44,6 +44,23 @@ pub enum Command {
     Remove { target: NodeId },
     /// Play an animation that names its subject by id.
     Play { animation: AnimationSpec },
+    /// Point the camera, now or over a beat.
+    ///
+    /// All four fields are optional and omitted when absent, like every other
+    /// payload here. Without `duration` the camera is written immediately;
+    /// with one (including `0.0`) a `CameraMove` beat is queued. `focus` frames
+    /// an object by its world bounding box; see [`camera_for`] for how `focus`,
+    /// `center` and `zoom` combine and for the refusals.
+    Camera {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        center: Option<[f64; 2]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        zoom: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        focus: Option<NodeId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<f64>,
+    },
 }
 
 /// A named, settable property.
@@ -251,8 +268,138 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // driving `apply` directly gets the round-trip it always got, not a
             // panic.
         }
+        Command::Camera { .. } => {
+            // Likewise answered by `SceneContext::handle`: resolving `focus` needs
+            // the viewport's aspect ratio, and applying the result is either a
+            // write to `tree.camera` or a queued beat. The arm keeps `apply` total.
+        }
     }
     Ok(diff)
+}
+
+/// Resolve the camera a [`Command::Camera`] describes.
+///
+/// Called from `SceneContext::handle` rather than `apply`, for the two reasons
+/// the arm above gives: the fit needs the viewport (only its aspect ratio; the
+/// absolute pixel size cancels), and "now or as a beat" is [`camera_duration`]'s
+/// question, not the tree's.
+///
+/// **Precedence**, in this order: start from the current camera; `focus` replaces
+/// both the centre and the zoom with the framed bounding box; an explicit
+/// `center` then replaces only the centre; an explicit `zoom` replaces only the
+/// zoom. So `{"focus": id, "zoom": 2.0}` frames the object and then doubles it,
+/// and `{"zoom": 2.0}` alone zooms in on whatever the camera already centres on.
+///
+/// **Fit** leaves a `1.2` margin: the subject's box, enlarged by a fifth, must
+/// fit in the frame on both axes, so the tighter axis decides the zoom. A box
+/// with one zero dimension (a horizontal line, a vertical one) is fitted by the
+/// other axis alone rather than refused; a box with no extent at all is refused,
+/// because there is no scale at which it fills the frame.
+///
+/// Refusals, each a value rather than a panic — these are model output too:
+///
+/// * none of `center`, `zoom`, `focus` given — [`CommandError::OutOfRange`]: the
+///   command named nothing to change, and answering it with silence would teach
+///   a model that an empty camera request is fine;
+/// * a `focus` naming a missing node — [`CommandError::NoSuchNode`], the same
+///   refusal every other command that names a node gives;
+/// * a `focus` naming a node with no geometry (a text mobject has no points; see
+///   `Mobject::has_picture`) or with zero extent —
+///   [`CommandError::OutOfRange`] rather than a silent no-op;
+/// * a `zoom` that is not positive and finite — [`CommandError::OutOfRange`],
+///   the same posture as `Scale`: a zero zoom divides by zero, a negative one
+///   mirrors the world, and neither is what "zoom in" means.
+///
+/// `center` is not range-checked, matching `move_to`'s `to`: JSON cannot carry a
+/// non-finite float and every finite point is a legitimate centre.
+pub fn camera_for(
+    tree: &SceneTree,
+    viewport: &Viewport,
+    center: Option<[f64; 2]>,
+    zoom: Option<f64>,
+    focus: Option<NodeId>,
+) -> Result<Camera, CommandError> {
+    if center.is_none() && zoom.is_none() && focus.is_none() {
+        return Err(CommandError::OutOfRange {
+            property: "camera".into(),
+            detail: "a camera command needs a centre, a zoom or a focus".into(),
+        });
+    }
+
+    let mut at = tree.camera.center;
+    let mut scale = tree.camera.zoom;
+
+    if let Some(target) = focus {
+        if tree.get(target).is_none() {
+            return Err(CommandError::NoSuchNode { target });
+        }
+        let Some(bounds) = tree.world_bounds(target) else {
+            return Err(CommandError::OutOfRange {
+                property: "focus".into(),
+                detail: format!("node {} has no geometry to frame", target.raw()),
+            });
+        };
+        let (w, h) = (bounds.width(), bounds.height());
+        if w <= 0.0 && h <= 0.0 {
+            return Err(CommandError::OutOfRange {
+                property: "focus".into(),
+                detail: format!("node {} has no extent to frame", target.raw()),
+            });
+        }
+        at = (bounds.x0 + w / 2.0, bounds.y0 + h / 2.0);
+        // visible height is WORLD_HEIGHT / zoom, and visible width is that times
+        // the frame's aspect ratio, so each axis imposes `zoom <= ceiling` and
+        // the smaller ceiling is the fit. A zero-width axis imposes no ceiling.
+        const MARGIN: f64 = 1.2;
+        let aspect = f64::from(viewport.frame_width) / f64::from(viewport.frame_height);
+        let mut fit = f64::INFINITY;
+        if w > 0.0 {
+            fit = fit.min(Camera::WORLD_HEIGHT * aspect / (MARGIN * w));
+        }
+        if h > 0.0 {
+            fit = fit.min(Camera::WORLD_HEIGHT / (MARGIN * h));
+        }
+        // `fit` is finite and positive here: one of the two terms was taken, and
+        // both are positive for a positive dimension.
+        if fit.is_finite() && fit > 0.0 {
+            scale = fit;
+        }
+    }
+
+    if let Some([x, y]) = center {
+        at = (x, y);
+    }
+    if let Some(z) = zoom {
+        if !z.is_finite() || z <= 0.0 {
+            return Err(CommandError::OutOfRange {
+                property: "zoom".into(),
+                detail: format!("{z} is not a positive, finite zoom factor"),
+            });
+        }
+        scale = z;
+    }
+
+    Ok(Camera::new(at, scale))
+}
+
+/// Validate a camera command's `duration`, and say whether there is one.
+///
+/// `None` means "write the camera now"; `Some(d)` means "queue a beat of `d`
+/// seconds", including `0.0`, which the scheduler already defines as an instant
+/// snap inside that beat. The accepted range is [`animation_for`]'s, for the same
+/// reasons: negative is refused, `0.0` is legitimate, and a non-finite duration
+/// is refused even though Manim accepts it, because an infinite one holds the
+/// clock forever and a NaN one makes the beat vanish after a frame.
+pub fn camera_duration(duration: Option<f64>) -> Result<Option<f64>, CommandError> {
+    if let Some(d) = duration
+        && (!d.is_finite() || d < 0.0)
+    {
+        return Err(CommandError::OutOfRange {
+            property: "duration".into(),
+            detail: format!("{d} is not a finite, non-negative number of seconds"),
+        });
+    }
+    Ok(duration)
 }
 
 /// Build the animation a [`Command::Play`] names.
@@ -494,6 +641,15 @@ mod tests {
             format!(
                 r#"{{"action":"play","animation":{{"target":{id},"type":"scale","factor":2.5}}}}"#
             ),
+            // The camera command, in its full and partial spellings. The full
+            // one exercises every optional field at once; the partial one is what
+            // a host sends to "zoom in", and it has to survive without gaining
+            // three `null`s.
+            format!(
+                r#"{{"action":"camera","center":[1.5,-2.0],"zoom":2.0,"focus":{id},"duration":0.8}}"#
+            ),
+            r#"{"action":"camera","zoom":2.0}"#.to_owned(),
+            r#"{"action":"camera","center":[0.0,0.0]}"#.to_owned(),
         ];
         for json in cases {
             let cmd: Command =
@@ -1037,6 +1193,156 @@ mod tests {
             assert!(
                 matches!(
                     with(bad),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == "duration"
+                ),
+                "{bad} must be refused"
+            );
+        }
+    }
+
+    // ---- the camera -------------------------------------------------------
+
+    fn tree_with_a_square() -> (SceneTree, NodeId) {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        (tree, id)
+    }
+
+    #[test]
+    fn a_camera_command_needs_a_focus_center_or_zoom() {
+        let tree = SceneTree::new();
+        assert!(matches!(
+            camera_for(&tree, &Viewport::default(), None, None, None),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "camera"
+        ));
+    }
+
+    /// A zoom of zero divides by zero and a negative one mirrors the world; both
+    /// are refused the way `Scale` refuses them.
+    #[test]
+    fn a_non_positive_zoom_is_refused() {
+        let tree = SceneTree::new();
+        for bad in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(
+                matches!(
+                    camera_for(&tree, &Viewport::default(), None, Some(bad), None),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == "zoom"
+                ),
+                "zoom {bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_focus_on_an_unknown_node_is_refused() {
+        let mut tree = SceneTree::new();
+        let ghost = tree.insert(Mobject::new(vec![]));
+        tree.remove(ghost);
+        assert!(matches!(
+            camera_for(&tree, &Viewport::default(), None, None, Some(ghost)),
+            Err(CommandError::NoSuchNode { target }) if target == ghost
+        ));
+    }
+
+    /// A text mobject has no points (`Mobject::has_picture` is the test for "can
+    /// be seen", not a point count), so there is no box to frame. Refusing is
+    /// honest: a silent success would leave the camera where it was and the host
+    /// believing it had framed the text.
+    #[test]
+    fn a_focus_on_a_node_without_geometry_is_refused() {
+        let mut tree = SceneTree::new();
+        let text = tree.insert(Mobject::new(vec![]));
+        assert!(matches!(
+            camera_for(&tree, &Viewport::default(), None, None, Some(text)),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "focus"
+        ));
+    }
+
+    /// The fit leaves a 1.2 margin and is decided by the tighter axis. A 2×2 box
+    /// at 1280×720: the frame is 8 units tall and ~14.2 wide, so the height is
+    /// the tighter constraint — `8 / (1.2 * 2)`.
+    #[test]
+    fn a_focus_frames_the_box_with_a_margin() {
+        let (tree, id) = tree_with_a_square();
+        let camera = camera_for(&tree, &Viewport::default(), None, None, Some(id)).unwrap();
+        assert_eq!(camera.center, (0.0, 0.0));
+        assert!(
+            (camera.zoom - Camera::WORLD_HEIGHT / (1.2 * 2.0)).abs() < 1e-12,
+            "zoom {}",
+            camera.zoom
+        );
+    }
+
+    /// The aspect ratio is really used: a 4×1 box cannot be fitted by height
+    /// alone, because 8 units of height would push it off the sides.
+    #[test]
+    fn a_wide_focus_is_limited_by_the_frame_width() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(4.0, 1.0)));
+        let vp = Viewport::default();
+        let camera = camera_for(&tree, &vp, None, None, Some(id)).unwrap();
+        let by_width = Camera::WORLD_HEIGHT
+            * (f64::from(vp.frame_width) / f64::from(vp.frame_height))
+            / (1.2 * 4.0);
+        assert!((camera.zoom - by_width).abs() < 1e-12, "{}", camera.zoom);
+        assert!(
+            camera.zoom < Camera::WORLD_HEIGHT / (1.2 * 1.0),
+            "the height alone would have allowed a closer view"
+        );
+    }
+
+    /// One zero dimension is fitted by the other axis rather than refused — a
+    /// horizontal line is a legitimate subject.
+    #[test]
+    fn a_flat_focus_is_fitted_by_its_long_axis() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(4.0, 0.0)));
+        let camera = camera_for(&tree, &Viewport::default(), None, None, Some(id)).unwrap();
+        let expected = Camera::WORLD_HEIGHT * (1280.0 / 720.0) / (1.2 * 4.0);
+        assert!((camera.zoom - expected).abs() < 1e-12, "{}", camera.zoom);
+    }
+
+    #[test]
+    fn an_explicit_center_and_zoom_override_the_focus_fit() {
+        let (tree, id) = tree_with_a_square();
+        let camera = camera_for(
+            &tree,
+            &Viewport::default(),
+            Some([10.0, -4.0]),
+            Some(1.5),
+            Some(id),
+        )
+        .unwrap();
+        assert_eq!(camera, Camera::new((10.0, -4.0), 1.5));
+    }
+
+    /// `center` and `zoom` are independent overrides: giving one keeps the other
+    /// half of the current view, which is what makes `{"zoom": 2}` mean "zoom in
+    /// on what I am already looking at".
+    #[test]
+    fn a_partial_camera_command_keeps_the_other_half() {
+        let mut tree = SceneTree::new();
+        tree.camera = Camera::new((2.0, 3.0), 4.0);
+
+        let zoom_only = camera_for(&tree, &Viewport::default(), None, Some(0.5), None).unwrap();
+        assert_eq!(zoom_only, Camera::new((2.0, 3.0), 0.5));
+
+        let pan_only =
+            camera_for(&tree, &Viewport::default(), Some([-1.0, 0.0]), None, None).unwrap();
+        assert_eq!(pan_only, Camera::new((-1.0, 0.0), 4.0));
+    }
+
+    /// The same accepted range as an animation's duration, because it *is* one:
+    /// `None` is instant, `0.0` is a legitimate snap inside a beat.
+    #[test]
+    fn a_camera_duration_is_validated_like_an_animation_duration() {
+        assert_eq!(camera_duration(None).unwrap(), None);
+        assert_eq!(camera_duration(Some(0.0)).unwrap(), Some(0.0));
+        assert_eq!(camera_duration(Some(1.5)).unwrap(), Some(1.5));
+        for bad in [-1.0, f64::INFINITY, f64::NAN] {
+            assert!(
+                matches!(
+                    camera_duration(Some(bad)),
                     Err(CommandError::OutOfRange { ref property, .. }) if property == "duration"
                 ),
                 "{bad} must be refused"

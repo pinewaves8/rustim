@@ -20,8 +20,13 @@
 //! exactly as the shaper produced them:
 //!
 //! ```text
-//! device = viewport · world · (centre and flip)
+//! device = (viewport · camera) · world · (centre and flip)
 //! ```
+//!
+//! The parenthesised pair is the caller's [`Affine2`] argument — `SceneContext`
+//! folds it into one transform ([`rustim_scene::SceneContext::affine`]), so this
+//! module never has to know a `Viewport` or a `Camera` exists, and a camera move
+//! scales the glyphs for the same reason a resize does.
 //!
 //! Doing it the other way round — flipping and centring the *coordinates* — looks
 //! equivalent and is not. `glifo`, the backend's text layer, composes
@@ -50,7 +55,7 @@
 //! absorbed.
 
 use rustim_color::Srgb;
-use rustim_math::{Affine2, Viewport};
+use rustim_math::Affine2;
 use rustim_render::{DrawList, DrawOp};
 use rustim_text::ShapedText;
 
@@ -72,28 +77,33 @@ pub fn layout_to_local(width: f32, height: f32) -> Affine2 {
 /// The ops that draw one shaped block, centred on the origin of its own frame.
 ///
 /// `world` is the mobject's own transform composed with its ancestors' — the
-/// caller folds those, because only the scene tree knows them. The paint is
-/// given rather than read from a mobject so that this stays a pure function of
-/// its arguments, which is what makes it testable without a tree.
+/// caller folds those, because only the scene tree knows them. `to_device` is the
+/// world→screen transform for the frame: the viewport *and the camera*, already
+/// composed (`SceneContext::affine`). Taking the composed transform rather than
+/// the two pieces is deliberate — this module has no business knowing where the
+/// view is looking, and a caller who passed only the viewport would draw text at
+/// the wrong place while every filled path moved correctly. The paint is given
+/// rather than read from a mobject so that this stays a pure function of its
+/// arguments, which is what makes it testable without a tree.
 ///
 /// Emits a [`DrawOp::SetTransform`] first, since the draw list's transform is
-/// global to the frame and the viewport has to be reinstated after whatever was
+/// global to the frame and the view has to be reinstated after whatever was
 /// drawn before. Nothing is emitted for an empty block: a scene whose font was
 /// missing should cost nothing to draw, and an empty glyph run is not a thing the
 /// backend needs to be told about.
 pub fn text_ops(
     shaped: &ShapedText,
     world: Affine2,
-    viewport: &Viewport,
+    to_device: Affine2,
     paint: Srgb,
 ) -> Vec<DrawOp> {
     if shaped.runs.iter().all(|r| r.glyphs.is_empty()) {
         return Vec::new();
     }
-    // The block's own placement in the world, then the viewport: the glyphs keep
-    // the shaper's coordinates, so this is the only place the flip and the
-    // centring happen.
-    let place = viewport.affine() * world * layout_to_local(shaped.width, shaped.height);
+    // The block's own placement in the world, then the view: the glyphs keep the
+    // shaper's coordinates, so this is the only place the flip and the centring
+    // happen.
+    let place = to_device * world * layout_to_local(shaped.width, shaped.height);
 
     let mut ops = Vec::with_capacity(shaped.runs.len() * 2 + 1);
     ops.push(DrawOp::SetTransform(place));
@@ -111,16 +121,16 @@ pub fn text_ops(
 /// The ops for one shaped block, appended to `list`.
 ///
 /// A convenience for a scene that wants the block in the frame it is already
-/// building, where the viewport has to come from the context rather than from an
-/// argument.
+/// building, where the world→device transform has to come from the context
+/// (`ctx.affine()`) rather than from an argument the scene chose.
 pub fn push_text(
     list: &mut DrawList,
     shaped: &ShapedText,
     world: Affine2,
-    viewport: &Viewport,
+    to_device: Affine2,
     paint: Srgb,
 ) {
-    for op in text_ops(shaped, world, viewport, paint) {
+    for op in text_ops(shaped, world, to_device, paint) {
         list.push(op);
     }
 }
@@ -128,11 +138,17 @@ pub fn push_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustim_math::Point;
+    use rustim_math::{Camera, Point, Viewport};
     use rustim_render::TextGlyph;
     use rustim_text::{FontProvider, TextStyle};
 
     const UNIT_SCALE: f64 = 1.0;
+
+    /// The world→device transform the app passes in: the default viewport under
+    /// the default camera, which is 90 px per unit.
+    fn device() -> Affine2 {
+        Viewport::default().affine(&Camera::default())
+    }
 
     fn shaped(text: &str) -> ShapedText {
         let mut provider = FontProvider::with_bundled().expect("assets/fonts");
@@ -187,12 +203,7 @@ mod tests {
         // it lower, and every letter is upside down while every baseline looks
         // right.
         let s = shaped("abc");
-        let ops = text_ops(
-            &s,
-            Affine2::IDENTITY,
-            &Viewport::default(),
-            rustim_color::FG,
-        );
+        let ops = text_ops(&s, Affine2::IDENTITY, device(), rustim_color::FG);
         let place = place_of(&ops);
         let g = glyphs(&ops)[0];
         let on_baseline = place * Point::new(f64::from(g.x), f64::from(g.y));
@@ -214,12 +225,7 @@ mod tests {
         // conversion here is exactly the mirrored-glyph bug, and it is invisible
         // in the positions this test reads.
         let s = shaped("abc");
-        let ops = text_ops(
-            &s,
-            Affine2::IDENTITY,
-            &Viewport::default(),
-            rustim_color::FG,
-        );
+        let ops = text_ops(&s, Affine2::IDENTITY, device(), rustim_color::FG);
         let drawn = glyphs(&ops);
         let shaped_glyphs: Vec<_> = s.runs.iter().flat_map(|r| r.glyphs.iter()).collect();
         assert_eq!(drawn.len(), shaped_glyphs.len());
@@ -230,16 +236,15 @@ mod tests {
 
     #[test]
     fn the_block_lands_where_the_world_transform_puts_it() {
-        // The two halves have to compose, not just each be right: the viewport
+        // The two halves have to compose, not just each be right: the view
         // maps world to screen, the world transform places the block, and the
         // block's own centre is the point that lands at `world`'s origin.
         let s = shaped("abc");
-        let viewport = Viewport::default();
         let world = Affine2::translate((2.0, 1.0));
-        let ops = text_ops(&s, world, &viewport, rustim_color::FG);
+        let ops = text_ops(&s, world, device(), rustim_color::FG);
         let centre =
             place_of(&ops) * Point::new(f64::from(s.width / 2.0), f64::from(s.height / 2.0));
-        let (x, y) = viewport.to_screen((2.0, 1.0));
+        let (x, y) = Viewport::default().to_screen(&Camera::default(), (2.0, 1.0));
         assert!((centre.x - x).abs() < 1e-9 && (centre.y - y).abs() < 1e-9);
 
         // And the run is still sized in world units: the viewport's scale is
@@ -258,15 +263,41 @@ mod tests {
         // would not look like a bug — it would quietly cost the hinting, and the
         // viewport's flip and ours are what cancel to keep it.
         let s = shaped("abc");
-        let viewport = Viewport::default();
-        let ops = text_ops(&s, Affine2::IDENTITY, &viewport, rustim_color::FG);
+        let ops = text_ops(&s, Affine2::IDENTITY, device(), rustim_color::FG);
         let [_, b, c, d, _, _] = place_of(&ops).as_coeffs();
         assert_eq!((b, c), (0.0, 0.0), "no rotation or skew");
         assert!(
             d > 0.0,
             "the flips must cancel, or the run is drawn unhinted"
         );
-        assert!((d - viewport.scale()).abs() < 1e-9, "world units to pixels");
+        assert!((d - 90.0).abs() < 1e-9, "world units to pixels");
+    }
+
+    /// The camera is folded in by the caller, so a zoom scales the glyphs the
+    /// same way a window resize does — and, crucially, it stays a *positive
+    /// uniform* composite, which is the condition for the hinted path. A camera
+    /// that produced a rotation or a flip would silently cost the hinting rather
+    /// than look wrong.
+    #[test]
+    fn a_zoomed_camera_scales_the_glyph_run() {
+        let s = shaped("abc");
+        let camera = Camera::new((0.5, -0.25), 2.0);
+        let to_device = Viewport::default().affine(&camera);
+        let ops = text_ops(&s, Affine2::IDENTITY, to_device, rustim_color::FG);
+        let place = place_of(&ops);
+        let [_, b, c, d, _, _] = place.as_coeffs();
+        assert_eq!((b, c), (0.0, 0.0), "a zoom is not a rotation");
+        assert!((d - 180.0).abs() < 1e-9, "zoom 2 doubles px/unit: {d}");
+
+        // And the pan shows: the block sits at the world origin, while the camera
+        // is centred on (0.5, -0.25) — so the block lands three quarters of a
+        // unit left of and a quarter unit below the frame's centre, at 180 px per
+        // unit.
+        let centre = place * Point::new(f64::from(s.width / 2.0), f64::from(s.height / 2.0));
+        assert!(
+            (centre.x - 550.0).abs() < 1e-9 && (centre.y - 315.0).abs() < 1e-9,
+            "{centre:?}"
+        );
     }
 
     #[test]
@@ -276,26 +307,20 @@ mod tests {
         // The size has to come out the same either way — it is the same em — and
         // this is the test that says so, since the two paths share no code.
         let s = shaped("abc");
-        let viewport = Viewport::default();
         let unit_length = |ops: &[DrawOp]| {
             let place = place_of(ops);
             let o = place * Point::new(0.0, 0.0);
             let u = place * Point::new(1.0, 0.0);
             (u.x - o.x).hypot(u.y - o.y)
         };
-        let straight = unit_length(&text_ops(
-            &s,
-            Affine2::IDENTITY,
-            &viewport,
-            rustim_color::FG,
-        ));
+        let straight = unit_length(&text_ops(&s, Affine2::IDENTITY, device(), rustim_color::FG));
         let rotated = unit_length(&text_ops(
             &s,
             Affine2::rotate(0.4),
-            &viewport,
+            device(),
             rustim_color::FG,
         ));
-        assert!((straight - viewport.scale()).abs() < 1e-9);
+        assert!((straight - 90.0).abs() < 1e-9);
         assert!(
             (straight - rotated).abs() < 1e-9,
             "a rotation is not a resize"
@@ -307,13 +332,7 @@ mod tests {
         let mut provider = FontProvider::new();
         let s = provider.shape("abc", &TextStyle::default(), UNIT_SCALE, None);
         assert!(
-            text_ops(
-                &s,
-                Affine2::IDENTITY,
-                &Viewport::default(),
-                rustim_color::FG
-            )
-            .is_empty(),
+            text_ops(&s, Affine2::IDENTITY, device(), rustim_color::FG).is_empty(),
             "a scene with no font should emit no ops at all"
         );
     }
@@ -321,12 +340,7 @@ mod tests {
     #[test]
     fn the_paint_is_set_before_the_glyphs() {
         let s = shaped("a");
-        let ops = text_ops(
-            &s,
-            Affine2::IDENTITY,
-            &Viewport::default(),
-            rustim_color::RED,
-        );
+        let ops = text_ops(&s, Affine2::IDENTITY, device(), rustim_color::RED);
         let paint = ops
             .iter()
             .position(|op| matches!(op, DrawOp::SetPaint(_)))

@@ -32,7 +32,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use rustim_math::{Point, Rect, Viewport, bezier};
+use rustim_math::{Camera, Point, Rect, Viewport, bezier};
 use rustim_mobject::{NodeId, NodeKind, SceneTree};
 
 /// The semantic tree's root.
@@ -145,10 +145,55 @@ pub struct SemanticNode {
     pub value: Option<SemanticValue>,
 }
 
+/// The camera the bounds in this snapshot were projected with.
+///
+/// [`SemanticNode::bounds`] are **screen pixels**, and that is the right thing
+/// for a platform — but it is not enough for the two consumers this layer also
+/// serves. An AI host deciding where to put a new object, and a reader being told
+/// which part of a figure is on screen, both need the inverse mapping, and the
+/// alternative to shipping it is each of them re-deriving the projection from
+/// `Viewport` and the camera — a duplicate that would drift from the one that
+/// produced the bounds. So the view rides along as data.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CameraView {
+    /// The world point at the centre of the frame.
+    pub center: [f64; 2],
+    pub zoom: f64,
+    /// Frame size in physical pixels.
+    pub frame: [u16; 2],
+    /// How much of the world the frame shows, in world units: `[width, height]`.
+    pub visible: [f64; 2],
+}
+
+impl CameraView {
+    /// The snapshot's camera fields for a given view.
+    pub fn new(camera: &Camera, viewport: &Viewport) -> Self {
+        let height = camera.visible_height();
+        let aspect = f64::from(viewport.frame_width) / f64::from(viewport.frame_height);
+        Self {
+            center: [camera.center.0, camera.center.1],
+            zoom: camera.zoom,
+            frame: [viewport.frame_width, viewport.frame_height],
+            visible: [height * aspect, height],
+        }
+    }
+}
+
+/// The default view, for reading a snapshot written before the camera was part
+/// of the protocol. The `bounds` in such a snapshot were made with it.
+impl Default for CameraView {
+    fn default() -> Self {
+        Self::new(&Camera::default(), &Viewport::default())
+    }
+}
+
 /// A complete snapshot of everything outside the engine needs to know.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticTree {
     pub root: NodeId,
+    /// The view this snapshot's pixel bounds belong to; see [`CameraView`].
+    #[serde(default)]
+    pub camera: CameraView,
     pub nodes: Vec<SemanticNode>,
     /// The announcement text, if the engine wants to say something. Not a node
     /// id: the announcement node is the app layer's, since it exists only where
@@ -171,7 +216,8 @@ impl SemanticTree {
 /// depend on interaction state would give the two projections (AccessKit and
 /// DOM/ARIA) different trees for the same scene.
 pub fn build(tree: &SceneTree, viewport: &Viewport, live: Option<String>) -> SemanticTree {
-    let to_screen = viewport.affine();
+    let camera = tree.camera;
+    let to_screen = viewport.affine(&camera);
     let mut nodes = Vec::with_capacity(tree.len() + 1);
     nodes.push(SemanticNode {
         id: ROOT,
@@ -219,6 +265,7 @@ pub fn build(tree: &SceneTree, viewport: &Viewport, live: Option<String>) -> Sem
 
     SemanticTree {
         root: ROOT,
+        camera: CameraView::new(&camera, viewport),
         nodes,
         live,
     }
@@ -954,5 +1001,60 @@ mod tests {
         // It survives the JSON round trip the agent-facing `inspect` surface uses.
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<SemanticTree>(&json).unwrap(), s);
+    }
+
+    /// The pixel `bounds` are only usable by a host that also knows the view they
+    /// were made with, so the view travels with them.
+    #[test]
+    fn the_semantic_tree_carries_the_camera() {
+        let mut tree = scene();
+        tree.camera = Camera::new((1.0, -2.0), 2.0);
+        let s = build(&tree, &Viewport::default(), None);
+        assert_eq!(s.camera.center, [1.0, -2.0]);
+        assert_eq!(s.camera.zoom, 2.0);
+        assert_eq!(s.camera.frame, [1280, 720]);
+        // 8 / 2 units tall, and the frame is 16:9.
+        assert!((s.camera.visible[1] - 4.0).abs() < 1e-12);
+        assert!((s.camera.visible[0] - 4.0 * 1280.0 / 720.0).abs() < 1e-12);
+    }
+
+    /// Moving the camera moves the reported bounds; moving the *object* is the
+    /// other test. Both projections read the same transform, and this is the
+    /// half the camera introduced.
+    #[test]
+    fn a_camera_pan_moves_the_reported_screen_bounds() {
+        let mut tree = scene();
+        let id = tree.root_ids()[0];
+        let before = build(&tree, &Viewport::default(), None)
+            .get(id)
+            .unwrap()
+            .bounds
+            .unwrap();
+
+        tree.camera.center = (3.0, 0.0);
+        let after = build(&tree, &Viewport::default(), None)
+            .get(id)
+            .unwrap()
+            .bounds
+            .unwrap();
+
+        // Panning the view right by 3 units moves everything on screen left by
+        // 3 * 90 px. The object itself did not change size.
+        assert!(
+            (before.x0 - after.x0 - 3.0 * 90.0).abs() < 1e-9,
+            "{before:?} vs {after:?}"
+        );
+        assert!((before.width() - after.width()).abs() < 1e-9);
+    }
+
+    /// A snapshot written before the camera joined the protocol still reads, and
+    /// reads as the view its bounds were actually made with.
+    #[test]
+    fn a_snapshot_from_before_the_camera_still_reads() {
+        let json = format!(r#"{{"root":{},"nodes":[],"live":null}}"#, ROOT.raw());
+        let s: SemanticTree = serde_json::from_str(&json).unwrap();
+        assert_eq!(s.camera, CameraView::default());
+        assert_eq!(s.camera.zoom, 1.0);
+        assert_eq!(s.camera.visible, [8.0 * (1280.0 / 720.0), 8.0]);
     }
 }

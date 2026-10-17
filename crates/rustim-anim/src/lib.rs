@@ -55,7 +55,7 @@ pub mod sequence;
 
 use rustim_mobject::{NodeId, SceneTree};
 
-pub use ops::{FadeIn, FadeOut, MoveTo, Rotate, Scale, Transform, Wait};
+pub use ops::{CameraMove, FadeIn, FadeOut, MoveTo, Rotate, Scale, Transform, Wait};
 pub use rustim_math::rate::{self, RateFunc};
 pub use sequence::Sequence;
 

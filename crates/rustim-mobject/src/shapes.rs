@@ -72,8 +72,8 @@ impl ShapeParams {
 
 /// How thick a line or an arrow's shaft is when the caller did not say.
 ///
-/// Manim's `Line` draws at `stroke_width = 4` px; against `Viewport::default()`'s
-/// 8 world units over 720 px that is `4 · 8 / 720`, or 0.0444 units, rounded here
+/// Manim's `Line` draws at `stroke_width = 4` px; against the default camera's
+/// 8 world units over the default viewport's 720 px that is `4 · 8 / 720`, or 0.0444 units, rounded here
 /// to 0.045. It is a *scene-side* convention rather than a property of geometry,
 /// which is why it is a constant with this comment and not a derivation: the
 /// px↔unit mapping is the viewport's business and a mobject never learns it.

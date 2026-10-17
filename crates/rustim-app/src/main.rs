@@ -850,7 +850,7 @@ impl Scene for TextScene {
             // keys change a text object's opacity and the picture follows.
             let mut paint = m.style.fill;
             paint.components[3] = (m.opacity * m.style.fill_opacity) as f32;
-            rustim_app::text::push_text(list, shaped, world, &ctx.viewport, paint);
+            rustim_app::text::push_text(list, shaped, world, ctx.affine(), paint);
         }
     }
 }
@@ -1642,10 +1642,13 @@ fn main() {
                 println!("--reply: answer each command with one JSON line on stdout");
                 println!("animations: {}", feed::animation_kinds());
                 println!();
-                println!("example --script line:");
+                println!("example --script lines:");
                 println!(
                     r#"  {{"action":"add","type":"circle","params":{{"radius":1.5,"label":"圆"}}}}"#
                 );
+                // `camera` is a command, not an animation kind: without
+                // `duration` it writes the view now, with one it queues a beat.
+                println!(r#"  {{"action":"camera","focus":4294967297,"duration":1.0}}"#);
                 return;
             }
             other => {
@@ -1682,7 +1685,6 @@ fn main() {
     let viewport = Viewport {
         frame_width: WIDTH,
         frame_height: HEIGHT,
-        ..Default::default()
     };
 
     // The flag wins; without it the desktop is asked, best effort, once. Read here

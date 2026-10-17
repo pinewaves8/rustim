@@ -1,7 +1,7 @@
 //! The scene trait and the context a scene is handed.
 
-use rustim_anim::{Animation, AnimationScheduler, Motion, Sequence, Wait};
-use rustim_math::Viewport;
+use rustim_anim::{Animation, AnimationScheduler, CameraMove, Motion, Sequence, Wait};
+use rustim_math::{Affine2, Camera, Viewport};
 use rustim_mobject::{NodeId, SceneTree};
 use rustim_render::{DrawList, DrawOp};
 
@@ -227,25 +227,72 @@ impl SceneContext {
 
     /// Apply a command from outside the engine.
     ///
-    /// [`Command::Play`] is answered **here** rather than in `command::apply`: a
-    /// play needs the playback machine, and `apply`'s documented purity — "pure
-    /// with respect to everything except `tree`: no clock, no I/O, no renderer" —
-    /// is what makes the rest of the protocol testable in isolation and replayable.
-    /// The wire→animation mapping still lives in `command::animation_for`, next to
-    /// the wire types.
+    /// [`Command::Play`] and [`Command::Camera`] are answered **here** rather than
+    /// in `command::apply`: a play needs the playback machine, a camera command
+    /// needs the playback machine *or* the viewport's aspect ratio (for `focus`),
+    /// and `apply`'s documented purity — "pure with respect to everything except
+    /// `tree`: no clock, no I/O, no renderer" — is what makes the rest of the
+    /// protocol testable in isolation and replayable. The wire→animation and
+    /// wire→camera mappings still live in `command`, next to the wire types.
+    ///
+    /// A camera command without a `duration` writes `tree.camera` now; one with a
+    /// duration (including `0.0`) queues a single `CameraMove` beat, so it is
+    /// subject to the same clock, reduced-motion policy and beat ordering as
+    /// everything else. **An instant camera command is overwritten by a move
+    /// already in flight**, the same way a `Set position` loses to a running
+    /// `MoveTo` — an animation owns its subject until it ends.
     ///
     /// The returned diff is **empty**, and that is the honest answer rather than a
     /// placeholder: a diff describes the tree, and queueing a beat does not change
-    /// the tree — it changes what will happen to it. The animation would report its
-    /// own modification when it runs; an `ANIMATION_DONE` announcement is how a host
-    /// learns that it did.
+    /// the tree — it changes what will happen to it — while the camera is not a
+    /// node at all. The animation would report its own modification when it runs;
+    /// an `ANIMATION_DONE` announcement is how a host learns that it did.
     pub fn handle(&mut self, cmd: &Command) -> Result<StateDiff, CommandError> {
         if let Command::Play { animation } = cmd {
             let anim = command::animation_for(&self.tree, animation)?;
             self.play_all([anim]);
             return Ok(StateDiff::default());
         }
+        if let Command::Camera {
+            center,
+            zoom,
+            focus,
+            duration,
+        } = cmd
+        {
+            let to = command::camera_for(&self.tree, &self.viewport, *center, *zoom, *focus)?;
+            match command::camera_duration(*duration)? {
+                None => self.tree.camera = to,
+                Some(seconds) => self.play(CameraMove::new(to).with_duration(seconds)),
+            }
+            return Ok(StateDiff::default());
+        }
         command::apply(&mut self.tree, cmd)
+    }
+
+    /// Where the view is looking.
+    ///
+    /// A shortcut for `self.tree.camera`: the camera is part of the tree because
+    /// that is the only mutable world an [`rustim_anim::Animation`] receives (see
+    /// `SceneTree`'s doc), and a scene should not have to know that to ask.
+    pub fn camera(&self) -> &Camera {
+        &self.tree.camera
+    }
+
+    /// The world→screen transform for this frame: the window's projection under
+    /// the scene's current camera.
+    ///
+    /// The one thing a scene that draws its own operations (text, most notably)
+    /// must fold into them. There is no camera-free variant, on purpose — a
+    /// caller that forgot the camera would draw a correct-looking picture of the
+    /// wrong view.
+    pub fn affine(&self) -> Affine2 {
+        self.viewport.affine(self.camera())
+    }
+
+    /// Pixels per world unit under the current camera.
+    pub fn pixels_per_unit(&self) -> f64 {
+        self.viewport.pixels_per_unit(self.camera())
     }
 
     /// This scene, projected into the semantic tree.
@@ -272,7 +319,7 @@ impl SceneContext {
     pub fn begin_frame(&self, list: &mut DrawList) {
         list.clear(self.viewport.frame_width, self.viewport.frame_height);
         list.background = Some(rustim_color::BG);
-        list.push(DrawOp::SetTransform(self.viewport.affine()));
+        list.push(DrawOp::SetTransform(self.affine()));
     }
 
     /// Flatten the tree into a backend-neutral draw list.
@@ -775,5 +822,112 @@ mod tests {
         assert!(ctx.animations.is_empty());
         tick(&mut ctx, 10);
         assert!(!ctx.is_playing());
+    }
+
+    // ---- the camera -------------------------------------------------------
+
+    fn camera_cmd(center: Option<[f64; 2]>, zoom: Option<f64>, duration: Option<f64>) -> Command {
+        Command::Camera {
+            center,
+            zoom,
+            focus: None,
+            duration,
+        }
+    }
+
+    /// Without a duration the camera is written at once: the very next frame is
+    /// already the new view, and the playhead never moves.
+    #[test]
+    fn a_camera_command_without_a_duration_sets_the_camera_now() {
+        let mut ctx = scene();
+        let diff = ctx
+            .handle(&camera_cmd(Some([2.0, -1.0]), Some(2.0), None))
+            .unwrap();
+        assert!(
+            diff.is_empty(),
+            "the view is not a node, so nothing changed"
+        );
+        assert!(!ctx.is_playing(), "an instant set queues no beat");
+        assert_eq!(ctx.camera(), &Camera::new((2.0, -1.0), 2.0));
+
+        // ...and the frame's transform follows in the same breath. Not a
+        // `pixels_per_unit()` assertion alone: the question a scene cares about is
+        // where a world point lands on screen.
+        let mut list = DrawList::default();
+        ctx.build_draw_list(&mut list);
+        let DrawOp::SetTransform(t) = list.ops[0] else {
+            panic!("the first op must install the view");
+        };
+        let p = t * rustim_math::Point::new(2.0, -1.0);
+        assert!(
+            (p.x - 640.0).abs() < 1e-9 && (p.y - 360.0).abs() < 1e-9,
+            "{p:?}"
+        );
+        assert_eq!(ctx.pixels_per_unit(), 180.0);
+    }
+
+    /// With a duration it is an ordinary beat: nothing happens on the frame it
+    /// arrives, the camera interpolates, and the settled state is the destination.
+    #[test]
+    fn a_camera_command_with_a_duration_queues_one_beat() {
+        let mut ctx = scene();
+        let diff = ctx
+            .handle(&camera_cmd(Some([2.0, 0.0]), None, Some(0.5)))
+            .unwrap();
+        assert!(diff.is_empty());
+        assert!(ctx.is_playing(), "the beat is queued");
+        assert_eq!(
+            ctx.camera(),
+            &Camera::default(),
+            "queueing must not teleport the view"
+        );
+
+        tick(&mut ctx, 3);
+        let mid = ctx.camera().center.0;
+        assert!(mid > 0.0 && mid < 2.0, "underway at {mid}");
+
+        tick(&mut ctx, 40);
+        assert!(!ctx.is_playing());
+        assert_eq!(ctx.camera(), &Camera::new((2.0, 0.0), 1.0));
+    }
+
+    /// **An instant command does not pre-empt a running move.** That is the same
+    /// contract `Set position` has with a running `MoveTo` — an animation owns its
+    /// subject until it ends — and it is documented rather than discovered. The
+    /// instant write is real for the moment it happens; the next frame of the move
+    /// overwrites it.
+    #[test]
+    fn an_instant_camera_command_is_overwritten_by_a_running_move() {
+        let mut ctx = scene();
+        ctx.handle(&camera_cmd(Some([2.0, 0.0]), None, Some(1.0)))
+            .unwrap();
+        tick(&mut ctx, 10);
+
+        ctx.handle(&camera_cmd(None, Some(4.0), None)).unwrap();
+        assert_eq!(ctx.camera().zoom, 4.0, "the write itself lands");
+
+        tick(&mut ctx, 1);
+        assert_ne!(
+            ctx.camera().zoom,
+            4.0,
+            "the running move owns the camera until it ends"
+        );
+        assert!(ctx.is_playing());
+
+        tick(&mut ctx, 70);
+        assert_eq!(ctx.camera(), &Camera::new((2.0, 0.0), 1.0));
+    }
+
+    /// A rewritten scene starts looking at the origin again.
+    #[test]
+    fn reset_returns_the_default_camera() {
+        let mut ctx = scene();
+        ctx.handle(&camera_cmd(Some([1.0, 1.0]), Some(3.0), None))
+            .unwrap();
+        assert_ne!(ctx.camera(), &Camera::default());
+
+        ctx.reset();
+        assert_eq!(ctx.camera(), &Camera::default());
+        assert_eq!(ctx.pixels_per_unit(), 90.0);
     }
 }

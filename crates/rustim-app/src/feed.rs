@@ -377,6 +377,42 @@ mod tests {
         assert_eq!(label.as_deref(), Some("圆"));
     }
 
+    /// `focus` is the camera field that needs the tree — it names an object and
+    /// frames its bounding box — so the feed is the place it is exercised end to
+    /// end: `add`, read the id back, then `camera focus` that id. That is exactly
+    /// the round trip an interactive host performs, and the reason `add` reports
+    /// the id it created.
+    #[test]
+    fn a_focus_command_in_a_feed_frames_the_shape_it_names() {
+        let mut scene = Recorder::default();
+        let mut ctx = context();
+        let (_, replies) = feed(
+            &mut scene,
+            &mut ctx,
+            &[r#"{"action":"add","type":"square","params":{"width":2.0,"height":2.0}}"#],
+        );
+        let id = replies[0].diff.as_ref().expect("an add diffs").created[0];
+
+        let line = format!(r#"{{"action":"camera","focus":{}}}"#, id.raw());
+        let (counts, replies) = feed(&mut scene, &mut ctx, &[line.as_str()]);
+        assert_eq!(counts.applied, 1);
+        assert!(
+            replies[0].diff.as_ref().expect("a reply").is_empty(),
+            "the view is not a node, so nothing in the tree changed"
+        );
+        // A 2x2 box at 1280x720: the height is the tighter axis, so the fit is
+        // 8 / (1.2 * 2). The host did not have to send a zoom to get it.
+        assert_eq!(ctx.camera().center, (0.0, 0.0));
+        assert!(
+            (ctx.camera().zoom - rustim_math::Camera::WORLD_HEIGHT / (1.2 * 2.0)).abs() < 1e-12,
+            "{}",
+            ctx.camera().zoom
+        );
+        // And `camera` is a command, not an animation kind: `--help` must keep
+        // saying so.
+        assert!(!animation_kinds().contains("camera"));
+    }
+
     /// The hook `Scene::on_command` exists for — and this is the only test that
     /// can see it, because the app's frame loop is the other caller and that
     /// needs a window.

@@ -491,6 +491,75 @@ fn a_script_applies_on_top_of_a_named_scene() {
     );
 }
 
+/// The camera is reachable from the protocol, both as a write and as a beat, and
+/// the still and the inspected tree agree about where it ended up.
+///
+/// The image half matters because the camera is consumed by three unrelated
+/// paths — filled paths, glyph runs, and the accessibility bounds — and only a
+/// frame shows that all three moved together. The `--inspect` half is the only
+/// way to see the exact destination, which a picture cannot state.
+#[test]
+fn a_camera_command_moves_the_settled_view() {
+    let bare = out_path("camera-bare");
+    run(&["--scene", "pythagorean", "--png", bare.to_str().unwrap()])
+        .ok("--scene pythagorean --png");
+
+    let instant = scratch("camera-instant", "{\"action\":\"camera\",\"zoom\":2.0}\n");
+    let moved = out_path("camera-moved");
+    run(&[
+        "--scene",
+        "pythagorean",
+        "--script",
+        instant.to_str().unwrap(),
+        "--png",
+        moved.to_str().unwrap(),
+    ])
+    .ok("--scene pythagorean --script … --png");
+
+    let tolerance = Tolerance::default();
+    let diff = compare_png_files(&bare, &moved, &tolerance).expect("compare");
+    assert!(
+        diff.max > 0,
+        "zooming in did not change the frame:\n{}",
+        diff.report(&tolerance),
+    );
+
+    let ran = run(&[
+        "--scene",
+        "pythagorean",
+        "--script",
+        instant.to_str().unwrap(),
+        "--inspect",
+    ]);
+    ran.ok("--scene pythagorean --script … --inspect");
+    let tree: serde_json::Value =
+        serde_json::from_str(&ran.stdout).expect("--inspect must emit JSON");
+    assert_eq!(tree["camera"]["zoom"], 2.0);
+    assert_eq!(tree["camera"]["center"], serde_json::json!([0.0, 0.0]));
+    // The frame is 4 world units tall at zoom 2, and 16:9 wide.
+    assert_eq!(tree["camera"]["visible"][1], 4.0);
+    assert_eq!(tree["camera"]["frame"], serde_json::json!([1280, 720]));
+
+    // With a duration it is a beat, and the ten-second still is past its end: the
+    // destination is assigned verbatim rather than approached, so `--inspect`
+    // reports exactly the two numbers the command named.
+    let beat = scratch(
+        "camera-beat",
+        "{\"action\":\"camera\",\"center\":[0.5,-0.25],\"zoom\":1.5,\"duration\":1.0}\n",
+    );
+    let ran = run(&[
+        "--scene",
+        "pythagorean",
+        "--script",
+        beat.to_str().unwrap(),
+        "--inspect",
+    ]);
+    ran.ok("--inspect after a camera beat");
+    let tree: serde_json::Value = serde_json::from_str(&ran.stdout).expect("--inspect JSON");
+    assert_eq!(tree["camera"]["center"], serde_json::json!([0.5, -0.25]));
+    assert_eq!(tree["camera"]["zoom"], 1.5);
+}
+
 /// A script path that cannot be read is an `exit(2)`, not a silent no-op.
 ///
 /// The one failure here that is not a per-line refusal: there is no line to
