@@ -54,6 +54,7 @@ pub mod composition;
 pub mod family;
 pub mod ops;
 pub mod sequence;
+pub mod with_rate;
 
 use rustim_mobject::{NodeId, SceneTree};
 
@@ -62,8 +63,9 @@ pub use family::TransformGroup;
 pub use ops::{
     CameraMove, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Transform, Uncreate, Wait,
 };
-pub use rustim_math::rate::{self, RateFunc};
+pub use rustim_math::rate::{self, Rate, RateFunc};
 pub use sequence::Sequence;
+pub use with_rate::WithRate;
 
 /// How much of a scene's motion to actually play.
 ///

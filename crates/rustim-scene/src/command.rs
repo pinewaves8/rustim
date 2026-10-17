@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use rustim_anim::{
     Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Succession,
-    TransformGroup, Uncreate,
+    TransformGroup, Uncreate, WithRate,
 };
+use rustim_math::rate::Rate;
 use rustim_math::{Affine2, Camera, Point, Viewport};
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree};
@@ -168,6 +169,29 @@ pub struct AnimationSpec {
     /// `group`, `1.0` for `succession`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lag_ratio: Option<f64>,
+    /// The easing curve, by Manim's name for it.
+    ///
+    /// Named rather than expressed, because a `RateFunc` is a pointer and has
+    /// no JSON spelling; the vocabulary is [`Rate`], which is exactly the set of
+    /// functions in `manim.utils.rate_functions` at Manim's default parameters.
+    /// Absent means the animation's own default, `ease_in_out` — which is the
+    /// same curve as the wire's `ease_in_out_quad`, both being Manim's
+    /// `ease_in_out_quad`.
+    ///
+    /// It applies to **every** kind, including `group` and `succession`: Manim's
+    /// `AnimationGroup` takes a `rate_func` like any other animation, and it
+    /// eases the group's whole timeline. A member inside one may carry its own
+    /// `rate`, which then applies to the member — the outer curve shapes when the
+    /// member starts and how far into its own motion it is, the inner one how that
+    /// motion is shaped.
+    ///
+    /// Unknown names are a serde error rather than a refusal, and that is the
+    /// honest classification: `"rate": "ease_in_wobble"` is not a well-formed
+    /// command, because the vocabulary is fixed and the model can read it. There
+    /// is no value of `Rate` to refuse — unlike a `factor` of `0`, every variant
+    /// names a real curve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<Rate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +511,12 @@ pub fn camera_duration(duration: Option<f64>) -> Result<Option<f64>, CommandErro
 /// *already running*; a command arriving now is a request that can still be
 /// answered.
 ///
+/// One field is not in the refusal list because it cannot be wrong once it has
+/// parsed: `rate`. An unknown curve name is a serde error — the vocabulary is
+/// fixed and [`Rate`] is the whole of it — and every name it accepts is a real
+/// curve. The curve is applied by wrapping the constructed animation, which is
+/// why every kind can take one, `group` and `succession` included.
+///
 /// The refusals, each a value rather than a panic:
 ///
 /// * a kind other than `group`/`succession` with **no** `target` —
@@ -537,10 +567,25 @@ pub fn animation_for(
     tree: &SceneTree,
     spec: &AnimationSpec,
 ) -> Result<Box<dyn Animation>, CommandError> {
-    match spec.kind {
-        AnimationKind::Group | AnimationKind::Succession => return composed_for(tree, spec),
-        _ => {}
-    }
+    let anim: Box<dyn Animation> = match spec.kind {
+        AnimationKind::Group | AnimationKind::Succession => composed_for(tree, spec)?,
+        _ => simple_for(tree, spec)?,
+    };
+    // The override wraps whatever the kind produced, compositions included. It
+    // has to sit *outside*: a group eases its own timeline, so a curve placed
+    // inside would shape each member's motion rather than when the members play.
+    Ok(match spec.rate {
+        Some(rate) => Box::new(WithRate::new(anim, rate.func())),
+        None => anim,
+    })
+}
+
+/// The half of [`animation_for`] that builds one concrete animation.
+///
+/// Split out because a rate override wraps the *result*, and a group's result
+/// comes from [`composed_for`] — the early return that used to open
+/// [`animation_for`] left no place to say "wrap whatever this produced".
+fn simple_for(tree: &SceneTree, spec: &AnimationSpec) -> Result<Box<dyn Animation>, CommandError> {
     let Some(target) = spec.target else {
         return Err(CommandError::OutOfRange {
             property: "target".into(),
@@ -937,6 +982,15 @@ mod tests {
             format!(
                 r#"{{"action":"play","animation":{{"target":{id},"type":"transform","duration":0.8,"into":{id},"path_arc":1.5}}}}"#
             ),
+            // The easing curve is last in declaration order — it wraps whatever
+            // the kind built, compositions included, so a group's own curve and
+            // a member's curve are two different fields in the same document.
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"fade_in","rate":"ease_in_out_sine"}}}}"#
+            ),
+            format!(
+                r#"{{"action":"play","animation":{{"type":"group","animations":[{{"target":{id},"type":"fade_in","rate":"linear"}}],"rate":"there_and_back"}}}}"#
+            ),
             // The camera command, in its full and partial spellings. The full
             // one exercises every optional field at once; the partial one is what
             // a host sends to "zoom in", and it has to survive without gaining
@@ -1191,6 +1245,7 @@ mod tests {
                     path_arc: None,
                     animations: None,
                     lag_ratio: None,
+                    rate: None,
                 },
             },
         )
@@ -1224,6 +1279,7 @@ mod tests {
             path_arc: None,
             animations: None,
             lag_ratio: None,
+            rate: None,
         }
     }
 
@@ -1586,6 +1642,7 @@ mod tests {
             path_arc: None,
             animations: Some(members),
             lag_ratio: None,
+            rate: None,
         }
     }
 
@@ -1900,6 +1957,65 @@ mod tests {
         assert!(
             (centre.x - 2.0).abs() < 1e-12 && (centre.y + 2.0).abs() < 1e-12,
             "{centre:?}"
+        );
+    }
+
+    /// The curve on the wire is the curve in play.
+    ///
+    /// `ease` is the observable rather than a frame: it is where the scheduler
+    /// reads the rate, so a wrapper that changed nothing would leave the default
+    /// at `ease_in_out`'s `0.125`. The counterfactual is the second build.
+    #[test]
+    fn a_play_command_carries_its_rate() {
+        let (tree, id) = scene_with_a_blank();
+
+        let mut eased = spec(id, AnimationKind::FadeIn);
+        eased.rate = Some(Rate::Linear);
+        let anim = animation_for(&tree, &eased).unwrap();
+        assert_eq!(anim.ease(0.25), 0.25);
+
+        let plain = animation_for(&tree, &spec(id, AnimationKind::FadeIn)).unwrap();
+        assert_eq!(
+            plain.ease(0.25),
+            0.125,
+            "absent rate must keep the engine's default"
+        );
+    }
+
+    /// The override wraps the whole composition, not its members: a group's own
+    /// rate stays `linear` here, so a curve that changed `ease` can only have
+    /// been applied outside. If the rate had been handed to the members instead,
+    /// `ease(0.25)` would still be 0.25.
+    #[test]
+    fn a_group_can_carry_its_own_rate() {
+        let (tree, id) = scene_with_a_blank();
+        let mut what = composed(AnimationKind::Group, vec![spec(id, AnimationKind::FadeIn)]);
+        what.rate = Some(Rate::EaseInCubic);
+
+        let anim = animation_for(&tree, &what).unwrap();
+        assert_eq!(anim.ease(0.25), 0.25f64.powi(3));
+        assert_ne!(anim.ease(0.25), 0.25, "the group's default is linear");
+    }
+
+    /// ...and a member may carry its own, which shapes its motion inside the
+    /// group's timeline. A quarter of the way into a cubic is a sixty-fourth, so
+    /// the opacity says which curve reached it.
+    #[test]
+    fn a_rate_inside_a_group_shapes_only_its_member() {
+        let (mut tree, id) = scene_with_a_blank();
+        let mut member = spec(id, AnimationKind::FadeIn);
+        member.duration = Some(1.0);
+        member.rate = Some(Rate::EaseInCubic);
+        let what = composed(AnimationKind::Group, vec![member]);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(0.25, &mut tree);
+
+        let opacity = tree.get(id).unwrap().opacity;
+        assert!(
+            (opacity - 0.25f64.powi(3)).abs() < 1e-12,
+            "member opacity {opacity}, expected the cubic's 1/64"
         );
     }
 

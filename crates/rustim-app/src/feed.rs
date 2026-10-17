@@ -47,6 +47,7 @@
 
 use std::io::{self, BufRead, Write};
 
+use rustim_anim::Rate;
 use rustim_scene::command::{AnimationKind, Command, CommandError, CommandReply, StateDiff};
 use rustim_scene::{Scene, SceneContext};
 
@@ -266,6 +267,26 @@ pub fn animation_kinds() -> String {
         .join(", ")
 }
 
+/// The easing curves a `play` command's `rate` field accepts, for `--help`.
+///
+/// Read off [`Rate::ALL`], the same array the wire vocabulary's uniqueness and
+/// round-trip tests run over, so the help text cannot list a curve the parser
+/// rejects or miss one it takes. Forty-five names is long for a help line and
+/// still cheaper than a model guessing `ease_in_wobble` and being told only
+/// that its command was unparseable.
+pub fn rate_names() -> String {
+    Rate::ALL
+        .iter()
+        .map(|r| {
+            serde_json::to_string(r)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +437,40 @@ mod tests {
         // And `camera` is a command, not an animation kind: `--help` must keep
         // saying so.
         assert!(!animation_kinds().contains("camera"));
+    }
+
+    /// The rate vocabulary `--help` prints is the one the wire parses.
+    ///
+    /// Every name is read back through the real command parser, so the check is
+    /// "this is accepted", not "the string looks right"; and the alias is
+    /// asserted *absent*, because a host that copies a name out of `--help` and
+    /// gets a spelling that serialises back differently would break the
+    /// round-trip promise.
+    #[test]
+    fn the_documented_rates_are_the_ones_the_wire_takes() {
+        let names = rate_names();
+        let listed: Vec<&str> = names.split(", ").collect();
+        assert_eq!(
+            listed.len(),
+            Rate::ALL.len(),
+            "one name per curve, no repeats"
+        );
+        for (i, name) in listed.iter().enumerate() {
+            let json = format!(
+                r#"{{"action":"play","animation":{{"target":0,"type":"fade_in","rate":"{name}"}}}}"#
+            );
+            match serde_json::from_str::<Command>(&json) {
+                Ok(Command::Play { animation }) => {
+                    assert_eq!(animation.rate, Some(Rate::ALL[i]), "{name}")
+                }
+                other => panic!("{name} parsed as {other:?}"),
+            }
+        }
+        assert!(names.contains("ease_in_out_quad"));
+        assert!(
+            !names.contains("ease_in_out,"),
+            "--help must print the canonical spelling, not the alias"
+        );
     }
 
     /// The hook `Scene::on_command` exists for — and this is the only test that

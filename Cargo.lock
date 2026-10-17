@@ -3169,6 +3169,7 @@ name = "rustim-math"
 version = "0.0.0"
 dependencies = [
  "kurbo",
+ "serde",
  "serde_json",
 ]
 

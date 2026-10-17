@@ -7,10 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-# `serde` is on so that `Rect` can appear in the accessibility layer's
-# serialisable tree (`rustim-scene::a11y`) without a hand-rolled four-field
-# rectangle existing purely to be serialisable. Additive and platform-free, so it
-# does not affect the `wasm32-unknown-unknown` kernel build.
+# A real dependency, not a test one: `rate::Rate` is the *wire* vocabulary for a
+# `play` command's easing curve, so the names have to deserialize in the kernel.
+# Derive-only and platform-free, so it does not affect the wasm build.
+serde = { version = "1", features = ["derive"] }
+# `serde` is also on for `kurbo` so that `Rect` can appear in the accessibility
+# layer's serialisable tree (`rustim-scene::a11y`) without a hand-rolled
+# four-field rectangle existing purely to be serialisable.
 kurbo = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]

@@ -34,6 +34,7 @@ use std::path::PathBuf;
 
 use rustim_math::Point;
 use rustim_math::bezier;
+use rustim_math::rate::{self, Rate, RateFunc};
 use rustim_math::space_ops as so;
 use serde_json::{Map, Value};
 
@@ -1226,6 +1227,79 @@ fn path_along_arc_matches() {
 }
 
 // ---------------------------------------------------------------------------
+// manim-rate.json
+// ---------------------------------------------------------------------------
+
+/// Every rate function Manim exports, replayed at 101 points each.
+///
+/// The first group's case *names* are the wire vocabulary — [`Rate`]'s serde
+/// names — so each case does double duty: it checks the curve, and it checks
+/// that a host can name that curve in JSON at all. A function added to the port
+/// but not to the enum fails here as "not a Rate", and one added to the enum but
+/// not exported by Manim fails the exhaustiveness guard below.
+///
+/// The second group's names spell their arguments (`wiggle@wiggles=3`). That
+/// spelling is interpreted in exactly one place, [`parameterised_rate`], which
+/// panics on a name it does not know — so a case added to the generator cannot
+/// pass unexercised, and a name the table forgets cannot be silently skipped.
+#[test]
+fn rate_functions_match() {
+    let fixture = Fixture::load("manim-rate.json");
+    let mut rec = Recorder::new(&fixture);
+    let ts: Vec<f64> = fixture.input("rate_ts");
+
+    for group in ["rate_functions", "rate_functions_parameterized"] {
+        let cases = fixture.cases.get(group).expect("fixture has the group");
+        for name in cases.keys() {
+            let want: Vec<f64> = Vec::from_value(&rec.expect(group, name), name);
+            let f: RateFunc = if group == "rate_functions" {
+                let rate: Rate = serde_json::from_value(Value::String(name.clone()))
+                    .unwrap_or_else(|e| panic!("{name:?} is not a wire rate name: {e}"));
+                rate.func()
+            } else {
+                parameterised_rate(name)
+            };
+            let got: Vec<f64> = ts.iter().map(|&t| f(t)).collect();
+            close_floats(&got, &want, name);
+        }
+    }
+
+    rec.assert_exhaustive(&["rate_functions", "rate_functions_parameterized"]);
+}
+
+/// The Rust call for each parameterised case, keyed by the generator's case name.
+///
+/// Deliberately a `match` and not a second table: a case whose name is not here
+/// panics with the name in the message, which is the same failure shape as a
+/// missing comparison. The defaults Manim's signature supplies (`smooth` at
+/// inflection 10 in `not_quite_there`) are written out rather than hidden behind
+/// a shim, because the point of this test is what Manim actually computed.
+fn parameterised_rate(name: &str) -> RateFunc {
+    match name {
+        "smooth@inflection=4" => |t: f64| rate::smooth(t, 4.0),
+        "rush_into@inflection=4" => |t: f64| rate::rush_into(t, 4.0),
+        "rush_from@inflection=4" => |t: f64| rate::rush_from(t, 4.0),
+        "there_and_back@inflection=4" => |t: f64| rate::there_and_back(t, 4.0),
+        "there_and_back_with_pause@pause_ratio=0.5" => {
+            |t: f64| rate::there_and_back_with_pause(t, 0.5)
+        }
+        "running_start@pull_factor=-0.3" => |t: f64| rate::running_start(t, -0.3),
+        "wiggle@wiggles=3" => |t: f64| rate::wiggle(t, 3.0),
+        "exponential_decay@half_life=0.2" => |t: f64| rate::exponential_decay(t, 0.2),
+        "not_quite_there@proportion=0.5" => |t: f64| {
+            rate::not_quite_there(|u: f64| rate::smooth(u, rate::DEFAULT_INFLECTION), 0.5)(t)
+        },
+        "squish_rate_func@ease_in_quad@0.2@0.8" => {
+            |t: f64| rate::squish_rate_func(rate::ease_in_quad, 0.2, 0.8)(t)
+        }
+        "squish_rate_func@0.3@0.3" => {
+            |t: f64| rate::squish_rate_func(rate::ease_in_quad, 0.3, 0.3)(t)
+        }
+        other => panic!("no Rust call for parameterised rate case {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the coverage guards
 // ---------------------------------------------------------------------------
 
@@ -1278,6 +1352,11 @@ const SPACE_OPS_GROUPS: &[&str] = &[
     "path_along_arc",
 ];
 
+/// The rate groups. The first is one case per curve Manim exports, the second
+/// one per non-default call the generator could think of; both are exhausted by
+/// [`rate_functions_match`].
+const RATE_GROUPS: &[&str] = &["rate_functions", "rate_functions_parameterized"];
+
 /// The case count of each file. A regeneration that silently drops cases is
 /// otherwise invisible, because the suite would stay green on a smaller fixture.
 #[test]
@@ -1286,6 +1365,7 @@ fn fixture_case_counts_are_stable() {
         ("manim-bezier.json", 282usize),
         ("manim-geometry.json", 145),
         ("manim-space-ops.json", 288),
+        ("manim-rate.json", 56),
     ] {
         let fixture = Fixture::load(file);
         let total: usize = fixture.cases.values().map(BTreeMap::len).sum();
@@ -1299,6 +1379,7 @@ fn every_fixture_group_has_a_test() {
         ("manim-bezier.json", BEZIER_GROUPS),
         ("manim-geometry.json", GEOMETRY_GROUPS),
         ("manim-space-ops.json", SPACE_OPS_GROUPS),
+        ("manim-rate.json", RATE_GROUPS),
     ] {
         let fixture = Fixture::load(file);
         let declared: BTreeSet<String> = claimed.iter().map(|g| g.to_string()).collect();

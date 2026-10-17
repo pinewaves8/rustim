@@ -863,6 +863,7 @@ mod tests {
                 path_arc: None,
                 animations: None,
                 lag_ratio: None,
+                rate: None,
             },
         };
         ctx.handle(&cmd).unwrap();
@@ -893,6 +894,7 @@ mod tests {
                 path_arc: None,
                 animations: None,
                 lag_ratio: None,
+                rate: None,
             },
         };
 
@@ -934,6 +936,7 @@ mod tests {
                 path_arc: None,
                 animations: None,
                 lag_ratio: None,
+                rate: None,
             },
         };
 

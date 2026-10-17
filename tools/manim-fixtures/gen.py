@@ -916,6 +916,119 @@ def collect_paths():
                 )
 
 
+# --------------------------------------------------------------------------
+# manim.utils.rate_functions
+# --------------------------------------------------------------------------
+
+# The grid every rate case is sampled on. Inside [0, 1] on purpose: Manim's
+# functions are decorated with `@unit_interval`/`@zero`, which the engine does
+# not reproduce because it clamps before it eases, so values outside the interval
+# would differ by design rather than by defect.
+RATE_TS = [i / 100 for i in range(101)]
+
+
+def collect_rates():
+    """Every exported function in `manim.utils.rate_functions`, plus the
+    parameterised and composed ones at non-default arguments.
+
+    The first group is one case per *wire* name — the names `rate::Rate`
+    serialises — so the Rust side can parse each case's name as serde JSON and
+    compare the curve the enum resolves to. The second group names its arguments
+    in the case key (`wiggle@wiggles=3`), which is how the Rust test knows which
+    call to make without a second table.
+
+    Two Manim quirks the grid records rather than corrects: `there_and_back`,
+    `there_and_back_with_pause` and `wiggle` end at 0, and `exponential_decay`
+    ends a hair short of 1. Both are Manim's behaviour, and the Rust port keeps
+    them (see `rate.rs`'s module doc).
+    """
+    import manim.utils.rate_functions as R
+
+    INPUTS["rate_ts"] = RATE_TS
+
+    exported = {
+        "linear": R.linear,
+        "smooth": R.smooth,
+        "smoothstep": R.smoothstep,
+        "smootherstep": R.smootherstep,
+        "smoothererstep": R.smoothererstep,
+        "rush_into": R.rush_into,
+        "rush_from": R.rush_from,
+        "slow_into": R.slow_into,
+        "double_smooth": R.double_smooth,
+        "there_and_back": R.there_and_back,
+        "there_and_back_with_pause": R.there_and_back_with_pause,
+        "running_start": R.running_start,
+        "wiggle": R.wiggle,
+        "lingering": R.lingering,
+        "exponential_decay": R.exponential_decay,
+        "ease_in_sine": R.ease_in_sine,
+        "ease_out_sine": R.ease_out_sine,
+        "ease_in_out_sine": R.ease_in_out_sine,
+        "ease_in_quad": R.ease_in_quad,
+        "ease_out_quad": R.ease_out_quad,
+        "ease_in_out_quad": R.ease_in_out_quad,
+        "ease_in_cubic": R.ease_in_cubic,
+        "ease_out_cubic": R.ease_out_cubic,
+        "ease_in_out_cubic": R.ease_in_out_cubic,
+        "ease_in_quart": R.ease_in_quart,
+        "ease_out_quart": R.ease_out_quart,
+        "ease_in_out_quart": R.ease_in_out_quart,
+        "ease_in_quint": R.ease_in_quint,
+        "ease_out_quint": R.ease_out_quint,
+        "ease_in_out_quint": R.ease_in_out_quint,
+        "ease_in_expo": R.ease_in_expo,
+        "ease_out_expo": R.ease_out_expo,
+        "ease_in_out_expo": R.ease_in_out_expo,
+        "ease_in_circ": R.ease_in_circ,
+        "ease_out_circ": R.ease_out_circ,
+        "ease_in_out_circ": R.ease_in_out_circ,
+        "ease_in_back": R.ease_in_back,
+        "ease_out_back": R.ease_out_back,
+        "ease_in_out_back": R.ease_in_out_back,
+        "ease_in_elastic": R.ease_in_elastic,
+        "ease_out_elastic": R.ease_out_elastic,
+        "ease_in_out_elastic": R.ease_in_out_elastic,
+        "ease_in_bounce": R.ease_in_bounce,
+        "ease_out_bounce": R.ease_out_bounce,
+        "ease_in_out_bounce": R.ease_in_out_bounce,
+    }
+    for name, fn in exported.items():
+        case(
+            "rate_functions",
+            name,
+            lambda fn=fn: [float(fn(t)) for t in RATE_TS],
+        )
+
+    parameterised = {
+        "smooth@inflection=4": lambda t: R.smooth(t, inflection=4.0),
+        "rush_into@inflection=4": lambda t: R.rush_into(t, inflection=4.0),
+        "rush_from@inflection=4": lambda t: R.rush_from(t, inflection=4.0),
+        "there_and_back@inflection=4": lambda t: R.there_and_back(t, inflection=4.0),
+        "there_and_back_with_pause@pause_ratio=0.5": lambda t: (
+            R.there_and_back_with_pause(t, pause_ratio=0.5)
+        ),
+        "running_start@pull_factor=-0.3": lambda t: R.running_start(t, pull_factor=-0.3),
+        "wiggle@wiggles=3": lambda t: R.wiggle(t, wiggles=3),
+        "exponential_decay@half_life=0.2": lambda t: R.exponential_decay(t, half_life=0.2),
+        # Manim's defaults when the argument is omitted: `smooth` at 10, 0.7.
+        "not_quite_there@proportion=0.5": lambda t: R.not_quite_there(proportion=0.5)(t),
+        "squish_rate_func@ease_in_quad@0.2@0.8": lambda t: R.squish_rate_func(
+            R.ease_in_quad, 0.2, 0.8
+        )(t),
+        # The `a == b` branch returns the constant, not a degenerate squash.
+        "squish_rate_func@0.3@0.3": lambda t: R.squish_rate_func(
+            R.ease_in_quad, 0.3, 0.3
+        )(t),
+    }
+    for name, fn in parameterised.items():
+        case(
+            "rate_functions_parameterized",
+            name,
+            lambda fn=fn: [float(fn(t)) for t in RATE_TS],
+        )
+
+
 def main(argv):
     if len(argv) != 2:
         print(__doc__.strip(), file=sys.stderr)
@@ -927,6 +1040,7 @@ def main(argv):
     collect_geometry()
     collect_space_ops()
     collect_paths()
+    collect_rates()
 
     # group -> the one file it belongs in. Groups are merged, never written one
     # at a time: each file is written once, or the later group would clobber the
@@ -975,6 +1089,10 @@ def main(argv):
             "rotate_vector",
             "path_along_arc",
         ],
+        "manim-rate.json": [
+            "rate_functions",
+            "rate_functions_parameterized",
+        ],
     }
 
     missing = sorted(set(CASES) - {g for groups in files.values() for g in groups})
@@ -1022,6 +1140,9 @@ def main(argv):
             "path_cases",
             "path_arcs",
             "path_alphas",
+        ],
+        "manim-rate.json": [
+            "rate_ts",
         ],
     }
 

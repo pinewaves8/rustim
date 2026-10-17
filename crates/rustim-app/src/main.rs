@@ -1914,6 +1914,7 @@ fn main() {
                 );
                 println!("--reply: answer each command with one JSON line on stdout");
                 println!("animations: {}", feed::animation_kinds());
+                println!("rates: {}", feed::rate_names());
                 println!();
                 println!("example --script lines:");
                 println!(
@@ -1922,6 +1923,11 @@ fn main() {
                 // `camera` is a command, not an animation kind: without
                 // `duration` it writes the view now, with one it queues a beat.
                 println!(r#"  {{"action":"camera","focus":4294967297,"duration":1.0}}"#);
+                // `rate` names the easing curve by Manim's name; absent means the
+                // animation's own default. The full vocabulary is the line above.
+                println!(
+                    r#"  {{"action":"play","animation":{{"target":4294967297,"type":"fade_in","rate":"ease_in_out_sine"}}}}"#
+                );
                 return;
             }
             other => {

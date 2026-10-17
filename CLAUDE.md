@@ -33,8 +33,9 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **479 tests plus a doctest** pass,
-`cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
+The workspace itself is **verified green** as of 2026-10-17: **496 tests** (unit, integration and
+doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
+are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
 baselines, a script replays to a byte-identical frame, and `rustim-app --png out.png` reproduces the
@@ -160,14 +161,14 @@ from, which is why `/media` is in `.gitignore`. Render a reference frame with:
 /tmp/manim-venv/bin/python -m manim -s -r 1280,720 scene.py SceneName
 ```
 
-**Manim numerical parity (`rustim-math`).** `crates/rustim-math/src/bezier.rs`, `space_ops.rs` and
-`paths.rs` are literal ports of `manim.utils.bezier`, `manim.utils.space_ops` and `manim.utils.paths`,
-and
-`crates/rustim-math/tests/manim_parity.rs` replays **715 recorded Manim results** against them
-(`tests/fixtures/manim-{bezier,geometry,space-ops}.json`, checked in — the suite needs no Python).
-The acceptance rule is `1e-9` absolute on every coordinate, with no "close enough" allowances: the
-ports reproduce Manim's *rounding paths*, not just its formulas, which is the only way the numbers
-land in the same place.
+**Manim numerical parity (`rustim-math`).** `crates/rustim-math/src/bezier.rs`, `space_ops.rs`,
+`paths.rs` and `rate.rs` are literal ports of `manim.utils.bezier`, `manim.utils.space_ops`,
+`manim.utils.paths` and `manim.utils.rate_functions`, and
+`crates/rustim-math/tests/manim_parity.rs` replays **771 recorded Manim results** against them
+(`tests/fixtures/manim-{bezier,geometry,space-ops,rate}.json`, checked in — the suite needs no
+Python). The acceptance rule is `1e-9` absolute on every coordinate and rate value, with no "close
+enough" allowances: the ports reproduce Manim's *rounding paths*, not just its formulas, which is the
+only way the numbers land in the same place.
 
 Three properties of that suite are load-bearing:
 
@@ -271,10 +272,10 @@ last property.
 
 | Crate | Contents | Status |
 |---|---|---|
-| `rustim-math` | Points, `Affine2`, rate functions, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` / `paths` | Real |
+| `rustim-math` | Points, `Affine2`, rate functions and the `Rate` wire vocabulary, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` / `paths` / `rate_functions` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
-| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `Wait` | Real |
+| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
@@ -506,6 +507,49 @@ animations" uniform — no separate gap type, and `is_playing` stays true *acros
 its own run_time`" (`scene.py:1017-1026`, `:1184-1186`, `:1714-1724`) **is** Manim's `play(*args)`
 semantics, so a beat reimplements nothing.
 
+### Rate functions
+
+`rustim_math::rate` is a literal port of `manim.utils.rate_functions`: **45 exported curves plus
+11 parameterised fixture cases** replayed against 56 recorded Manim results
+(`manim-rate.json`, a 101-point `t` grid). It is also the engine's *wire vocabulary* — `Rate` is a
+serde enum with one variant per exported curve, so a command names `"ease_in_out_sine"` and nothing
+downstream needs a name table.
+
+Three things about the port are deliberate:
+
+- **`smooth` is Manim's sigmoid, not the cubic.** The engine's historical `smooth` (the
+  `3t² − 2t³` cubic) was Manim's `smoothstep`; it was renamed, and `smooth` now means
+  `smooth(t, inflection = 10)`. The historical `ease_in` / `ease_out` / `ease_in_out` survive as
+  **bit-identical aliases** of the quad curves, so the engine default and the wire's
+  `ease_in_out_quad` cannot diverge (a test compares them to the bit).
+- **`RateFunc` is a plain `fn(f64) -> f64`, so a parameterised curve cannot be one.** Each ported
+  function takes Manim's parameters explicitly (`smooth(t, inflection)`); `Rate::func()` supplies
+  the defaults through private one-argument shims, and a caller wanting another value passes a
+  **non-capturing closure** — `|t| smooth(t, 4.0)` coerces to `RateFunc`. The wire carries only the
+  default set; a parameter is not on it.
+- **Parameters are part of the port, not an extension.** The fixture's second group records eleven
+  non-default calls (inflection 4, pull factor −0.3, pause ratio 0.5, a squish over `[0.2, 0.8]`, …),
+  so "the parameterised spelling agrees with Manim" is measured rather than assumed.
+
+Three curves do not do what "rate function" suggests, and the fixture pins all three:
+`there_and_back` and its pausing sibling **end at 0** (a scene that settles on them settles where it
+started), `wiggle` is a there-and-back too, `running_start` dips **below zero** (it backtracks before
+moving), and `exponential_decay` **never arrives** (`1 − e^{−10} ≈ 0.9999546`). Manim's
+`@unit_interval` / `@zero` decorators are not ported: they clamp arguments, and `Animation::ease`
+already clamps once (`rate::clamp01`), so a curve need only be correct on `[0, 1]` — exactly the
+domain the fixture feeds it.
+
+On the wire, a `play` animation takes an optional `"rate"` naming one of the 45; absent means the
+animation's own default (`ease_in_out`, i.e. Manim's `ease_in_out_quad`). An unknown name is a serde
+error at parse time, not a `CommandError` — it never becomes a command. `rustim_anim::WithRate` is
+the wrapper that applies it: it overrides `rate_func` and forwards `duration` / `begin` /
+`interpolate` / `finish`, the last of which is the `Box<dyn Animation>` forwarding trap again — so
+`a_wrapped_fade_out_still_removes_its_target` drives it through the scheduler rather than calling it.
+For a `group` / `succession` the rate wraps the **composition** (shaping the whole timeline), while
+each member may carry its own `rate` recursively; a `WithRate` around a group does not replace the
+members' curves. `Rate::ALL` is the array `--help` prints, and a feed test proves the documented
+names are exactly the ones the wire accepts.
+
 ### Composition: a fourth layer, inside the first
 
 `AnimationGroup` / `Succession` (`rustim-anim/src/composition.rs`) are the port of
@@ -699,9 +743,11 @@ moment the morph was *queued* — that distinction was a bug in P2 step 2).
 where its target actually is), `interpolate(alpha, &mut SceneTree)` with `alpha` in `0.0..=1.0`,
 `finish(&mut SceneTree)` (called once, after the last `interpolate`, when the animation has reached
 its end — Manim's `clean_up_from_scene`; a default no-op keeps the other animations out of it), and
-`rate_func()`. Easing is applied **inside** the animation, never by the scheduler.
-`AnimationScheduler` holds one shared clock and computes each animation's progress independently, so
-durations may differ and the shortest simply finishes first.
+`rate_func()`, plus `ease(raw)`, which clamps and applies it. The scheduler computes each
+animation's **raw** progress and calls `anim.ease(raw)` — it never applies a curve of its own, so an
+animation can change its curve without the scheduler knowing. `AnimationScheduler` holds one shared
+clock and computes each animation's progress independently, so durations may differ and the shortest
+simply finishes first.
 
 `finish` is the hook `FadeOut` removes its target through, and it has **three call sites** — the
 scheduler's completion loop, and `Sequence`'s reduced branch, where a beat's members never reach the
@@ -1206,8 +1252,9 @@ Issues the tutorial's sketches leave open, and where each stands now:
   `rustim-color`, never inline literals.
 - **World units, not pixels, in scene code.** Manim's default frame is 8 units tall, so legs of
   `3.0` and `4.0` mean what they would in Manim.
-- **Easing** is `ease_in_out` (quadratic in/out, split at `t = 0.5`) by default, applied inside the
-  animation.
+- **Easing** is `ease_in_out` (quadratic in/out, split at `t = 0.5`) by default, applied by
+  `Animation::ease` from the animation's own `rate_func`; a beat may override it with a wire `rate`
+  or a `WithRate` wrapper.
 - **Opacity composes multiplicatively**: a mobject's `opacity` times its style's `fill_opacity` for
   the fill and times its `stroke_opacity` for the stroke. At draw time each is folded into that
   pass's paint alpha, so the two channels fade independently.
@@ -1588,6 +1635,17 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   draws the same line as no arc), one family twin, two command tests (the angle reaches the morph; a
   non-finite one is refused under `path_arc`), the round-trip JSON case, and the `--script` morph now
   carrying an arc — **with the eight goldens unchanged**, since no compiled scene asks for one.
+- **P3's remaining animations — the ~40 rate functions — are done**, and the item was mostly a
+  *naming* problem rather than a maths one. `rustim_math::rate` is the literal port (see "Rate
+  functions"), `Rate` is the wire vocabulary with `Rate::ALL` behind `--help`, `WithRate` applies an
+  override without touching the animation trait, and the wire's `AnimationSpec` gained
+  `rate: Option<Rate>` as its last field. The parity fixture is the evidence: **56 recorded Manim
+  results** over a 101-point grid, including eleven non-default parameter sets, in the fourth
+  fixture file — 771 cases in total. Three curves that end somewhere other than 1 and one that dips
+  negative are pinned as behaviour, not treated as errors. Deferred, deliberately: parameters on the
+  wire (the enum is Manim's default set; a custom inflection is a Rust-level closure), parameterised
+  rates for scene code beyond the explicit functions, and the `@unit_interval` / `@zero` decorators
+  (the clamp lives in `Animation::ease`).
 - **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration
@@ -1598,7 +1656,7 @@ The product is an AI explainer assistant, so the engine exposes a JSON command i
 ```json
 { "action": "add", "type": "circle", "params": { "radius": 2.0, "label": "leg a" } }
 { "action": "set", "target": 4294967299, "property": { "name": "opacity", "value": 0.5 } }
-{ "action": "play", "animation": { "target": 4294967299, "type": "fade_in", "duration": 0.6 } }
+{ "action": "play", "animation": { "target": 4294967299, "type": "fade_in", "duration": 0.6, "rate": "ease_in_out_sine" } }
 ```
 
 `target` is a `NodeId`: an **opaque 64-bit integer**, not a small index (see the `slotmap` note above
