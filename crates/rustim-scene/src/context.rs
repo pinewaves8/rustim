@@ -332,18 +332,15 @@ impl SceneContext {
         for id in self.tree.draw_order() {
             let Some(m) = self.tree.get(id) else { continue };
             // Points rather than `Mobject::has_picture`, and deliberately so: this
-            // walk can emit one thing, a filled path, so an object with no points
-            // has nothing here to draw *and nothing is missing* — a text mobject
-            // is drawn by the scene that shaped it. The wider predicate is what
-            // the keyboard and the semantic tree ask, and they must not ask this
-            // one, or text would be unreadable by both.
+            // walk emits paths — filled and/or stroked — so an object with no
+            // points has nothing here to draw *and nothing is missing* — a text
+            // mobject is drawn by the scene that shaped it. The wider predicate is
+            // what the keyboard and the semantic tree ask, and they must not ask
+            // this one, or text would be unreadable by both. One point is not a
+            // path either: `bezier_path_from_points` needs a segment to emit.
             if m.opacity <= 0.0 || m.points.len() < 2 {
                 continue;
             }
-            let alpha = m.opacity * m.style.fill_opacity;
-            let mut color = m.style.fill;
-            color.components[3] = alpha as f32;
-            list.push(DrawOp::SetPaint(color));
             // The mobject's own transform is folded in here rather than via a
             // `SetTransform`, because the draw list's transform is global to the
             // frame (it carries the viewport) and mixing the two would require
@@ -351,9 +348,39 @@ impl SceneContext {
             // `to_bez_path` the accumulated parent transform — passing
             // `Affine2::IDENTITY` instead silently drops every ancestor transform,
             // which is invisible only while the tree stays flat.
-            list.push(DrawOp::FillPath(
-                m.to_bez_path(self.tree.parent_transform(id)),
-            ));
+            //
+            // Built once per object and handed to whichever passes run: a shape
+            // with both a fill and a stroke (an arrow with an outline, say) must
+            // not pay for two flattenings or, worse, two slightly different ones.
+            let path = m.to_bez_path(self.tree.parent_transform(id));
+            // Fill first, stroke second. Manim's cairo backend does the same,
+            // and the order is visible whenever the two overlap: a stroked edge
+            // sits half outside the fill, and drawing it underneath would let
+            // the fill cover half the stroke's width.
+            //
+            // `opacity` composes multiplicatively with each channel's own
+            // opacity, which is the convention this engine states once and both
+            // passes obey. A pass whose alpha or width is zero is skipped rather
+            // than emitted transparent — an invisible stroke is not free, and a
+            // zero-width `StrokePath` is geometry the stroker should never see.
+            if m.style.fill_opacity > 0.0 {
+                let mut color = m.style.fill;
+                color.components[3] = (m.opacity * m.style.fill_opacity) as f32;
+                list.push(DrawOp::SetPaint(color));
+                list.push(DrawOp::FillPath(path.clone()));
+            }
+            if m.style.stroke_opacity > 0.0
+                && m.style.stroke_width > 0.0
+                && m.style.stroke_width.is_finite()
+            {
+                let mut color = m.style.stroke;
+                color.components[3] = (m.opacity * m.style.stroke_opacity) as f32;
+                list.push(DrawOp::SetPaint(color));
+                list.push(DrawOp::StrokePath {
+                    path,
+                    width: m.style.stroke_width,
+                });
+            }
         }
     }
 }
@@ -462,6 +489,107 @@ mod tests {
             .unwrap();
         // Composes multiplicatively, per CLAUDE.md's convention.
         assert!((alpha - 0.25).abs() < 1e-6, "got {alpha}");
+    }
+
+    /// A plot reaches the backend as a **stroke**, never as a fill.
+    ///
+    /// This is the op-level half of `shapes::tests::a_plot_is_the_centerline…`:
+    /// the geometry test can only say the points are the samples, while the
+    /// defect it guards against (a graph painted as the area under itself) is a
+    /// property of which command the draw walk emits.
+    #[test]
+    fn a_plot_is_stroked_and_not_filled() {
+        let mut ctx = scene();
+        ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Plot,
+            &ShapeParams {
+                points: Some(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]),
+                thickness: Some(0.05),
+                ..Default::default()
+            },
+        ));
+        let mut list = DrawList::default();
+        ctx.build_draw_list(&mut list);
+
+        assert_eq!(
+            list.ops
+                .iter()
+                .filter(|o| matches!(o, DrawOp::FillPath(_)))
+                .count(),
+            0,
+            "a filled open polyline is the area under the curve"
+        );
+        let widths: Vec<f64> = list
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                DrawOp::StrokePath { width, .. } => Some(*width),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(widths, vec![0.05]);
+    }
+
+    /// Fill first, stroke second, each with its own opacity folded into it.
+    #[test]
+    fn a_fill_and_a_stroke_carry_separate_alpha_and_fill_comes_first() {
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        {
+            let m = ctx.tree.get_mut(id).unwrap();
+            m.opacity = 0.5;
+            m.style.fill_opacity = 0.4;
+            m.style.stroke_opacity = 0.8;
+            m.style.stroke_width = 0.1;
+        }
+        let mut list = DrawList::default();
+        ctx.build_draw_list(&mut list);
+
+        let mut paint = 0.0f32;
+        let mut alphas = Vec::new();
+        let mut order = Vec::new();
+        for op in &list.ops {
+            match op {
+                DrawOp::SetPaint(c) => paint = c.components[3],
+                DrawOp::FillPath(_) => {
+                    alphas.push(paint);
+                    order.push("fill");
+                }
+                DrawOp::StrokePath { .. } => {
+                    alphas.push(paint);
+                    order.push("stroke");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(order, ["fill", "stroke"]);
+        assert!((alphas[0] - 0.2).abs() < 1e-6, "{alphas:?}");
+        assert!((alphas[1] - 0.4).abs() < 1e-6, "{alphas:?}");
+    }
+
+    #[test]
+    fn a_zero_width_stroke_is_not_drawn() {
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        {
+            let m = ctx.tree.get_mut(id).unwrap();
+            m.style.stroke_opacity = 1.0;
+            m.style.stroke_width = 0.0;
+        }
+        let mut list = DrawList::default();
+        ctx.build_draw_list(&mut list);
+        assert!(
+            !list
+                .ops
+                .iter()
+                .any(|o| matches!(o, DrawOp::StrokePath { .. }))
+        );
     }
 
     #[test]

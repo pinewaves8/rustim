@@ -258,9 +258,10 @@ fn rotate_matches_its_baseline() {
 /// The axes scene is the only one with a coordinate system, a sampled curve, a
 /// number line **and** a non-default camera.
 ///
-/// What only an image can say about it: that a plot is a ribbon and not the
+/// What only an image can say about it: that the plot is a stroke and not the
 /// area under the curve (a filled polyline is a plausible-looking wrong
-/// picture), that the welded axes and ticks are solid with empty quadrants,
+/// picture), that a stroked centerline is actually rasterised at the width the
+/// style asked for, that the welded axes and ticks are solid with empty quadrants,
 /// that tick labels shaped through the shaper land on the ticks the geometry
 /// placed, and — because the still is the end of a camera beat — that the camera
 /// reaches **all three** of the projections: fills, glyph runs and the

@@ -42,10 +42,12 @@ pub enum NodeKind {
     RightTriangle,
     /// A straight segment and a segment with a head on it.
     ///
-    /// Distinct kinds rather than `Unknown` even though both are drawn as filled
-    /// outlines here (see [`crate::shapes::line`]): a reader who is told "长 3 的
-    /// 箭头" has been told the one thing that matters about it, and the length is
-    /// not recoverable from the kind the way a square's side is.
+    /// Distinct kinds rather than `Unknown`: a reader who is told "长 3 的箭头"
+    /// has been told the one thing that matters about it, and the length is not
+    /// recoverable from the kind the way a square's side is. The two are drawn
+    /// differently, too — the line is a stroked centerline, the arrow a filled
+    /// contour whose head cannot be a stroke on a flat point array (see
+    /// [`crate::shapes::line`] and [`crate::shapes::arrow`]).
     Line,
     Arrow,
     /// A one-dimensional coordinate frame.

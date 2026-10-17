@@ -595,7 +595,11 @@ fn a_script_can_add_the_coordinate_system_kinds() {
         [
             ("坐标轴", "7 × 4 的坐标轴"),
             ("数轴", "数轴，长度 6"),
-            ("函数图象", "2.03 × 2.03 的函数图象"),
+            // The plot is a centerline, so its measured size is the samples'
+            // own extent — exactly 2 × 2 here. The old ribbon measured the
+            // stroke's outline (2.03), i.e. it reported the pen width as part of
+            // the curve's size.
+            ("函数图象", "2 × 2 的函数图象"),
         ],
         "in:\n{}",
         serde_json::to_string_pretty(&tree).unwrap_or_default(),

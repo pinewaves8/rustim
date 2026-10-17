@@ -449,10 +449,12 @@ fn triangle_sentence(s: &Shape, w: f64, h: f64, with_noun: bool) -> String {
 /// A line, an arrow or a number line: its **length**.
 ///
 /// The one thing about any of them that a reader can act on, and the thing the
-/// fallback below cannot say: a line is drawn as a filled rectangle (it has no
-/// area, and the draw walk emits fills — see `rustim_mobject::shapes::line`), so a
-/// box-based sentence would announce one as "3 × 0.045 的图形" — the stroke width
-/// read out as if it were a dimension.
+/// fallback below cannot say: a line is a **stroked centerline** (see
+/// `rustim_mobject::shapes::line`), so its box has a zero height and the stroke
+/// width is not part of the geometry at all — but an arrow's box still mixes the
+/// head's width into the answer, and a box-based sentence would announce a
+/// number line as "6 × 0.3 的图形" with the ticks read as a dimension. The
+/// diameter of the corner set is the length in every one of those cases.
 ///
 /// A number line joins them rather than taking the box sentence because its box
 /// includes the ticks, whose height is a decoration and not a dimension: the

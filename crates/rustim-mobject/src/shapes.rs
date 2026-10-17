@@ -26,8 +26,9 @@ pub enum ShapeKind {
     NumberLine,
     /// Two axes crossing at the origin, with ticks on both.
     Axes,
-    /// A sampled curve, drawn as a stroke's outline rather than as a filled
-    /// polygon.
+    /// A sampled curve, drawn as a **stroked centerline** rather than as a
+    /// filled polygon: the fill rule would close the open polyline with its
+    /// chord and paint the region under the curve.
     Plot,
 }
 
@@ -48,7 +49,10 @@ pub struct ShapeParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub radius: Option<f64>,
     /// How thick a [`ShapeKind::Line`] or [`ShapeKind::Arrow`] is drawn, in world
-    /// units. Ignored by the closed shapes, which are defined by `width`/`height`.
+    /// units — for a line this becomes `Style::stroke_width`, for an arrow the
+    /// shaft's width inside the filled contour. It is the stroke width of a
+    /// [`ShapeKind::Plot`] too. Ignored by the closed shapes, which are defined
+    /// by `width`/`height`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thickness: Option<f64>,
     /// World-space position of the shape's anchor, in Manim units (Y up, origin
@@ -111,13 +115,18 @@ impl ShapeParams {
     }
 }
 
-/// How thick a line or an arrow's shaft is when the caller did not say.
+/// How thick a line or an arrow's shaft is when the caller did not say — and,
+/// as of the stroke step, the default `Style::stroke_width`.
 ///
 /// Manim's `Line` draws at `stroke_width = 4` px; against the default camera's
 /// 8 world units over the default viewport's 720 px that is `4 · 8 / 720`, or 0.0444 units, rounded here
 /// to 0.045. It is a *scene-side* convention rather than a property of geometry,
 /// which is why it is a constant with this comment and not a derivation: the
 /// px↔unit mapping is the viewport's business and a mobject never learns it.
+/// The width is in **world units**, so it scales with the camera; Manim's is in
+/// pixels and does not. That is the honest consequence of this engine folding
+/// the projection into the path transform: a stroked circle and a filled one
+/// zoom together instead of the outline staying a constant screen width.
 pub const DEFAULT_THICKNESS: f64 = 0.045;
 
 /// How far a tick rises above its axis when the caller did not say.
@@ -134,7 +143,7 @@ pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
         ShapeKind::Square => square(w, h),
         ShapeKind::Circle => circle(params.radius()),
         ShapeKind::RightTriangle => right_triangle(w, h),
-        ShapeKind::Line => line(w, params.thickness()),
+        ShapeKind::Line => line(w),
         ShapeKind::Arrow => arrow(w, params.thickness()),
         ShapeKind::NumberLine => {
             // The default range spans the line's own length, so with no range
@@ -164,7 +173,7 @@ pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
             )
         }
         ShapeKind::Plot => match &params.points {
-            Some(points) => plot(points, params.thickness()),
+            Some(points) => plot(points),
             // No samples is a legitimate description — a host may add the
             // object before it has data — and it is an empty mobject rather
             // than an error, which is what `add` can say.
@@ -175,10 +184,29 @@ pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
     let color = params.color.map_or(rustim_color::FG, |[r, g, b]| {
         rustim_color::Srgb::from_rgba8(r, g, b, 255)
     });
+    // A **line** and a **plot** are centerlines drawn by the backend's stroker;
+    // everything else is a closed contour drawn by the fill rule. Two spellings
+    // of the same shape are not interchangeable here: filling an open polyline
+    // paints the region between it and its closing chord (the plot-as-an-area
+    // defect), and stroking a closed contour draws an outline *around* a
+    // rectangle that was meant to be the shape's interior (a square's edge
+    // would double in size). So the kind decides which half of `Style` is on.
+    let (fill_opacity, stroke_opacity) = match kind {
+        ShapeKind::Line | ShapeKind::Plot => (0.0, 1.0),
+        _ => (1.0, 0.0),
+    };
     let style = Style {
         fill: color,
+        fill_opacity,
         stroke: color,
-        ..Style::default()
+        stroke_opacity,
+        // For a stroked kind this is the stroke's width; the `thickness`
+        // parameter of `Line`/`Arrow` remains the arrow's shaft thickness,
+        // because an arrow is still a filled contour (see `arrow`).
+        stroke_width: match kind {
+            ShapeKind::Line | ShapeKind::Plot => params.thickness(),
+            _ => DEFAULT_THICKNESS,
+        },
     };
 
     let mut m = Mobject::new(points)
@@ -255,53 +283,51 @@ pub fn right_triangle(w: f64, h: f64) -> Vec<Point> {
     ])
 }
 
-/// A straight segment from the origin along `+x`, `length` long and `thickness`
-/// thick.
+/// A straight segment from the origin along `+x`: a **centerline**, `length`
+/// long, drawn by the backend's stroker rather than faked as a thin filled
+/// rectangle.
 ///
-/// # A line is drawn as the rectangle a stroke would have painted
-///
-/// A mathematical line has no area, and [`crate::SceneTree`]'s draw walk emits
-/// **fills** — a stroke is a `DrawOp` and a `Style` field that the mobject model
-/// has no way to express yet, which is exactly why the `primitives` scene builds
-/// raw draw lists by hand. So this returns the quad that a stroked line would have
-/// covered, which is the same expansion `rustim-text::formula::filled_shape` makes
-/// for Typst's stroke-only fraction rule. It rotates, scales, morphs and measures
-/// like any other mobject because it *is* one; it is simply a filled outline rather
-/// than a stroke, and it should be replaced by a real stroke when the model grows
-/// one.
+/// The two points below are the whole geometry. The width is not a geometric
+/// argument at all — [`build`] reads `ShapeParams::thickness` into
+/// `Style::stroke_width`, which is a style knob a host can animate and which
+/// the draw walk emits as `DrawOp::StrokePath`. That is the honest spelling of
+/// a line: its extent *is* its length (the accessibility layer's diameter
+/// measurement agrees exactly instead of rounding the diagonal of the old
+/// rectangle), and a zoomed camera thickens the pen rather than moving an
+/// invisible edge.
 ///
 /// Anchored at its **tail**, pointing along `+x` — matching
 /// [`right_triangle`]'s "right angle at the origin" rather than
 /// [`square`]'s "centred on the origin", because the tail is the point a caller
 /// pivots and rotates around.
-pub fn line(length: f64, thickness: f64) -> Vec<Point> {
-    let t = thickness / 2.0;
-    bezier::points_as_corners(&[
-        Point::new(0.0, -t),
-        Point::new(length, -t),
-        Point::new(length, t),
-        Point::new(0.0, t),
-        Point::new(0.0, -t),
-    ])
+///
+/// **An arrow is not built this way**, and cannot be with a flat point array:
+/// Manim's arrow is a stroked shaft plus a *filled* triangular tip, which is
+/// two contours — and a Manim point array has one subpath (`points_from_path`
+/// welds a glyph's counters for exactly this reason). `arrow` stays a filled
+/// contour until mobjects can own children.
+pub fn line(length: f64) -> Vec<Point> {
+    bezier::points_as_corners(&[Point::new(0.0, 0.0), Point::new(length, 0.0)])
 }
 
 /// An arrow: a shaft along `+x` from the origin, ending in a triangular head whose
 /// point is at `(length, 0)`.
 ///
-/// Drawn as filled geometry for the reason [`line`] gives. It is **one closed
-/// contour of seven corners**, not a shaft and a head, because the head is wider
-/// than the shaft: the union of the two is a single simple polygon, so no subpath
-/// break is needed — and a flat Manim point array cannot express one anyway (see
-/// `shapes::points_from_path` and the welded-glyph note in `CLAUDE.md`). The
-/// consequence is a shape the existing draw walk already renders, with no stroke
-/// and no welding.
+/// Drawn as filled geometry — unlike [`line`], which is a stroke — because a
+/// stroked shaft and a filled head need two paint roles in one object. It is
+/// **one closed contour of seven corners**, not a shaft and a head, because the
+/// head is wider than the shaft: the union of the two is a single simple
+/// polygon, so no subpath break is needed — and a flat Manim point array cannot
+/// express one anyway (see `shapes::points_from_path` and the welded-glyph note
+/// in `CLAUDE.md`). The consequence is a shape the draw walk's fill pass renders,
+/// with no stroke and no welding.
 ///
 /// The head's proportions are Manim's: `Arrow`'s `tip_length` defaults to `0.25`
 /// and is capped by `max_tip_length_to_length_ratio = 0.25` times the arrow's
 /// length (`animation/mobject/geometry.py`), so the head can never eat a short
 /// arrow. Its *width* is ours — Manim fills a separate `ArrowTriangleFilledTip`
-/// submobject and strokes the shaft, and with neither strokes nor groups in this
-/// module the head is sized here as wide as it is long, which is what a drawn
+/// submobject and strokes the shaft, and with no groups in this module the head
+/// is sized here as wide as it is long, which is what a drawn
 /// triangle tip looks like.
 ///
 /// The shaft is clamped to the head's width so that a caller asking for an absurd
@@ -457,42 +483,25 @@ pub fn axes(
     points_from_path(&path)
 }
 
-/// The tolerance [`plot`] hands `kurbo`'s stroker, in world units.
-///
-/// It only affects curves: every segment of a sampled polyline is straight, and
-/// `kurbo` emits a straight segment's offset exactly. Stated anyway because the
-/// number has to come from somewhere, and a tolerance chosen per call would make
-/// the geometry depend on who called.
-const STROKE_TOLERANCE: f64 = 1e-3;
-
-/// A sampled curve, drawn as the **outline a stroke would cover**.
+/// A sampled curve, returned as its **centerline** for the backend's stroker.
 ///
 /// # Not a filled polyline
 ///
 /// Handing the samples to the fill walk as an open polyline would fill the
 /// region between the curve and its closing chord — a function graph would be
-/// drawn as a solid area rather than as a line. Manim's `plot` is a stroke, and
-/// the mobject model has no stroke, so the shape here is `kurbo::stroke`'s
-/// expansion of the polyline into one closed outline that `points_from_path`
-/// carries like any other polygon. That is the same expansion
-/// [`crate::shapes::line`] performs by hand, with the joins handled by the
-/// stroker rather than by a constant.
+/// drawn as a solid area rather than as a line. `build` therefore marks a
+/// `Plot` as stroked (`fill_opacity = 0`, `stroke_opacity = 1`) and the draw
+/// walk emits [`rustim_render::DrawOp::StrokePath`] instead. The stroke width
+/// is `Style::stroke_width`, so it is a property a host can change and an
+/// animation can interpolate — which the earlier ribbon spelling could not do:
+/// there the width had been baked into the point array.
 ///
-/// Miter joins and butt caps are chosen for the same reason: the outline is then
-/// pure polygon geometry with no rounded overshoot, and its corners are at the
-/// samples rather than at arc approximations. Consecutive duplicate samples are
-/// dropped — a host sampling at two different parameters can produce them, and a
-/// zero-length segment makes the stroker's join direction undefined.
-///
+/// Consecutive duplicate samples are dropped — a host sampling at two different
+/// parameters can produce them, and the stroker needs no zero-length segments.
 /// Fewer than two distinct points draws nothing: there is no direction in one
 /// point, and a lone sample is not a curve.
-pub fn plot(points: &[[f64; 2]], thickness: f64) -> Vec<Point> {
-    if !thickness.is_finite() || thickness <= 0.0 {
-        return Vec::new();
-    }
-    let mut path = rustim_math::BezPath::new();
-    let mut count = 0_usize;
-    let mut last: Option<Point> = None;
+pub fn plot(points: &[[f64; 2]]) -> Vec<Point> {
+    let mut kept: Vec<Point> = Vec::with_capacity(points.len());
     for &[x, y] in points {
         // A non-finite sample refuses the whole plot rather than being skipped:
         // skipping would move the curve's start to the origin, which is a wrong
@@ -501,29 +510,23 @@ pub fn plot(points: &[[f64; 2]], thickness: f64) -> Vec<Point> {
             return Vec::new();
         }
         let p = Point::new(x, y);
-        if last == Some(p) {
+        // Consecutive duplicates would be zero-length segments; they are
+        // dropped here so the stroke has no degenerate joins at all.
+        if kept.last() == Some(&p) {
             continue;
         }
-        if count == 0 {
-            path.move_to(p);
-        } else {
-            path.line_to(p);
-        }
-        count += 1;
-        last = Some(p);
+        kept.push(p);
     }
-    if count < 2 {
+    if kept.len() < 2 {
         return Vec::new();
     }
-    let outline = rustim_math::stroke(
-        &path,
-        &rustim_math::Stroke::new(thickness)
-            .with_join(rustim_math::Join::Miter)
-            .with_caps(rustim_math::Cap::Butt),
-        &rustim_math::StrokeOpts::default(),
-        STROKE_TOLERANCE,
-    );
-    points_from_path(&outline)
+    // The samples are the **centerline**. `build` marks a `Plot` as stroked, so
+    // the draw walk emits `DrawOp::StrokePath` and the backend's stroker puts
+    // the width on. Expanding to an outline here — what this function used to
+    // do — was the interim spelling while the draw walk could only fill; it
+    // hard-coded the width into geometry, made the width un-animatable, and
+    // left the a11y measurement reading a ribbon rather than the curve.
+    bezier::points_as_corners(&kept)
 }
 
 /// The most ticks one axis may draw.
@@ -853,29 +856,30 @@ mod tests {
         assert_eq!(p.thickness(), DEFAULT_THICKNESS);
     }
 
-    /// A line is the rectangle a stroke would have painted: four corners, exactly
-    /// `length` by `thickness`, anchored at the tail.
+    /// A line is a two-anchor **centerline**, anchored at the tail.
     ///
-    /// Asserted on the **bounds**, not on the point count alone, because the count
-    /// is the same for a line of the right shape in the wrong place — and "anchored
-    /// at the tail" is the half of it a caller pivots on, so `x0 == 0` is the
-    /// assertion that matters rather than `x1 == length`.
+    /// Asserted on the **bounds**, not on the point count alone, because the
+    /// count is the same for a line of the right length in the wrong place —
+    /// and "anchored at the tail" is the half of it a caller pivots on (the
+    /// `rotate` scene turns an arrow about exactly this point), so `x0 == 0`
+    /// is the assertion that matters rather than `x1 == length`.
+    ///
+    /// The zero height is the change: this used to be a `length × thickness`
+    /// rectangle whose box was the picture. Now the width lives in `Style`, and
+    /// the geometry is the segment itself.
     #[test]
-    fn a_line_is_the_rectangle_a_stroke_would_have_painted() {
-        let (length, thickness) = (3.0, 0.2);
-        let pts = line(length, thickness);
-        assert_eq!(pts.len(), 4 * 4, "four corners, four points per curve");
+    fn a_line_is_a_two_anchor_centerline() {
+        let pts = line(3.0);
+        assert_eq!(pts.len(), 4, "one segment, four control points");
 
         let anchors = bezier::anchors(&pts).unwrap();
-        assert_eq!(anchors.len(), 8, "each corner stated twice");
-        let b = bezier::bounds_of(&anchors).unwrap();
-        assert_eq!(b.width(), length);
-        assert_eq!(b.height(), thickness);
         assert_eq!(
-            (b.x0, b.y0),
-            (0.0, -thickness / 2.0),
+            anchors,
+            vec![Point::new(0.0, 0.0), Point::new(3.0, 0.0)],
             "the tail is the anchor"
         );
+        let b = bezier::bounds_of(&anchors).unwrap();
+        assert_eq!((b.width(), b.height()), (3.0, 0.0));
     }
 
     /// An arrow is **one** contour — seven corners — with its point at
@@ -1055,47 +1059,54 @@ mod tests {
         assert_eq!((b.width(), b.height()), (7.0, 4.0), "{b:?}");
     }
 
-    /// A plot is the *ribbon* a stroke would cover, not the region under the
-    /// curve.
+    /// A plot's geometry *is* its samples, not an outline around them.
     ///
-    /// This is the counterfactual for the obvious implementation: handing the
-    /// samples to the fill walk as an open polyline fills between the curve and
-    /// its closing chord, so `y = 0.25x² - 2` would be drawn as a solid area. The
-    /// point below the apex is inside that area and outside the ribbon, which is
-    /// exactly what the winding number at `(1, 0.5)` measures.
+    /// The counterfactual for the obvious implementation — handing the open
+    /// polyline to the fill walk, which paints the area between the curve and
+    /// its closing chord — is enforced at the op level, because that is where
+    /// the defect lives: see `context::tests::a_plot_is_stroked_and_not_filled`.
+    /// This test pins the other half: no expansion is baked into the points, so
+    /// the measured size of a graph is the graph's extent and not that extent
+    /// plus a pen width.
     #[test]
-    fn a_plot_is_a_ribbon_and_not_the_region_under_the_curve() {
-        let pts = plot(&[[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]], 0.1);
-        assert_eq!(pts.len() % 4, 0);
-        let poly = flatten(&pts);
-
-        assert_eq!(winding(&poly, Point::new(1.0, 1.0)), 1, "on the curve");
+    fn a_plot_is_the_centerline_and_not_the_region_under_the_curve() {
+        let pts = plot(&[[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]);
+        // Two segments, four control points each, each restating the previous
+        // endpoint as its own start — so the four anchors contain the middle
+        // sample twice, exactly as Manim spells a polyline.
+        assert_eq!(pts.len(), 8);
+        let anchors = bezier::anchors(&pts).unwrap();
         assert_eq!(
-            winding(&poly, Point::new(1.0, 0.5)),
-            0,
-            "under the apex is not the plot"
+            anchors,
+            vec![
+                Point::new(0.0, 0.0),
+                Point::new(1.0, 1.0),
+                Point::new(1.0, 1.0),
+                Point::new(2.0, 0.0)
+            ],
+            "the samples *are* the geometry; nothing is expanded around them"
         );
-        assert_eq!(winding(&poly, Point::new(1.0, -0.5)), 0, "nor below it");
 
-        let b = bezier::bounds_of(&bezier::anchors(&pts).unwrap()).unwrap();
-        assert!(b.height() > 1.0 && b.height() < 1.2, "{:?}", b);
-        assert!(
-            b.x0 < 0.0 && b.x1 > 2.0,
-            "the outline surrounds the samples"
-        );
+        // The counterfactual the old ribbon test enforced geometrically is now
+        // enforced by the op the draw walk emits — see
+        // `context::tests::a_plot_is_stroked_and_not_filled`. Here the shape's
+        // own claim is enough: its bounds are the samples' bounds, so no
+        // region below the curve belongs to it.
+        let b = bezier::bounds_of(&anchors).unwrap();
+        assert_eq!(b.height(), 1.0);
+        assert_eq!((b.x0, b.x1), (0.0, 2.0));
     }
 
     /// Fewer than two distinct samples is not a curve, and a non-finite sample
     /// refuses the whole plot rather than moving its start.
     #[test]
     fn a_plot_needs_two_distinct_points() {
-        assert!(plot(&[], 0.1).is_empty());
-        assert!(plot(&[[1.0, 1.0]], 0.1).is_empty());
-        assert!(plot(&[[1.0, 1.0], [1.0, 1.0]], 0.1).is_empty());
-        assert!(plot(&[[0.0, 0.0], [1.0, f64::NAN]], 0.1).is_empty());
-        assert!(plot(&[[0.0, 0.0], [1.0, 1.0]], 0.0).is_empty());
+        assert!(plot(&[]).is_empty());
+        assert!(plot(&[[1.0, 1.0]]).is_empty());
+        assert!(plot(&[[1.0, 1.0], [1.0, 1.0]]).is_empty());
+        assert!(plot(&[[0.0, 0.0], [1.0, f64::NAN]]).is_empty());
         // Duplicated interior samples are dropped, not zero-length segments.
-        assert!(!plot(&[[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]], 0.1).is_empty());
+        assert!(!plot(&[[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]]).is_empty());
     }
 
     /// The one mapping a scene samples through: the endpoints of the data range
@@ -1112,6 +1123,54 @@ mod tests {
         // zero — the same refusal the builders make, in the mapping's own terms.
         let flat = AxesScale::new((1.0, 1.0), 7.0, (-2.0, 2.0), 4.0);
         assert_eq!(flat.to_world(3.0, 2.0), Point::new(0.0, 2.0));
+    }
+
+    /// A built line is a two-anchor centerline whose paint says "stroke me".
+    ///
+    /// The style assertions are the half a geometry test cannot make: a
+    /// centerline drawn by the fill rule is invisible, so "the points are
+    /// right" and "the picture is right" would disagree silently.
+    #[test]
+    fn a_line_is_a_centerline_with_the_stroke_switched_on() {
+        let m = build(
+            ShapeKind::Line,
+            &ShapeParams {
+                width: Some(3.0),
+                thickness: Some(0.05),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            bezier::anchors(&m.points).unwrap(),
+            vec![Point::new(0.0, 0.0), Point::new(3.0, 0.0)]
+        );
+        assert_eq!(m.style.fill_opacity, 0.0);
+        assert_eq!(m.style.stroke_opacity, 1.0);
+        assert_eq!(m.style.stroke_width, 0.05);
+    }
+
+    /// The kind decides which half of `Style` is on, in both directions.
+    #[test]
+    fn a_plot_is_stroked_and_a_square_is_filled() {
+        let plot = build(
+            ShapeKind::Plot,
+            &ShapeParams {
+                points: Some(vec![[0.0, 0.0], [1.0, 1.0]]),
+                thickness: Some(0.08),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            (plot.style.fill_opacity, plot.style.stroke_opacity),
+            (0.0, 1.0)
+        );
+        assert_eq!(plot.style.stroke_width, 0.08);
+
+        let square = build(ShapeKind::Square, &ShapeParams::default());
+        assert_eq!(
+            (square.style.fill_opacity, square.style.stroke_opacity),
+            (1.0, 0.0)
+        );
     }
 
     #[test]

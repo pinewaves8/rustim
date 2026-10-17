@@ -23,7 +23,12 @@ impl Default for Style {
             fill_opacity: 1.0,
             stroke: rustim_color::FG,
             stroke_opacity: 0.0,
-            stroke_width: 2.0,
+            // A *world-unit* width, not Manim's pixels. The default stroke is
+            // off, so the value is latent — but a host that turns
+            // `stroke_opacity` up without setting a width must get a hairline
+            // and not a two-unit border. See `shapes::DEFAULT_THICKNESS` for
+            // where `0.045` comes from.
+            stroke_width: crate::shapes::DEFAULT_THICKNESS,
         }
     }
 }

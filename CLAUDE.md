@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **377 tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **385 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
@@ -214,9 +214,10 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
 
 The eight scenes are there to disagree with each other: `pythagorean` is the one with a Manim
 reference, `composite` covers deferred transforms, alpha and draw order through the mobject tree
-walk, `primitives` pushes strokes and clips as raw `DrawOp`s because nothing in the mobject model
-expresses either yet — without it the baselines would never touch stroke expansion or clip
-rasterisation, the two most intricate things `vello_cpu` does — `text` is the only one whose pixels
+walk, `primitives` pushes strokes and clips as raw `DrawOp`s because the mobject model still has no
+clip — its stroke half is now redundant with `axes`, whose plot is a real `DrawOp::StrokePath`, but
+it is the only scene that exercises *clip* rasterisation, and keeping both ends of the stroker
+under test is cheaper than trusting one — `text` is the only one whose pixels
 come from a file in this repository rather than from code, so losing `assets/fonts/` fails here
 rather than silently producing a blank frame for a user, `formula` is the only one whose
 geometry comes from a *third-party* typesetting engine, which is what makes the image the only place
@@ -227,10 +228,11 @@ both directions of the alignment padding and that the style lerp arrived (see "P
 `rotate` is the only one where an object **leaves the scene**: a `FadeOut` removes its square as its
 third beat, so the still has two objects where the script named three (see "P2 step 5"), and `axes`
 is the only one shot through a **non-default camera**: a `CameraMove` beat lands on
-`center (0.15, 0.2), zoom 1.25`, and the still holds welded axes with ticks, a stroke-outlined
+`center (0.15, 0.2), zoom 1.25`, and the still holds welded axes with ticks, a **stroked**
 parabola, a number line and integer tick labels drawn through that same projection — so a camera
-that moved the fills and not the glyphs would show up here and nowhere else (see "Axes, number
-lines and plots").
+that moved the fills and not the glyphs would show up here and nowhere else, and it is the only
+mobject-driven golden whose pixels go through the backend's stroker (see "Axes, number lines and
+plots" and "Strokes").
 
 **A baseline's *bytes* are not a property of the image, and `BLESS=1` rewrites all of them** —
 `check()` copies the render unconditionally, not just the one under review. In the step-5 bless run
@@ -358,12 +360,13 @@ layer already named (`NodeKind::{NumberLine, Axes, Plot}`), and each is built by
   width past the axis and the corner set is longer than the axis is; the a11y description measures a
   number line by the **diameter** of its corners (the rotation-invariant rule arrows use), so an
   unclamped line was announced as "长度 6.05 的数轴" when it is 6 long.
-- **`Plot` is a stroke's outline, not a filled polyline.** Feeding sampled points to the fill rule
+- **`Plot` is a stroked centerline, not a filled polyline.** Feeding sampled points to the fill rule
   closes the polyline with its chord and paints the region under the curve — a graph would render as
-  an area, the single most visible wrong picture this suite could hold. `kurbo::stroke`
-  (`Join::Miter`, `Cap::Butt`, a fixed world tolerance) expands the polyline into a closed contour
-  first. The host supplies the points **in world coordinates**; there is no expression language and
-  no parser in the command layer, by decision — a scene samples with Rust.
+  an area, the single most visible wrong picture this suite could hold. The points are instead
+  exactly the samples, and the mobject's style selects `stroke_opacity = 1, fill_opacity = 0`; the
+  draw walk emits a `DrawOp::StrokePath` and the backend's stroker expands it (see "Strokes"). The
+  host supplies the points **in world coordinates**; there is no expression language and no parser
+  in the command layer, by decision — a scene samples with Rust.
 - **`AxesScale::new(x_range, x_length, y_range, y_length).to_world(x, y)`** is the shared data→world
   map for the scene's own samples *and* the ticks' positions, so a curve and its grid cannot drift
   apart. It centres on zero, scales each range onto its length, and returns `0.0` on a degenerate
@@ -374,6 +377,47 @@ Guards are values, not panics, because `ShapeParams` arrives from a model: non-f
 per axis** caps what one `add` can allocate. The `axes` scene is the one golden where all three
 objects, integer tick labels drawn through the camera, and a `CameraMove` beat meet: one image
 proves the camera reaches fills, glyphs and accessibility bounds at once (see "Golden images").
+
+### Strokes
+
+`Style` has always carried `stroke` / `stroke_opacity` / `stroke_width`; until P3 step 2 the draw walk
+read only the fill half and the stroke fields were latent. `SceneContext::build_draw_list` now emits
+a `DrawOp::StrokePath { path, width }` as well as, or instead of, the `DrawOp::FillPath`, and the
+backend hands it to vello's stroker.
+
+Four properties are load-bearing:
+
+- **Each pass has its own alpha**, both folded with the mobject's opacity: `m.opacity *
+  style.fill_opacity` and `m.opacity * style.stroke_opacity`. That is what lets a plot be a stroke on
+  an *empty* fill without a second style type, and what makes `FadeOut` fade a stroke at the same rate
+  as a fill.
+- **Fill first, stroke second.** A stroke straddles its path — half inside, half outside — so
+  drawing it under the fill buries half its width. This is Manim's cairo order too.
+- **`stroke_width` is in *world units*, not Manim's pixels, and that is a deliberate divergence.**
+  vello's `stroke_path` strokes in path space and applies the frame transform afterwards
+  (`render.rs:229` passes `state.transform` alongside the `Stroke`), so the visible width is
+  `width · pixels_per_unit` and it **scales with the camera** — zooming in thickens the pen, which is
+  what moving closer should mean. Manim's pixel width is right for a fixed canvas and wrong for a
+  viewport the user can zoom. `Style::default().stroke_width = DEFAULT_THICKNESS` (0.045, the same
+  number an arrow's silhouette uses) rather than Manim's 2.0: the default stroke is off, but a host
+  that turns `stroke_opacity` up without naming a width must get a hairline, not a two-unit border.
+- **A zero or non-finite width is skipped**, not emitted: `vello`'s stroker should never see it, and a
+  transparent stroke still costs a flattening and a strip build. Zero is *legal* in the command layer
+  (`stroke_width` refuses only negative and non-finite) because "make the outline vanish" is a
+  meaningful thing to ask for.
+
+Two consequences in the mobject vocabulary:
+
+- **`Line` is a two-anchor stroked centerline; `Arrow` is still a filled contour.** A flat point array
+  cannot be a stroked shaft plus a filled head — one path has one paint role — so the arrow stays the
+  filled silhouette it was and the line becomes the object the new pass exists for.
+- **`Plot` changed from a ribbon outline to a stroked centerline** in this step, so the `axes` golden
+  is the one image that moved. Its samples are now the geometry itself, the fill is off, and this is
+  the first mobject-driven golden whose pixels go through the stroker (the `primitives` scene uses
+  `DrawOp`s directly).
+
+The command layer exposes `stroke_opacity` (0..=1), `stroke_color` (`[r, g, b]`) and `stroke_width`
+(finite, `>= 0`), all writing `dirty.style` like `fill_opacity` does.
 
 ### The timeline: three layers
 
@@ -515,8 +559,9 @@ angle of the 3-4-5 triangle — would be announced as a 4.2-square of area 17.64
 one scene that exists to demonstrate it.
 
 A **line**, an **arrow** and a **number line** are the same rule applied to figures whose box is not
-a measurement at all — a line's is `3 × 0.045`, the stroke width read out as a dimension. A line's
-corners *are* its rectangle, so its long edge is exact; an arrow's corners are neither its tail nor
+a measurement at all — a line's is `3 × 0` now that it is a centerline (it was `3 × 0.045` while it
+was a filled rectangle, which is the stroke width read out as a dimension). A line's corners *are*
+its two anchors, so its length is exact; an arrow's corners are neither its tail nor
 its tip (the tail is two corners, the tip a seventh), so it is measured by the **diameter** of its
 corner set, which is its tail-to-tip length to within `t²/2L`; a number line is the same diameter
 rule, because its box height is tick decoration rather than a dimension. All three are
@@ -684,11 +729,14 @@ scalar multiplication or point addition — go through `Vec2` (`p.to_vec2()`, `V
 
 **A filled open polyline is not a curve — the fill rule closes it.** Handing a sampled function's
 points to `Fill::NonZero` paints the region between the curve and its closing chord, so a graph
-renders as an area. `Plot` therefore runs `kurbo::stroke` (Miter/Butt) before `points_from_path`;
-`a_plot_is_a_ribbon_and_not_the_region_under_the_curve` asserts a winding of 1 *on* the curve and 0
-below it, because "it looks like a line" is exactly what the wrong picture also looks like at a
-glance. The same trap is why a formula's fraction bar is expanded to a quad rather than drawn as a
-polyline (see "P1 step 5").
+renders as an area. `Plot`'s points are therefore the samples themselves, with the fill switched off
+and the stroke switched on, and the picture comes from `DrawOp::StrokePath`
+(`a_plot_is_stroked_and_not_filled` counts zero fills and one stroke at the width the style asked
+for). The first implementation expanded the polyline into a closed ribbon with `kurbo::stroke` in the
+shape builder; it worked, and it was moved out deliberately — the stroker belongs to the backend that
+already has one, and a ribbon's interior contour is a second representation of a line to keep right.
+Do not put it back. The same trap is why a formula's fraction bar is expanded to a quad rather than
+drawn as a polyline (see "P1 step 5").
 
 **Welding rectangles into one path requires that every rectangle share its winding and close
 explicitly.** `points_from_path` walks each `MoveTo` out to a hub with a doubled slit, so the
@@ -813,14 +861,18 @@ bridge is traversed once in each direction, so its winding contribution is zero 
 points — outside, on the ring, inside the counter, beside the slit — because winding is the quantity
 the fill rule actually reads; "it looks right" cannot distinguish a welded glyph from a filled one.
 
-**A formula's rules are strokes, and the draw walk only emits fills.** A fraction's bar and a
-radical's overline are `FrameItem::Shape` carrying `Geometry::Line(..)`
+**A formula's rules are strokes, and a formula's output is geometry, not style.** A fraction's bar
+and a radical's overline are `FrameItem::Shape` carrying `Geometry::Line(..)`
 (`typst-layout/src/math/fraction.rs:74`, `radical.rs:137`) — `Shape` stores geometry *plus* an
-optional fill and an optional stroke, and these have no fill. `SceneContext::build_draw_list` emits
-paths, so a stroke-only shape is dropped and the formula reads as a bug. `formula::filled_shape`
-expands one into a filled quad of the stroke's own thickness (a rect for `Geometry::Rect`, `None`
-reported into `skipped_shapes` for anything needing a real stroker). `FrameItem::Shape` is the one
-thing this step needed that the tutorial's sketch does not mention at all.
+optional fill and an optional stroke, and these have no fill. `Formula::insert` turns them into
+mobjects whose geometry lives in a point array, and a point array cannot say "draw this contour with
+a pen and that one with a brush"; so a stroke-only shape is dropped and the formula reads as a bug.
+`formula::filled_shape` expands one into a filled quad of the stroke's own thickness (a rect for
+`Geometry::Rect`, `None` reported into `skipped_shapes` for anything needing a real stroker). The
+draw walk *can* stroke now (see "Strokes"), but that does not reach this case: the distinction the
+rule needs is per-contour within one compile step, and the compiler's only output channel is
+geometry. `FrameItem::Shape` is the one thing this step needed that the tutorial's sketch does not
+mention at all.
 
 **`Glyph::span` is the element's span, not the glyph's.** Every glyph produced by one math element
 shares that element's `Span`, so it identifies a symbol only when one element produced one glyph.
@@ -870,8 +922,9 @@ Issues the tutorial's sketches leave open, and where each stands now:
   `3.0` and `4.0` mean what they would in Manim.
 - **Easing** is `ease_in_out` (quadratic in/out, split at `t = 0.5`) by default, applied inside the
   animation.
-- **Opacity composes multiplicatively**: a mobject's `opacity` times its style's `fill_opacity`. At
-  draw time they are folded into the paint's alpha.
+- **Opacity composes multiplicatively**: a mobject's `opacity` times its style's `fill_opacity` for
+  the fill and times its `stroke_opacity` for the stroke. At draw time each is folded into that
+  pass's paint alpha, so the two channels fade independently.
 - **Commands are data.** Everything an AI or a host can do to the engine should be expressible as a
   serde command naming a node by `NodeId` and a property by name, and must round-trip through JSON
   unchanged. Refusals are `CommandError` values, never panics — a language model can reach every one
@@ -976,9 +1029,10 @@ covered by a test or an image (see "Hard-won facts" for the mechanism of each):
    to start a second contour — and a glyph's counter (`o`, `d`, `=`, `%`) is a second contour. They
    are welded through a hub with a doubled slit, so every bridge cancels to zero winding and the
    counter stays open under `Fill::NonZero`.
-2. **A fraction's rule and a radical's overline are *strokes*, not fills**, and the draw walk emits
-   only fills. `FrameItem::Shape` with `Geometry::Line` is expanded into a filled quad by
-   `filled_shape` — a formula with no fraction bar reads as a bug, not as a missing feature.
+2. **A fraction's rule and a radical's overline are *strokes*, not fills**, and the compiler's
+   output is geometry with no per-contour style. `FrameItem::Shape` with `Geometry::Line` is expanded
+   into a filled quad by `filled_shape` — a formula with no fraction bar reads as a bug, not as a
+   missing feature.
 3. **`Glyph::span` is the *element's* span, shared by every glyph of a run.** So it names a glyph
    only when one element produced one glyph; `"abc"` gives all three the whole literal, and the
    guard is a shaped-character-count comparison.
@@ -1100,9 +1154,11 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   so the default pivot needs no inverse — and the world-space pivot `Rotate::about_point` does take
   one, guarded, with a degenerate parent making the animation a no-op rather than writing `NaN`.
   Two shapes came with them, because nothing in `shapes` was interesting to turn: `line` and `arrow`
-  are **filled outlines** (a line has zero area and the draw walk emits fills — the same trade
-  `formula::filled_shape` makes for a fraction's rule), anchored at the tail rather than centred, so
-  "rotate about the tail" means what a caller expects. **The step's own behavioural change is that
+  were **filled outlines** at the time (a line has zero area and the draw walk emitted only fills),
+  anchored at the tail rather than centred, so "rotate about the tail" means what a caller expects.
+  `line` has since become a two-anchor stroked centerline; `arrow` is still the filled silhouette,
+  because a flat point array cannot be a stroked shaft plus a filled head — see "Strokes". **The
+  step's own behavioural change is that
   `set`'s `scale` and `rotation` now compose** onto the object's transform instead of overwriting it,
   pinned by two tests; `position` stays absolute because Manim's `move_to` is.
   **The evidence is a bless run that moved nothing.** All six older scenes rendered *pixel-identical*
@@ -1116,8 +1172,8 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   turned arrow was announced as "长度 2.49" rather than 3, because the measurement fell back to the
   bounding box — see "Accessibility" for the diameter rule that replaced it, and note that the test
   now asserts on a *rotated* arrow, since the unrotated one gave the right answer by coincidence.
-  Deferred on purpose: **strokes in the mobject model** (the filled `Line`/`Arrow` are the honest
-  interim, and teaching the draw walk to stroke changes every golden), `Create`/`Uncreate` (needs
+  Deferred at the time, since landed: **strokes in the mobject model** (see "Strokes").
+  Deferred on purpose: `Create`/`Uncreate` (needs
   `pointwise_become_partial`), `Rotating` (an animation that never ends makes `is_playing`
   permanently true, which every "react when the timeline drains" scene depends on), `path_arc` for a
   straight move, `FadeIn`'s `shift`/`scale`, and axes and plots — **the last two have since
@@ -1157,6 +1213,17 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   per decision), pointer pan/zoom, axis arrows and subticks, automatic label layout and number
   formatting, `focus` on a group (its bounding box would need descendants), per-tick
   addressability/styling, and text bounds — which is why `focus` still refuses a text node.
+- **P3's strokes are done.** `SceneContext::build_draw_list` emits a `DrawOp::StrokePath` beside the
+  fill, each pass carrying its own multiplicative alpha, with the width in **world units** so it
+  scales with the camera — see "Strokes" for the four properties and the two vocabulary consequences.
+  `Plot` moved from a kurbo ribbon outline to a stroked centerline, `Line` from a filled rectangle to
+  a two-anchor centerline, and `Arrow` stayed a filled silhouette on purpose. The command layer gained
+  `stroke_opacity`, `stroke_color` and a validated `stroke_width`. **The evidence is a bless diff
+  with exactly one file in it**: all seven older goldens were pixel-identical (their bytes were not,
+  for the known deflate reason — see "Golden images"), and only `axes/linux-aarch64.png` moved,
+  because the plot's rasterisation genuinely changed. Deferred: stroke joins/caps/dashes and
+  per-segment widths (the style has one width and `vello`'s defaults), a per-mobject stroke style on
+  formulas (see "P1 step 5"), and `Create`/`Uncreate`, which is what a stroke makes visible.
 - **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration

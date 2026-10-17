@@ -198,8 +198,8 @@ impl Scene for PythagoreanScene {
     }
 }
 
-/// A style that fills and does not stroke — what every shape in these scenes
-/// wants, since the tree walk only emits fills.
+/// A style that fills and does not stroke — what every closed shape in these
+/// scenes wants.
 fn filled(color: rustim_color::Srgb, alpha: f64) -> Style {
     Style {
         fill: color,
@@ -207,6 +207,22 @@ fn filled(color: rustim_color::Srgb, alpha: f64) -> Style {
         stroke: color,
         stroke_opacity: 0.0,
         stroke_width: 0.0,
+    }
+}
+
+/// A style that strokes a centerline and does not fill it.
+///
+/// The tree walk emits the fill pass first and the stroke pass second, so a
+/// style may legitimately have both on. Lines and plots want only the stroke:
+/// filling an open polyline paints the area under it, which is the defect the
+/// plot's stroke exists to avoid. `width` is in world units.
+fn stroked(color: rustim_color::Srgb, width: f64) -> Style {
+    Style {
+        fill: color,
+        fill_opacity: 0.0,
+        stroke: color,
+        stroke_opacity: 1.0,
+        stroke_width: width,
     }
 }
 
@@ -1018,9 +1034,10 @@ const Y_LENGTH: f64 = 4.0;
 ///
 /// - `axes` is one welded path of shafts and ticks, so the golden shows whether
 ///   the weld leaves the quadrants empty and the axes solid;
-/// - the plot is a **stroke's outline**, not a filled polyline: the counterfactual
-///   is an area under `y = 0.25x² - 1.75`, which would be the single most visible
-///   wrong picture in the suite;
+/// - the plot is a **stroked centerline**, not a filled polyline: the
+///   counterfactual is an area under `y = 0.25x² - 1.75`, which would be the
+///   single most visible wrong picture in the suite — and this is the one golden
+///   whose pixels go through the backend's stroker;
 /// - the number line is the same weld with a different tick direction, and it is
 ///   the object `focus` and the accessibility layer measure by diameter;
 /// - the labels are shaped text drawn *through the camera*, so a camera that
@@ -1086,15 +1103,18 @@ impl AxesScene {
                 })
             })
             .collect();
+        // The width lives in the style now: the plot is a stroked centerline,
+        // so the backend's stroker applies `stroke_width` to it. That is what
+        // makes the curve's thickness an animatable property rather than a
+        // baked-in polygon.
         let curve = build(
             ShapeKind::Plot,
             &ShapeParams {
                 points: Some(samples),
-                thickness: Some(0.05),
                 ..Default::default()
             },
         )
-        .with_style(filled(rustim_color::YELLOW, 1.0));
+        .with_style(stroked(rustim_color::YELLOW, 0.05));
         ctx.add(curve);
 
         let number_line = build(

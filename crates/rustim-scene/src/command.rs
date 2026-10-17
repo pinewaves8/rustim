@@ -73,6 +73,18 @@ pub enum Command {
 pub enum Property {
     Opacity(f64),
     StrokeWidth(f64),
+    /// The stroke's own opacity, `0.0..=1.0` — independent of the fill's.
+    ///
+    /// Turning this up on an object that was built filled (a square, a circle)
+    /// draws an outline around it; on a line or a plot — which `build` marks as
+    /// stroked and unfilled — it is the only thing that makes the object
+    /// visible at all, so `add` sets it to `1.0` for those two kinds.
+    StrokeOpacity(f64),
+    /// The stroke's colour as `[r, g, b]`; the alpha is `stroke_opacity`, and
+    /// the fill keeps its own colour. `[u8; 3]` is the same spelling `add`'s
+    /// `params.color` uses, so a host that can create a blue shape can recolour
+    /// its outline.
+    StrokeColor([u8; 3]),
     FillOpacity(f64),
     Label(String),
     /// What the object is, for the accessibility tree and the AI layer.
@@ -537,13 +549,23 @@ impl Property {
                 m.dirty.style = true;
             }
             Self::StrokeWidth(v) => {
-                if *v < 0.0 {
+                if *v < 0.0 || !v.is_finite() {
                     return Err(CommandError::OutOfRange {
                         property: "stroke_width".into(),
-                        detail: format!("{v} is negative"),
+                        detail: format!("{v} is not a non-negative, finite width"),
                     });
                 }
                 m.style.stroke_width = *v;
+                m.dirty.style = true;
+            }
+            Self::StrokeOpacity(v) => {
+                m.style.stroke_opacity = range("stroke_opacity", *v)?;
+                m.dirty.style = true;
+            }
+            Self::StrokeColor([r, g, b]) => {
+                // Same construction `shapes::build` uses for `params.color`, so
+                // an `add` followed by a `set` can produce the identical style.
+                m.style.stroke = rustim_color::Srgb::from_rgba8(*r, *g, *b, 255);
                 m.dirty.style = true;
             }
             // Both of these change what the object *means* and nothing about how
@@ -628,6 +650,15 @@ mod tests {
                 .to_owned(),
             r#"{"action":"add","type":"plot","params":{"thickness":0.05,"points":[[0.0,0.0],[1.0,1.0],[2.0,0.0]]}}"#
                 .to_owned(),
+            // Stroke knobs. The colour's `[u8; 3]` is the same spelling
+            // `params.color` uses, and the alpha never appears in the colour
+            // itself — one alpha per channel, in its own property.
+            format!(
+                r#"{{"action":"set","target":{id},"property":{{"name":"stroke_opacity","value":0.5}}}}"#
+            ),
+            format!(
+                r#"{{"action":"set","target":{id},"property":{{"name":"stroke_color","value":[100,181,246]}}}}"#
+            ),
             // The animation specs round-trip too, which is what lets a host log and
             // replay a session: `range`'s absent-field rule holds for `duration`
             // and `to` as well, so neither is written back as `null`.
@@ -798,6 +829,81 @@ mod tests {
         ));
         // ...and the object was not half-modified.
         assert_eq!(tree.get(id).unwrap().opacity, 1.0);
+    }
+
+    /// The three stroke properties reach `Style` and mark it dirty.
+    #[test]
+    fn stroke_properties_write_the_style_they_name() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(vec![]));
+        for property in [
+            Property::StrokeOpacity(0.25),
+            Property::StrokeColor([100, 181, 246]),
+            Property::StrokeWidth(0.08),
+        ] {
+            apply(
+                &mut tree,
+                &Command::Set {
+                    target: id,
+                    property,
+                },
+            )
+            .unwrap();
+        }
+
+        let m = tree.get(id).unwrap();
+        assert_eq!(m.style.stroke_opacity, 0.25);
+        assert_eq!(m.style.stroke_width, 0.08);
+        let [r, g, b, a] = m.style.stroke.components;
+        assert!((r - 100.0 / 255.0).abs() < 1e-6, "{r}");
+        assert!((g - 181.0 / 255.0).abs() < 1e-6, "{g}");
+        assert!((b - 246.0 / 255.0).abs() < 1e-6, "{b}");
+        assert_eq!(a, 1.0, "alpha lives in stroke_opacity, not in the colour");
+        assert!(m.dirty.style, "the draw list has to be rebuilt");
+    }
+
+    #[test]
+    fn a_stroke_opacity_out_of_range_is_refused() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(vec![]));
+        for bad in [1.5, -0.1, f64::NAN] {
+            let cmd = Command::Set {
+                target: id,
+                property: Property::StrokeOpacity(bad),
+            };
+            assert!(matches!(
+                apply(&mut tree, &cmd),
+                Err(CommandError::OutOfRange { .. })
+            ));
+        }
+        assert_eq!(tree.get(id).unwrap().style.stroke_opacity, 0.0);
+    }
+
+    #[test]
+    fn a_negative_or_non_finite_stroke_width_is_refused() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(vec![]));
+        for bad in [-0.1, f64::NAN, f64::INFINITY] {
+            let cmd = Command::Set {
+                target: id,
+                property: Property::StrokeWidth(bad),
+            };
+            assert!(matches!(
+                apply(&mut tree, &cmd),
+                Err(CommandError::OutOfRange { .. })
+            ));
+        }
+        // A zero width is legitimate: it is how a host turns a stroke off
+        // without touching its opacity or colour.
+        apply(
+            &mut tree,
+            &Command::Set {
+                target: id,
+                property: Property::StrokeWidth(0.0),
+            },
+        )
+        .unwrap();
+        assert_eq!(tree.get(id).unwrap().style.stroke_width, 0.0);
     }
 
     #[test]
