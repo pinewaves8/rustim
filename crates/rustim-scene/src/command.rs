@@ -243,6 +243,54 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// Put a label beside an object, with an arrow pointing at it.
+    ///
+    /// The teaching-tier sentence `point_at` is half of: a callout names its
+    /// subject and its words, and the engine computes the rest — the arrow's
+    /// tip sits `buff` from the subject's world box, the shaft runs `length`
+    /// outward, and the label's near edge sits `buff` past the tail, centred on
+    /// the subject's perpendicular axis. The label never covers the arrow, and
+    /// every gap is the number asked for, whatever the subject's size or
+    /// rotation. The label's own box comes from the host's typesetter, so a
+    /// long string pushes the label further out rather than overlapping the
+    /// arrow.
+    ///
+    /// `"down"` (the default) puts the callout below the subject with the arrow
+    /// pointing up at it — the caption placement. `arrow` defaults to `true`;
+    /// `false` places the label alone, one arrow-and-gap away from the subject.
+    /// `buff` and `length` are [`Command::PointAt`]'s numbers with the same
+    /// defaults (`0.1`, `1.0`); `thickness`, `color`, `size`, `max_width` and
+    /// `label` are passed to the shapes. **`color` reaches both the text and
+    /// the arrow**, so one callout reads as one object; `label` names the
+    /// **text** only, because one label on two nodes would be ambiguous.
+    ///
+    /// Answered by [`crate::SceneContext::handle`], not `apply`: typesetting is
+    /// the host's, exactly as for `add` of `text`. `created` lists the text
+    /// first and the arrow second when it was asked for, so `created[0]` is
+    /// always the label. A build with no typesetter refuses with
+    /// [`CommandError::Unsupported`] under `text`, before anything is created.
+    Annotate {
+        target: Target,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<Direction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        buff: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thickness: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arrow: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<[u8; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_width: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Dim everything but an object for a moment, then bring it back.
     ///
     /// The attention helper a spoken explanation needs and `point_at` does not
@@ -577,6 +625,7 @@ pub enum Command {
 /// handshake.
 pub const ACTIONS: &[&str] = &[
     "add",
+    "annotate",
     "arrange",
     "batch",
     "camera",
@@ -620,6 +669,7 @@ impl Command {
             Self::Arrange { .. } => "arrange",
             Self::Fit { .. } => "fit",
             Self::PointAt { .. } => "point_at",
+            Self::Annotate { .. } => "annotate",
             Self::Highlight { .. } => "highlight",
             Self::Play { .. } => "play",
             Self::Stop => "stop",
@@ -1759,6 +1809,12 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // `apply` total, so a caller replaying a session log through a bare
             // tree gets a no-op rather than a panic.
         }
+        Command::Annotate { .. } => {
+            // Answered by `SceneContext::handle` for the same reason `add` of a
+            // `text` is: a callout's label is typeset, and `apply` may not read
+            // fonts. The arm keeps `apply` total, so a direct caller replaying a
+            // session log meets a no-op rather than a panic.
+        }
         Command::Narrate { .. } => {
             // Answered by `SceneContext::handle`, because scheduling narration
             // needs the virtual clock and the narration track — neither of which
@@ -2583,10 +2639,11 @@ mod tests {
             format!(r#"{{"action":"arrange","targets":[{id},"leg a"],"axis":"row"}}"#),
             r#"{"action":"arrange","targets":["a","b"],"axis":"column","buff":0.5}"#.to_owned(),
             format!(r#"{{"action":"fit","targets":[{id}],"width":4.0,"height":2.0}}"#),
-            // The teaching tier's two attention actions. `point_at` creates a
+            // The teaching tier's three attention actions. `point_at` creates a
             // picture and carries the same optional knobs `add` does, each
             // omitted when absent; `highlight` queues a beat and writes no
-            // fields back. Both take a label where every other target field
+            // fields back; `annotate` creates two pictures from one measured
+            // placement. All three take a label where every other target field
             // does.
             format!(
                 r#"{{"action":"point_at","target":{id},"direction":"down","buff":0.2,"length":1.5,"thickness":0.05,"color":[100,181,246],"label":"看这里"}}"#
@@ -2596,6 +2653,14 @@ mod tests {
                 r#"{{"action":"highlight","target":{id},"dim":0.2,"duration":0.4,"hold":0.6}}"#
             ),
             r#"{"action":"highlight","target":"三角形"}"#.to_owned(),
+            // The callout: a label (required — a callout with nothing to say is
+            // a typo, not a command) plus the same optional knobs `point_at`
+            // carries, in declaration order. `arrow` is a boolean this action
+            // has and `point_at` does not.
+            format!(
+                r#"{{"action":"annotate","target":{id},"text":"两条直角边是 3 和 4","direction":"up","buff":0.2,"length":1.5,"thickness":0.05,"arrow":false,"color":[100,181,246],"size":0.6,"max_width":4.0,"label":"注释"}}"#
+            ),
+            r#"{"action":"annotate","target":"三角形","text":"看这里"}"#.to_owned(),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for json in cases {
@@ -2663,6 +2728,19 @@ mod tests {
                 dim: None,
                 duration: None,
                 hold: None,
+            },
+            Command::Annotate {
+                target: id.into(),
+                text: "看这里".to_owned(),
+                direction: None,
+                buff: None,
+                length: None,
+                thickness: None,
+                arrow: None,
+                color: None,
+                size: None,
+                max_width: None,
+                label: None,
             },
         ] {
             let diff = apply(&mut tree, &cmd).expect("answered elsewhere, not refused");

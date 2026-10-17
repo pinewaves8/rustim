@@ -52,18 +52,24 @@
 //! are the wire's `next_to` / `arrange` / `fit` actions; the protocol's
 //! spelling and refusal mapping live in `rustim-scene`.
 //!
-//! [`attention`]: the geometry of *point at this* and *dim the rest* —
-//! [`pointing_arrow`](attention::pointing_arrow) builds an arrow whose tip sits
-//! a gap from the subject's world box, and [`spotlight`](attention::spotlight)
-//! names the picture-bearing nodes outside the subject's subtree. They are the
-//! wire's `point_at` / `highlight` actions; the dim-and-restore beat itself is
+//! [`attention`]: the geometry of *point at this*, *label this* and *dim the
+//! rest* — [`pointing_arrow`](attention::pointing_arrow) builds an arrow whose
+//! tip sits a gap from the subject's world box, [`callout`](attention::callout)
+//! places a label just past that arrow's tail from one measurement of the
+//! subject, and [`spotlight`](attention::spotlight) names the picture-bearing
+//! nodes outside the subject's subtree. They are the wire's `point_at` /
+//! `annotate` / `highlight` actions; the dim-and-restore beat itself is
 //! composed in `rustim-scene`, because this crate does not depend on
-//! `rustim-anim`.
+//! `rustim-anim`. A callout is a **static** placement computed from the boxes
+//! as they are when the command arrives — following a moving subject would need
+//! per-frame state the tree deliberately does not have, so it is deferred
+//! rather than approximated by parenting (a parent's transform would carry the
+//! label through a rotation, which is not what a caption does).
 //!
 //! Deferred, deliberately, and named so they are not rediscovered as gaps:
-//! annotation (labels that follow their subject), the six `explain.*`
-//! templates, the linter (out of frame, overlap, size, contrast, pacing) and
-//! the declarative `ScenePlan`.
+//! labels that follow their subject, the six `explain.*` templates, the linter
+//! (out of frame, overlap, size, contrast, pacing) and the declarative
+//! `ScenePlan`.
 //!
 //! `rustim-text` is not a dependency and will not become one without a separate
 //! crate: see this module's note on the wasm kernel.
@@ -71,5 +77,8 @@
 pub mod attention;
 pub mod layout;
 
-pub use attention::{DEFAULT_POINT_AT_BUFF, DEFAULT_POINT_AT_LENGTH, pointing_arrow, spotlight};
+pub use attention::{
+    Callout, CalloutStyle, DEFAULT_POINT_AT_BUFF, DEFAULT_POINT_AT_LENGTH, callout, pointing_arrow,
+    spotlight,
+};
 pub use layout::{Axis, Direction, LayoutError, arrange, fit, next_to};

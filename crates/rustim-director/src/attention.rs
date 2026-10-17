@@ -5,13 +5,14 @@
 //! the world boxes a viewer sees, so the result stays right when the subject is
 //! rotated, nested or resized, and the caller never hands over a coordinate.
 //!
-//! The two functions here are the geometry half only. [`pointing_arrow`] builds
-//! and places a fresh [`Mobject`] the command layer inserts; [`spotlight`] names
-//! the nodes a spotlight must dim. Turning that list into a dim-and-restore
+//! The functions here are the geometry half only. [`pointing_arrow`] builds and
+//! places a fresh [`Mobject`] the command layer inserts; [`callout`] lays out a
+//! label and its arrow from one measurement of the subject's box; [`spotlight`]
+//! names the nodes a spotlight must dim. Turning that list into a dim-and-restore
 //! beat is animation composition, which belongs to `rustim-scene` (this crate
 //! does not depend on `rustim-anim`, and should not start).
 
-use rustim_math::{Affine2, Point};
+use rustim_math::{Affine2, Point, Rect, Vec2};
 use rustim_mobject::{Mobject, NodeId, SceneTree, ShapeKind, ShapeParams, shapes};
 
 use crate::layout::{Direction, LayoutError};
@@ -51,6 +52,20 @@ pub fn pointing_arrow(
     length: f64,
     thickness: Option<f64>,
 ) -> Result<Mobject, LayoutError> {
+    check_arrow(buff, length, thickness)?;
+    // Existence first, so a stale id is `Unknown` rather than the weaker
+    // "nothing to measure" — the two are different bugs for a caller.
+    if tree.get(target).is_none() {
+        return Err(LayoutError::Unknown(target));
+    }
+    let bounds = tree
+        .world_bounds(target)
+        .ok_or(LayoutError::Unmeasurable(target))?;
+    Ok(arrow_at(bounds, direction, buff, length, thickness))
+}
+
+/// The shared guard for every arrow this module builds.
+fn check_arrow(buff: f64, length: f64, thickness: Option<f64>) -> Result<(), LayoutError> {
     if !buff.is_finite() {
         return Err(LayoutError::OutOfRange {
             field: "buff",
@@ -71,15 +86,22 @@ pub fn pointing_arrow(
             detail: format!("{t} is not a finite, non-negative thickness"),
         });
     }
-    // Existence first, so a stale id is `Unknown` rather than the weaker
-    // "nothing to measure" — the two are different bugs for a caller.
-    if tree.get(target).is_none() {
-        return Err(LayoutError::Unknown(target));
-    }
-    let bounds = tree
-        .world_bounds(target)
-        .ok_or(LayoutError::Unmeasurable(target))?;
+    Ok(())
+}
 
+/// Build the arrow for a **measured** box.
+///
+/// Split from [`pointing_arrow`] so [`callout`] can place an arrow and a label
+/// from the same measurement without walking the tree twice — and so both are
+/// computed from exactly the same rule, which is what keeps a callout's label
+/// sitting just past the arrow's tail.
+fn arrow_at(
+    bounds: Rect,
+    direction: Direction,
+    buff: f64,
+    length: f64,
+    thickness: Option<f64>,
+) -> Mobject {
     // Where the tip lands, and which way the shaft points. The local arrow runs
     // from the origin to `(length, 0)` with its tip at the far end, so the
     // rotation that sends `+x` toward the subject is the angle named here.
@@ -116,7 +138,110 @@ pub fn pointing_arrow(
     arrow.transform = Affine2::translate((tip.x, tip.y))
         * Affine2::rotate(angle)
         * Affine2::translate((-length, 0.0));
-    Ok(arrow)
+    arrow
+}
+
+/// How a callout is shaped, beyond its subject and its label.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CalloutStyle {
+    /// Which side of the subject the callout sits on.
+    pub direction: Direction,
+    /// The gap between the subject and the arrow's tip, and between the
+    /// arrow's tail and the label.
+    pub buff: f64,
+    /// The arrow's length — the shaft between the tip and the tail.
+    pub length: f64,
+    /// The arrow's shaft thickness; `None` is the shape default.
+    pub thickness: Option<f64>,
+    /// Whether to build the arrow at all. A label placed beside its subject
+    /// with no pointer is a callout too.
+    pub arrow: bool,
+}
+
+/// What a callout is made of: where the label goes and, when asked for, the
+/// arrow that runs from it to the subject.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Callout {
+    /// The world-space centre the label's transform should carry.
+    pub label_center: Point,
+    /// The arrow, when [`CalloutStyle::arrow`] is set.
+    pub arrow: Option<Mobject>,
+}
+
+/// Lay out a callout: a label beside `subject`, with an arrow from the label to
+/// the subject's box.
+///
+/// The geometry is [`pointing_arrow`]'s, extended one step outward: the arrow's
+/// tip sits `buff` from the subject's near edge, its tail one `length` further
+/// out, and the label's near edge `buff` beyond the tail. So the label never
+/// covers the arrow, and the gap between any two of the three is exactly the
+/// number asked for — whatever the subject's size, however it is rotated,
+/// because everything is measured from the world box.
+///
+/// `label_extent` is the label's own box size (width, height), which the caller
+/// knows before the label is inserted: a typeset text block reports its layout
+/// box, and a fresh node with an identity transform has that box in the world.
+/// The perpendicular coordinate is the subject's centre, the same rule
+/// [`crate::layout::next_to`] applies.
+///
+/// A label with no extent on either axis (an empty string) is legal: it sits
+/// `buff` past the arrow's tail and occupies no room.
+pub fn callout(
+    tree: &SceneTree,
+    subject: NodeId,
+    label_extent: Vec2,
+    style: CalloutStyle,
+) -> Result<Callout, LayoutError> {
+    check_arrow(style.buff, style.length, style.thickness)?;
+    for (field, value) in [("width", label_extent.x), ("height", label_extent.y)] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(LayoutError::OutOfRange {
+                field: "text",
+                detail: format!("the label's {field} {value} is not a finite, non-negative size"),
+            });
+        }
+    }
+    if tree.get(subject).is_none() {
+        return Err(LayoutError::Unknown(subject));
+    }
+    let bounds = tree
+        .world_bounds(subject)
+        .ok_or(LayoutError::Unmeasurable(subject))?;
+    let centre = bounds.center();
+
+    // Everything is signed along one axis: `sign` is the outward direction in
+    // world coordinates, and the perpendicular coordinate never moves.
+    let (perp, sign, near_edge) = match style.direction {
+        Direction::Down => (centre.x, -1.0, bounds.y0),
+        Direction::Up => (centre.x, 1.0, bounds.y1),
+        Direction::Left => (centre.y, -1.0, bounds.x0),
+        Direction::Right => (centre.y, 1.0, bounds.x1),
+    };
+    let tip = near_edge + sign * style.buff;
+    let tail = tip + sign * style.length;
+    let half_extent = match style.direction {
+        Direction::Left | Direction::Right => label_extent.x / 2.0,
+        Direction::Up | Direction::Down => label_extent.y / 2.0,
+    };
+    let label_along = tail + sign * (style.buff + half_extent);
+    let label_center = match style.direction {
+        Direction::Left | Direction::Right => Point::new(label_along, perp),
+        Direction::Up | Direction::Down => Point::new(perp, label_along),
+    };
+
+    let arrow = style.arrow.then(|| {
+        arrow_at(
+            bounds,
+            style.direction,
+            style.buff,
+            style.length,
+            style.thickness,
+        )
+    });
+    Ok(Callout {
+        label_center,
+        arrow,
+    })
 }
 
 /// The nodes a spotlight on `target` must dim: every picture-bearing node
@@ -240,6 +365,120 @@ mod tests {
                 Err(LayoutError::OutOfRange { field: got, .. }) => assert_eq!(got, field),
                 other => panic!("expected a refusal under {field}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn a_callout_puts_the_label_past_the_arrow_tail() {
+        // A 2x2 square: its near edge is one unit from the centre. With buff
+        // 0.2 and length 1.0 the arrow spans 1.2..2.2 from the centre, and the
+        // label's near edge sits another 0.2 past the tail. A 2x0.5 label has
+        // half-extents 1.0 across and 0.25 along a vertical arrow.
+        let mut tree = SceneTree::new();
+        let subject = square(&mut tree, 2.0, (0.0, 0.0));
+        let label = Vec2::new(2.0, 0.5);
+        let cases = [
+            (
+                Direction::Down,
+                Point::new(0.0, -2.65),
+                Point::new(0.0, -1.2),
+                Point::new(0.0, -2.2),
+            ),
+            (
+                Direction::Up,
+                Point::new(0.0, 2.65),
+                Point::new(0.0, 1.2),
+                Point::new(0.0, 2.2),
+            ),
+            (
+                Direction::Left,
+                Point::new(-3.4, 0.0),
+                Point::new(-1.2, 0.0),
+                Point::new(-2.2, 0.0),
+            ),
+            (
+                Direction::Right,
+                Point::new(3.4, 0.0),
+                Point::new(1.2, 0.0),
+                Point::new(2.2, 0.0),
+            ),
+        ];
+        for (direction, label_center, tip, tail) in cases {
+            let style = CalloutStyle {
+                direction,
+                buff: 0.2,
+                length: 1.0,
+                thickness: None,
+                arrow: true,
+            };
+            let result = callout(&tree, subject, label, style).unwrap();
+            close(result.label_center.x, label_center.x);
+            close(result.label_center.y, label_center.y);
+            let arrow = result.arrow.expect("the arrow was asked for");
+            let world_tip = arrow.transform * Point::new(1.0, 0.0);
+            let world_tail = arrow.transform * Point::ZERO;
+            close(world_tip.x, tip.x);
+            close(world_tip.y, tip.y);
+            close(world_tail.x, tail.x);
+            close(world_tail.y, tail.y);
+        }
+    }
+
+    #[test]
+    fn a_callout_without_an_arrow_still_places_the_label() {
+        let mut tree = SceneTree::new();
+        let subject = square(&mut tree, 2.0, (0.0, 0.0));
+        let style = CalloutStyle {
+            direction: Direction::Down,
+            buff: 0.2,
+            length: 1.0,
+            thickness: None,
+            arrow: false,
+        };
+        let result = callout(&tree, subject, Vec2::new(2.0, 0.5), style).unwrap();
+        assert!(result.arrow.is_none());
+        close(result.label_center.y, -2.65);
+
+        // An empty label has no extent: its centre is the gap past the tail.
+        let empty = callout(&tree, subject, Vec2::ZERO, style).unwrap();
+        close(empty.label_center.y, -2.4);
+    }
+
+    #[test]
+    fn a_callout_refuses_a_missing_subject_a_bad_extent_and_a_bad_arrow() {
+        let mut tree = SceneTree::new();
+        let subject = square(&mut tree, 2.0, (0.0, 0.0));
+        let style = CalloutStyle {
+            direction: Direction::Down,
+            buff: 0.1,
+            length: 1.0,
+            thickness: None,
+            arrow: true,
+        };
+        let ghost = tree.insert(Mobject::new(vec![]));
+        tree.remove(ghost);
+        assert_eq!(
+            callout(&tree, ghost, Vec2::new(1.0, 1.0), style),
+            Err(LayoutError::Unknown(ghost))
+        );
+        let empty = tree.insert(Mobject::new(vec![]));
+        assert_eq!(
+            callout(&tree, empty, Vec2::new(1.0, 1.0), style),
+            Err(LayoutError::Unmeasurable(empty))
+        );
+        for extent in [Vec2::new(-1.0, 1.0), Vec2::new(1.0, f64::NAN)] {
+            match callout(&tree, subject, extent, style) {
+                Err(LayoutError::OutOfRange { field, .. }) => assert_eq!(field, "text"),
+                other => panic!("expected a refusal under text, got {other:?}"),
+            }
+        }
+        let bad = CalloutStyle {
+            length: 0.0,
+            ..style
+        };
+        match callout(&tree, subject, Vec2::new(1.0, 1.0), bad) {
+            Err(LayoutError::OutOfRange { field, .. }) => assert_eq!(field, "length"),
+            other => panic!("expected a refusal under length, got {other:?}"),
         }
     }
 

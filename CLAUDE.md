@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **836 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **842 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -171,7 +171,7 @@ cargo test -p rustim-daemon          # sessions, RPC envelope, and real loopback
 cargo test -p rustim-daemon --test daemon   # ...only the socket-level integration suite
 cargo test -p rustim-mcp            # the MCP envelope and tools, natively
 cargo test -p rustim-mcp --test mcp # ...only the real-process stdio suite
-cargo test -p rustim-director       # the teaching tier's layout and attention, over real scene trees
+cargo test -p rustim-director       # the teaching tier's layout, attention and annotation, over real scene trees
 cargo test -p rustim-export --test compare_cli  # the visual-regression CLI's exit codes
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo test -p rustim-web             # the browser session core, natively (no Chrome, no wasm)
@@ -373,7 +373,7 @@ last property.
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it) and `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) | Real |
-| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). Both are pure geometry and animations are *not* composed here — the director does not depend on `rustim-anim`. Annotation, templates, the linter and `ScenePlan` are deferred; nothing here does I/O and nothing names a model | Real (layout, attention) |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. Templates, the linter and `ScenePlan` are deferred; nothing here does I/O and nothing names a model | Real (layout, attention, annotation) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -1987,7 +1987,40 @@ that points at a labelled square, reads the arrow back through `query`, highligh
 `dim: 2.0` refused. `ACTIONS` 22 → 24. **All eight goldens are unchanged**, and the count moved
 826 → 836.
 
-Deferred, and named so they are not rediscovered as gaps: annotation that follows its subject, the
+**The third slice is `annotate`, and it is the one teaching action that cannot be a pure `apply`
+arm.** A callout is a label *and* an arrow placed from one measurement of the subject: the arrow's
+tip sits `buff` from the subject's box, its shaft runs `length` outward, and the label's near edge
+sits `buff` past the tail, centred on the subject's perpendicular axis. Two layers:
+
+- **`attention::callout(tree, subject, label_extent, CalloutStyle) -> Callout`** is pure geometry.
+  `CalloutStyle { direction, buff, length, thickness, arrow }` is the caller's half; the validation
+  is `check_arrow` — the same function `pointing_arrow` now calls — plus a non-finite or negative
+  `label_extent` refused under `"text"`, and the subject measured exactly as `pointing_arrow`
+  measures it. It returns the label's centre and the optional arrow **mobject**, built by the same
+  `arrow_at`, so the two placement functions cannot drift apart. `arrow: false` keeps the placement
+  (one arrow-and-gap away) and drops the arrow, so the label never lands on the subject. The
+  `label_extent` comes from the **typesetter**: the label's own box decides how far out it goes, so
+  a long sentence pushes the label out rather than overlapping the arrow.
+- **The wire arm lives in `SceneContext::handle`**, because a label means typesetting and `apply`
+  may not read fonts. It refuses `Unsupported { feature: "text" }` when the build has no typesetter,
+  resolves the target, asks the host for the `TextBlock`, takes its `local_bounds()` as the extent,
+  calls `callout`, and only then inserts: the text node first (so `created[0]` is always the label),
+  the arrow second, with `color` applied to both halves. Every refusal is therefore atomic — a bad
+  `length` leaves the tree exactly as it found it, so a model retries against the scene it had.
+
+**The placement is static, and that is a decision rather than a gap.** Following a moving subject
+would need a per-frame constraint the tree deliberately does not have, and parenting the label to
+the subject would carry it through the subject's rotations — not what a caption does. Re-sending
+`annotate` re-anchors it, and a host that wants to move it can `play`/`set` it like any other node.
+Evidence for the slice: three director tests (the label centre past the tail from all four
+directions, an arrow-less callout keeping the placement, and the three refusals), three context
+tests (the full two-node placement with the colour reaching both halves, `up` + `arrow: false`, and
+atomic refusals for a missing typesetter / a bad `length` / an unknown label), two round-trip
+fixtures (the full spelling and the minimal one), and the conformance case extended to annotate a
+labelled square and read the label back. `ACTIONS` 24 → 25. **All eight goldens are unchanged**,
+and the count moved 836 → 842.
+
+Deferred, and named so they are not rediscovered as gaps: labels that *follow* their subject, the
 six `explain.*` templates, the linter (out of frame, overlap, size, contrast, pacing) and
 `ScenePlan`. Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
 arrow is a static node placed once; re-placing it is a `point_at` again, and following would need a
@@ -2818,7 +2851,21 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   `0.5`. Evidence: four director tests, two `apply` tests, three context tests, four round-trip
   fixtures and an end-to-end conformance case; `ACTIONS` 22 → 24. **All eight goldens are
   unchanged**, and the count moved 826 → 836.
-  Deliberately deferred: annotation, the `explain.*` templates, the linter and `ScenePlan`.
+- **Phase 2's fourth slice — annotation (`annotate`) — is done.** The third attention verb, and the
+  first teaching action that creates **two** nodes: a typeset label and, unless `arrow: false`, the
+  arrow that points at the subject. `attention::callout(tree, subject, label_extent, style)` is pure
+  geometry — the label's near edge sits a `buff` past the arrow's tail, so the typesetter's own box
+  decides how far out the label goes — and `SceneContext::handle` owns the arm, because a label
+  means typesetting and `apply` may not read fonts. Geometry is computed before either node is
+  inserted, so every refusal is atomic; `created[0]` is always the label, and `label` names the text
+  only. A build with no typesetter answers `Unsupported { feature: "text" }` and creates nothing.
+  The placement is **static** on purpose: following a moving subject would need a per-frame
+  constraint the tree does not have, and parenting the label would rotate it with the subject — so
+  re-sending `annotate` is how a host re-anchors one. Evidence: three director tests, three context
+  tests, two round-trip fixtures and the extended conformance case; `ACTIONS` 24 → 25. **All eight
+  goldens are unchanged**, and the count moved 836 → 842.
+  Deliberately deferred: labels that follow their subject, the `explain.*` templates, the linter and
+  `ScenePlan`.
 
 ## AI integration
 
@@ -2844,7 +2891,7 @@ the AI surface" below.
 session. It does not touch the tree; it answers with a `capabilities` document — the protocol version,
 the engine's version string, and the exact action / shape / animation / property / rate names this
 build accepts, plus its limits and two advisory profiles. The lists are **derived from serde over the
-same enums the parser uses** — `actions` from `Command::action_name` (19 verbs), `PROPERTY_NAMES`,
+same enums the parser uses** — `actions` from `Command::action_name` (25 verbs), `PROPERTY_NAMES`,
 `AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` for the nouns — so an advertised name is
 accepted by construction, and a conformance test feeds every advertised word back through the binary
 (see `crates/rustim-app/tests/conformance.rs`). A new variant that misses its `ALL`/name table fails a

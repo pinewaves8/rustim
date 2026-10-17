@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (24 actions, 11 shapes, 11 animations, 10
+//!    the build actually has (25 actions, 11 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -155,7 +155,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 24, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 25, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -415,6 +415,28 @@ fn attention_commands_work_through_the_wire() {
     assert!(
         tree.nodes[0].bounds.is_some(),
         "a placed arrow has measured bounds"
+    );
+
+    // A callout is two pictures from one measurement, and the label is always
+    // first: `created[0]` is the words, `created[1]` its arrow. The text is
+    // typeset by the host, so this also proves the real binary's typesetter
+    // reaches the teaching tier.
+    let created = expect_diff(
+        &mut client,
+        r#"{"action":"annotate","target":"三角形","text":"面积 4","label":"注释","color":[100,181,246]}"#,
+    )
+    .created;
+    assert_eq!(created.len(), 2, "a label and its arrow");
+    let label = created[0];
+    let tree = client
+        .send_raw(&format!(r#"{{"action":"query","target":{}}}"#, label.raw()))
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert_eq!(tree.nodes[0].name, "注释", "the label names the text only");
+    assert!(
+        tree.nodes[0].bounds.is_some(),
+        "the placed label has measured bounds"
     );
 
     // A highlight is a beat: the tree does not move until the frames run, so

@@ -6,7 +6,7 @@ use rustim_anim::{
     Animate, Animation, AnimationGroup, AnimationScheduler, CameraMove, Motion, Sequence,
     StyleProperty, Succession, Wait,
 };
-use rustim_math::{Affine2, Camera, Viewport};
+use rustim_math::{Affine2, Camera, Vec2, Viewport};
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 use rustim_mobject::{NodeId, SceneTree};
 use rustim_render::{DrawList, DrawOp};
@@ -1164,6 +1164,88 @@ impl SceneContext {
             // is the only thing that keeps the lecture in order.
             self.narration.push((self.clock + delay, text.to_owned()));
             return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Annotate {
+            target,
+            text,
+            direction,
+            buff,
+            length,
+            thickness,
+            arrow,
+            color,
+            size,
+            max_width,
+            label,
+        } = cmd
+        {
+            if !self.supports_text() {
+                return Err(CommandError::Unsupported {
+                    feature: "text".to_owned(),
+                });
+            }
+            // Resolution before typesetting: a stale id is refused without
+            // shaping a line nobody will see.
+            let target = target.resolve(&self.tree)?;
+            let spec = TextSpec {
+                size: *size,
+                max_width: *max_width,
+            };
+            let block = {
+                let Some(typesetter) = self.typesetter.as_mut() else {
+                    return Err(CommandError::Unsupported {
+                        feature: "text".to_owned(),
+                    });
+                };
+                typesetter.text(text, &spec).map_err(typeset_error)?
+            };
+            // The label's own size decides where it goes, so the caller's box
+            // is the typesetter's, not a guess from the string length. A block
+            // with no extent (an empty line) still places, half an extent of
+            // nothing away from the tail.
+            let extent = block
+                .local_bounds()
+                .map_or(Vec2::ZERO, |r| Vec2::new(r.width(), r.height()));
+            let style = rustim_director::CalloutStyle {
+                direction: direction.unwrap_or(command::Direction::Down).into(),
+                buff: buff.unwrap_or(rustim_director::DEFAULT_POINT_AT_BUFF),
+                length: length.unwrap_or(rustim_director::DEFAULT_POINT_AT_LENGTH),
+                thickness: *thickness,
+                arrow: arrow.unwrap_or(true),
+            };
+            // Geometry before insertion, so a refused callout leaves the tree
+            // exactly as it found it — the same atomicity the batch command
+            // keeps, and what lets a model retry a bad `length` without first
+            // cleaning up half a callout.
+            let callout = rustim_director::callout(&self.tree, target, extent, style)
+                .map_err(|error| command::layout_error("target", error))?;
+            let params = ShapeParams {
+                text: Some(text.clone()),
+                size: *size,
+                max_width: *max_width,
+                color: *color,
+                label: label.clone(),
+                position: Some([callout.label_center.x, callout.label_center.y]),
+                ..ShapeParams::default()
+            };
+            let text_id = self
+                .tree
+                .insert(rustim_mobject::shapes::build(ShapeKind::Text, &params).with_text(block));
+            let mut diff = StateDiff::default();
+            diff.created.push(text_id);
+            if let Some(mut arrow) = callout.arrow {
+                // The shape builder paints with the foreground when no colour
+                // was given; a colour named here replaces both halves, matching
+                // `point_at`.
+                if let Some([r, g, b]) = color {
+                    let paint = rustim_color::Srgb::from_rgba8(*r, *g, *b, 255);
+                    arrow.style.fill = paint;
+                    arrow.style.stroke = paint;
+                    arrow.dirty.style = true;
+                }
+                diff.created.push(self.tree.insert(arrow));
+            }
+            return Ok(CommandOutcome::Applied(diff));
         }
         if let Command::Highlight {
             target,
@@ -2911,6 +2993,136 @@ mod tests {
             }),
             Err(CommandError::NoSuchLabel { .. })
         ));
+    }
+
+    // ---- annotation: a label past an arrow --------------------------------
+
+    fn annotate(
+        target: NodeId,
+        direction: Option<command::Direction>,
+        arrow: Option<bool>,
+        length: Option<f64>,
+        color: Option<[u8; 3]>,
+    ) -> Command {
+        Command::Annotate {
+            target: target.into(),
+            text: "看这里".to_owned(),
+            direction,
+            buff: None,
+            length,
+            thickness: None,
+            arrow,
+            color,
+            size: None,
+            max_width: None,
+            label: None,
+        }
+    }
+
+    /// One callout, two nodes, one measurement. The fake typesetter reports
+    /// "看这里" as 3 × 1, so with a 1×1 subject at the origin and the default
+    /// gaps the label's centre lands at `-(0.5 + 0.1 + 1.0 + 0.1 + 0.5)` — the
+    /// near edge a buff past the tail, not the centre: a longer label moves
+    /// further out rather than covering the arrow.
+    #[test]
+    fn annotate_places_the_label_past_an_arrow_from_one_measurement() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let subject = square(&mut ctx, [0.0, 0.0]);
+        let diff = applied(
+            &mut ctx,
+            &annotate(subject, None, None, None, Some([100, 181, 246])),
+        );
+
+        assert_eq!(diff.created.len(), 2, "the label and its arrow");
+        let (text, arrow) = (diff.created[0], diff.created[1]);
+        assert_eq!(ctx.tree.get(text).unwrap().kind, NodeKind::Text);
+        assert_eq!(ctx.tree.get(arrow).unwrap().kind, NodeKind::Arrow);
+        assert!(
+            ctx.tree.get(arrow).unwrap().label.is_none(),
+            "one label on two nodes would be ambiguous"
+        );
+
+        let label = ctx.tree.world_bounds(text).unwrap();
+        assert!(label.center().x.abs() < 1e-12, "{label:?}");
+        assert!((label.center().y + 2.2).abs() < 1e-12, "{label:?}");
+        // The arrow spans tip (a buff below the box) to tail (one length out).
+        let shaft = ctx.tree.world_bounds(arrow).unwrap();
+        assert!((shaft.y1 + 0.6).abs() < 0.05, "{shaft:?}");
+        assert!((shaft.y0 + 1.6).abs() < 0.05, "{shaft:?}");
+
+        // `color` reaches both halves, so one callout reads as one object.
+        let paint = rustim_color::Srgb::from_rgba8(100, 181, 246, 255);
+        assert_eq!(ctx.tree.get(text).unwrap().style.fill, paint);
+        assert_eq!(ctx.tree.get(arrow).unwrap().style.fill, paint);
+        assert_eq!(ctx.tree.get(arrow).unwrap().style.stroke, paint);
+    }
+
+    /// The other half of the placement: `up` mirrors the whole arrangement
+    /// above the subject, and `arrow: false` keeps the placement (one arrow and
+    /// gap away) while creating only the label.
+    #[test]
+    fn an_annotate_direction_and_arrow_flag_move_the_same_placement() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let subject = square(&mut ctx, [0.0, 0.0]);
+        let diff = applied(
+            &mut ctx,
+            &annotate(
+                subject,
+                Some(command::Direction::Up),
+                Some(false),
+                None,
+                None,
+            ),
+        );
+        assert_eq!(diff.created.len(), 1, "no arrow was asked for");
+        let label = ctx.tree.world_bounds(diff.created[0]).unwrap();
+        assert!(label.center().x.abs() < 1e-12, "{label:?}");
+        assert!((label.center().y - 2.2).abs() < 1e-12, "{label:?}");
+    }
+
+    /// Every refusal is atomic: nothing is created, whatever failed. The
+    /// geometry is computed before either node is inserted, so a model that
+    /// sends a bad `length` retries against the scene it had, not half a
+    /// callout.
+    #[test]
+    fn annotate_refuses_before_creating_anything() {
+        let bare = scene();
+        let mut bare = bare;
+        let id = square(&mut bare, [0.0, 0.0]);
+        let before = bare.tree.len();
+        assert!(
+            matches!(
+                bare.handle(&annotate(id, None, None, None, None)),
+                Err(CommandError::Unsupported { ref feature }) if feature == "text"
+            ),
+            "a build with no typesetter cannot typeset a label"
+        );
+        assert_eq!(bare.tree.len(), before);
+
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let subject = square(&mut ctx, [0.0, 0.0]);
+        let before = ctx.tree.len();
+        assert!(matches!(
+            ctx.handle(&annotate(subject, None, None, Some(0.0), None)),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "length"
+        ));
+        assert!(matches!(
+            ctx.handle(&Command::Annotate {
+                target: "无".into(),
+                text: "看这里".to_owned(),
+                direction: None,
+                buff: None,
+                length: None,
+                thickness: None,
+                arrow: None,
+                color: None,
+                size: None,
+                max_width: None,
+                label: None,
+            }),
+            Err(CommandError::NoSuchLabel { .. })
+        ));
+        assert_eq!(ctx.tree.len(), before, "a refused callout creates nothing");
     }
 
     // ---- the camera -------------------------------------------------------
