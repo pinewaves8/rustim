@@ -46,3 +46,36 @@ fn self_voicing_refuses_the_headless_modes() {
         );
     }
 }
+
+/// `--voice` is a property of a sentence, not a mode of its own. A run that
+/// named a voice and then said nothing would look like it had worked.
+#[test]
+fn a_voice_without_speaking_is_refused() {
+    for args in [
+        &["--voice", "cmn"][..],
+        &["--voice"][..],
+        &["--voice", ""][..],
+    ] {
+        let out = run(args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?} should have been a refusal"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{args:?} wrote to stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("--voice"),
+            "{args:?} refused for the wrong reason: {err}"
+        );
+    }
+    // A flag-shaped token is not a voice name; without this it would be
+    // swallowed and the refusal below would name the wrong problem.
+    let out = run(&["--voice", "--speak"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--voice takes a voice name"));
+}

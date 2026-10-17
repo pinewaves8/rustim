@@ -2056,6 +2056,7 @@ fn main() {
     let mut probe = false;
     let mut captions = false;
     let mut speak = false;
+    let mut voice: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2136,12 +2137,27 @@ fn main() {
                 speak = true;
                 i += 1;
             }
+            // A voice name is backend vocabulary, not engine vocabulary: the
+            // `cmn` that fixes Mandarin under espeak-ng is not what macOS's
+            // `say` calls it. So the value is forwarded verbatim and never
+            // validated here. A leading `-` is refused because the next token
+            // would otherwise be swallowed as a voice name.
+            "--voice" => match args.get(i + 1) {
+                Some(name) if !name.is_empty() && !name.starts_with('-') => {
+                    voice = Some(name.clone());
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("--voice takes a voice name, such as `cmn` or `Tingting`");
+                    std::process::exit(2);
+                }
+            },
             "--help" | "-h" => {
                 println!(
                     "rustim-app [--frames N] \
                      [--png OUT.png | --video OUT.mp4 | --video-png DIR | --inspect | --a11y-probe] \
                      [--srt OUT.srt] [--scene NAME] [--motion full|reduced] \
-                     [--script PATH|-] [--reply] [--captions] [--speak]"
+                     [--script PATH|-] [--reply] [--captions] [--speak [--voice NAME]]"
                 );
                 println!("scenes: {}", scene_names());
                 println!("--inspect: print the accessibility tree as JSON to stdout");
@@ -2173,6 +2189,12 @@ fn main() {
                 println!(
                     "--speak: read the same text aloud with the platform's speech \
                      synthesiser (silent while a screen reader is attached)"
+                );
+                println!(
+                    "--voice: with --speak, name the synthesiser's voice; the value is the \
+                     backend's own (`cmn` for Mandarin in espeak-ng, `Tingting` in macOS \
+                     `say`), and the default is the system's, which may read Chinese text \
+                     one character at a time"
                 );
                 println!(
                     "--a11y-probe: open a window, offer one announcement, and report on stderr \
@@ -2266,6 +2288,12 @@ fn main() {
     // be cut off. Same discipline as `--a11y-probe`.
     if speak && (inspect || png.is_some() || exporting_video) {
         eprintln!("--speak needs the window; a headless run has no time to speak during");
+        std::process::exit(2);
+    }
+    // A voice only exists relative to a sentence. Accepting `--voice` alone
+    // would look like the run had chosen a voice and then said nothing.
+    if voice.is_some() && !speak {
+        eprintln!("--voice changes how --speak sounds; without it there is nothing to say");
         std::process::exit(2);
     }
 
@@ -2605,7 +2633,7 @@ fn main() {
                     .and_then(|path| rustim_app::speech::find_any_in(&path, platform.programs()));
                 match found {
                     Some((program, _)) => Some(rustim_app::speech::Speaker::spawn(
-                        rustim_app::speech::ProcessVoice::new(program, platform),
+                        rustim_app::speech::ProcessVoice::new(program, platform, voice),
                     )),
                     None => {
                         eprintln!("{}", rustim_app::speech::missing_report(platform));

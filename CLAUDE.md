@@ -40,7 +40,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **628 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **631 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -115,6 +115,7 @@ cargo run -p rustim-app -- --scene axes --png out.png  # axes, ticks, a plot and
 cargo run -p rustim-app -- --motion reduced  # ignore the platform "reduce motion" preference
 cargo run -p rustim-app -- --captions --png out.png  # ...and draw the live region's sentence on it
 cargo run -p rustim-app -- --speak --frames 300      # self-voicing (windowed only)
+cargo run -p rustim-app -- --speak --voice cmn       # ...in espeak-ng's Mandarin voice
 cargo run --release -p rustim-app -- --video out.mp4 --srt out.srt   # export 10 s via ffmpeg
 cargo run --release -p rustim-app -- --video-png frames/ --srt out.srt  # ...or numbered PNGs
 cargo run -p rustim-export --bin rustim-compare -- a.png b.png   # exit 0 pass / 1 fail / 2 cannot
@@ -1059,6 +1060,20 @@ and what the built-in voice speaks.**
   channel, because speech takes seconds and a frame takes milliseconds; dropping it stops at the end
   of the current sentence rather than joining. No backend is reported in one line and the run
   continues — a bare Linux is the common case, and captions still work.
+
+- **`--voice` is the host's half of self-voicing.** The backend's default voice is the
+  distribution's, and an English default on Chinese prose is not an accent: espeak-ng reads every
+  Han character as the words "Chinese letter", so a caption reading `场景 pythagorean，4 个对象` is
+  heard as a burst of "Chinese letter", one per character — which sounds like the engine repeating
+  itself and does not match the caption at all. `--voice NAME` forwards the name **verbatim**:
+  `-v NAME` for `espeak-ng`/`espeak` and `say`, `SelectVoice` for PowerShell's `System.Speech`,
+  because a voice name is backend vocabulary (`cmn` fixes Mandarin in espeak-ng; macOS's equivalent
+  is `Tingting`) and this module cannot know which names a machine has. On Windows the name travels
+  in the `RUSTIM_VOICE` environment variable rather than being spliced into the `-Command` string:
+  it is host input, and the command string is not a place to quote it. `--voice` without `--speak`
+  is a refusal (exit 2), like `--srt` without a video mode. The module still never picks a voice on
+  its own — auto-detection would need each backend's listing syntax, and a hard-coded `-v cmn` breaks
+  every machine that lacks it.
 
 - **A screen reader wins.** `--speak` goes silent once `full_pushes + incremental_pushes > 0`, i.e.
   once an assistive technology has ever attached (the counters only move inside `update_if_active`),
@@ -2181,10 +2196,11 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   differ from a plain still are in the bottom band. Step 16 added `--speak` on `espeak-ng` / `say` /
   PowerShell's `System.Speech`, with the sentence on stdin, a speaker thread so the frame loop never
   blocks, and the built-in voice yielding to a screen reader that has ever attached. The `.srt`
-  export it deferred landed with video export (the next bullet). Still deferred: a user-selectable
-  voice (the default is the distribution's; hard-coding `-v cmn` breaks machines without that
-  voice), `piper`, and captions that follow the camera or scale with DPI — 24 px is the determinism
-  promise.
+  export it deferred landed with video export (the next bullet). The user-selectable voice it
+  deferred landed as **`--voice NAME`** (see "Narration, captions and self-voicing"): the name is
+  the backend's own and is forwarded, never chosen. Still deferred: automatic voice detection (a
+  hard-coded `-v cmn` breaks machines without that voice), `piper`, and captions that follow the
+  camera or scale with DPI — 24 px is the determinism promise.
 - **P3's video export and the visual-regression CLI are done**, and the split is the design:
   `rustim-export` gained the `VideoSink` seam with an `ffmpeg` pipe and a PNG-sequence fallback, the
   `srt` writer, and the `rustim-compare` binary over the existing `compare`; `rustim-app` gained

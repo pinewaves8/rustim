@@ -22,13 +22,25 @@
 //! pure function precisely so that this property can be asserted for all three
 //! platforms on any one of them.
 //!
-//! # What it does not promise
+//! # Choosing a voice
 //!
-//! `espeak-ng`'s default voice is whatever the distribution configured, and it is
-//! often an English voice reading Chinese text. Choosing a voice is deliberately
-//! out of scope: hard-coding `-v cmn` would break every machine that has no such
-//! voice installed, and there is no portable way to ask. A host that cares sets
-//! its own default. `piper` (a neural synthesiser needing downloaded model files)
+//! The backend's **default voice** is whatever the distribution configured, and
+//! it is often an English voice. That is not merely an accent: `espeak-ng` with
+//! an English voice reads every Han character as the words "Chinese letter", so
+//! `场景 pythagorean，4 个对象` is heard as a burst of "Chinese letter …
+//! pythagorean for Chinese letter Chinese letter Chinese letter Chinese letter"
+//! while the caption shows the sentence. It sounds like the engine is repeating
+//! itself; it is the voice saying one word per character.
+//!
+//! `--voice NAME` forwards the host's choice to whichever backend was found:
+//! `-v NAME` as one argument for `espeak-ng`/`espeak` and macOS's `say`, and
+//! `SpeechSynthesizer.SelectVoice` on Windows. The Windows name travels in an
+//! **environment variable**, [`VOICE_ENV`], rather than being spliced into the
+//! PowerShell one-liner — a voice name is host input, and the command string is
+//! not the place to quote it. The module never picks a voice on its own: asking
+//! whether a Mandarin voice exists means knowing each backend's listing syntax
+//! (`espeak-ng --voices=zh`), and hard-coding `-v cmn` would break every machine
+//! that lacks it. `piper` (a neural synthesiser needing downloaded model files)
 //! is named in the design document as a future backend and is not implemented
 //! here.
 
@@ -82,6 +94,12 @@ impl Platform {
     }
 }
 
+/// The environment variable that carries a Windows voice name.
+///
+/// Public so the tests and the documentation name the same thing. It is set on
+/// the child process only; the module never touches the parent's environment.
+pub const VOICE_ENV: &str = "RUSTIM_VOICE";
+
 /// How to invoke one utterance on one platform.
 ///
 /// The program is a name here, not a resolved path: [`find`] does the resolution
@@ -91,31 +109,66 @@ impl Platform {
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
+    /// Variables to set for the child, as `(name, value)`.
+    pub env: Vec<(String, String)>,
     /// What to write to the child's standard input before closing it.
     pub stdin: String,
 }
 
-/// The command for one line of speech.
+/// The command for one line of speech, optionally in a named voice.
 ///
 /// Pure, so the same three platforms can be checked from any one of them. All
 /// three read the text from **standard input**: `espeak-ng --stdin`, `say` with
 /// no file arguments (it reads stdin when there are none), and a PowerShell one-
 /// liner that reads `[Console]::In` to its end and hands it to the synthesiser.
-pub fn command_for(platform: Platform, program: &str, text: &str) -> CommandSpec {
-    let args: &[&str] = match platform {
-        Platform::Linux => &["--stdin"],
-        Platform::MacOs => &[],
-        Platform::Windows => &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Add-Type -AssemblyName System.Speech; (New-Object \
-             System.Speech.Synthesis.SpeechSynthesizer).Speak([Console]::In.ReadToEnd())",
-        ],
-    };
+///
+/// `voice` is forwarded verbatim; `None` leaves the backend's default alone. On
+/// Windows the name goes through [`VOICE_ENV`] so it is never part of the
+/// `-Command` string.
+pub fn command_for(
+    platform: Platform,
+    program: &str,
+    voice: Option<&str>,
+    text: &str,
+) -> CommandSpec {
+    let mut args: Vec<String> = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
+    match platform {
+        Platform::Linux => {
+            if let Some(voice) = voice {
+                args.push("-v".to_owned());
+                args.push(voice.to_owned());
+            }
+            args.push("--stdin".to_owned());
+        }
+        Platform::MacOs => {
+            if let Some(voice) = voice {
+                args.push("-v".to_owned());
+                args.push(voice.to_owned());
+            }
+        }
+        Platform::Windows => {
+            args.extend(
+                [
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Add-Type -AssemblyName System.Speech; $s = New-Object \
+                     System.Speech.Synthesis.SpeechSynthesizer; if ($env:RUSTIM_VOICE) \
+                     { $s.SelectVoice($env:RUSTIM_VOICE) }; $s.Speak([Console]::In.ReadToEnd())",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            if let Some(voice) = voice {
+                env.push((VOICE_ENV.to_owned(), voice.to_owned()));
+            }
+        }
+    }
     CommandSpec {
         program: program.to_owned(),
-        args: args.iter().map(|a| (*a).to_owned()).collect(),
+        args,
+        env,
         stdin: text.to_owned(),
     }
 }
@@ -193,14 +246,19 @@ pub trait Voice: Send {
 pub struct ProcessVoice {
     program: PathBuf,
     platform: Platform,
+    voice: Option<String>,
     disabled: bool,
 }
 
 impl ProcessVoice {
-    pub fn new(program: PathBuf, platform: Platform) -> Self {
+    /// `voice` is the backend's own voice name (`cmn`, `en-us`, `Tingting`, …);
+    /// `None` keeps the distribution's default. The name is not validated here
+    /// — the backend knows its own vocabulary, and a wrong name is its refusal.
+    pub fn new(program: PathBuf, platform: Platform, voice: Option<String>) -> Self {
         Self {
             program,
             platform,
+            voice,
             disabled: false,
         }
     }
@@ -213,9 +271,10 @@ impl Voice for ProcessVoice {
         }
         // The program field of the spec is a name for the pure test; the spawn
         // below uses the resolved path instead.
-        let spec = command_for(self.platform, "", text);
+        let spec = command_for(self.platform, "", self.voice.as_deref(), text);
         let spawned = Command::new(&self.program)
             .args(&spec.args)
+            .envs(spec.env.iter().map(|(name, value)| (name, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -322,31 +381,102 @@ mod tests {
     #[test]
     fn the_text_is_on_stdin_and_never_in_the_arguments() {
         for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
-            let spec = command_for(platform, "voice", SAID);
-            assert_eq!(spec.stdin, SAID, "{platform:?}");
-            assert!(
-                spec.args.iter().all(|arg| !arg.contains(SAID)),
-                "{platform:?} put the sentence on the command line: {:?}",
-                spec.args
-            );
-            assert!(
-                spec.args.iter().all(|arg| !arg.contains("直角")),
-                "{platform:?} put part of the sentence on the command line"
-            );
+            for voice in [None, Some("cmn")] {
+                let spec = command_for(platform, "voice", voice, SAID);
+                assert_eq!(spec.stdin, SAID, "{platform:?}");
+                assert!(
+                    spec.args.iter().all(|arg| !arg.contains(SAID)),
+                    "{platform:?} put the sentence on the command line: {:?}",
+                    spec.args
+                );
+                assert!(
+                    spec.args.iter().all(|arg| !arg.contains("直角")),
+                    "{platform:?} put part of the sentence on the command line"
+                );
+                assert!(
+                    spec.env.iter().all(|(_, value)| !value.contains(SAID)),
+                    "{platform:?} put the sentence in the environment: {:?}",
+                    spec.env
+                );
+            }
         }
     }
 
     #[test]
     fn each_platform_runs_the_backend_it_has() {
         assert_eq!(
-            command_for(Platform::Linux, "espeak-ng", SAID).args,
+            command_for(Platform::Linux, "espeak-ng", None, SAID).args,
             ["--stdin"]
         );
-        assert!(command_for(Platform::MacOs, "say", SAID).args.is_empty());
-        let windows = command_for(Platform::Windows, "powershell", SAID);
+        assert!(
+            command_for(Platform::MacOs, "say", None, SAID)
+                .args
+                .is_empty()
+        );
+        let windows = command_for(Platform::Windows, "powershell", None, SAID);
         assert_eq!(&windows.args[..2], ["-NoProfile", "-NonInteractive"]);
         assert!(windows.args[3].contains("System.Speech"));
         assert!(windows.args[3].contains("[Console]::In.ReadToEnd()"));
+    }
+
+    /// The voice name is the host's, and each backend spells it its own way:
+    /// an argument with no quoting to get wrong on the two Unix platforms, and
+    /// an environment variable on Windows so it is never spliced into the
+    /// `-Command` string.
+    #[test]
+    fn a_named_voice_reaches_the_backend_without_touching_the_text() {
+        let linux = command_for(Platform::Linux, "espeak-ng", Some("cmn"), SAID);
+        assert_eq!(linux.args, ["-v", "cmn", "--stdin"]);
+        assert!(linux.env.is_empty());
+
+        let macos = command_for(Platform::MacOs, "say", Some("Tingting"), SAID);
+        assert_eq!(macos.args, ["-v", "Tingting"]);
+        assert!(macos.env.is_empty());
+
+        let windows = command_for(Platform::Windows, "powershell", Some("Tingting"), SAID);
+        assert_eq!(windows.env, [(VOICE_ENV.to_owned(), "Tingting".to_owned())]);
+        assert!(
+            windows.args[3].contains("$env:RUSTIM_VOICE"),
+            "the voice never reaches the child: {:?}",
+            windows.args
+        );
+        assert!(
+            !windows.args.iter().any(|arg| arg.contains("Tingting")),
+            "the voice was spliced into the PowerShell command: {:?}",
+            windows.args
+        );
+    }
+
+    /// What the previous test proves about the spec, this proves about the
+    /// spawn: `ProcessVoice` must use the spec it was configured with. Unix
+    /// only, because the fake backend is a shell script.
+    #[cfg(unix)]
+    #[test]
+    fn process_voice_passes_the_voice_and_the_text_on_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_dir("spawn");
+        let program = dir.join("fake-voice");
+        // `$0` keeps the shell script free of interpolated paths, so a temp
+        // directory with a quote or a space in it cannot break the fixture.
+        let args_out = dir.join("fake-voice.args");
+        let stdin_out = dir.join("fake-voice.stdin");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat > \"$0.stdin\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut voice = ProcessVoice::new(program, Platform::Linux, Some("cmn".to_owned()));
+        voice.speak(SAID);
+
+        let args = std::fs::read_to_string(&args_out).unwrap();
+        assert_eq!(args, "-v\ncmn\n--stdin\n");
+        let stdin = std::fs::read_to_string(&stdin_out).unwrap();
+        assert_eq!(stdin, format!("{SAID}\n"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
