@@ -372,6 +372,53 @@ fn playback_controls_answer_with_empty_diffs() {
     finish(client, &png);
 }
 
+/// A checkpoint is a mark (empty diff) and an undo is the one host-answered
+/// command whose diff names nodes. With the stack empty the answer is a state
+/// refusal, not a bad-field one, and the feed continues.
+#[test]
+fn checkpoint_and_undo_answer_with_the_change_they_made() {
+    let (mut client, png) = client("checkpoint");
+
+    let circle = expect_diff(
+        &mut client,
+        r#"{"action":"add","type":"circle","params":{"radius":1.0,"label":"圆"}}"#,
+    );
+    assert_eq!(circle.created.len(), 1);
+    assert!(
+        expect_diff(&mut client, r#"{"action":"checkpoint"}"#).is_empty(),
+        "a mark changes nothing in the tree"
+    );
+
+    let square = expect_diff(
+        &mut client,
+        r#"{"action":"add","type":"square","params":{"width":1.0}}"#,
+    );
+    assert_eq!(square.created.len(), 1);
+
+    let undone = expect_diff(&mut client, r#"{"action":"undo"}"#);
+    assert_eq!(
+        undone.removed, square.created,
+        "the undo must name the square"
+    );
+    assert!(undone.created.is_empty() && undone.modified.is_empty());
+
+    let reply = client
+        .send_raw(r#"{"action":"undo"}"#)
+        .expect("a refusal is a reply");
+    let error = reply.error.expect("the stack holds one mark");
+    assert_eq!(format!("{error}"), "no checkpoint to restore");
+    assert!(reply.diff.is_none(), "a refusal carries no diff");
+
+    // The restored tree still answers for the object it kept, and the feed is
+    // unharmed.
+    let kept = expect_diff(
+        &mut client,
+        r#"{"action":"set","target":"圆","property":{"name":"opacity","value":0.5}}"#,
+    );
+    assert_eq!(kept.modified.len(), 1);
+    finish(client, &png);
+}
+
 /// A refusal is a value: it names what was wrong, it does not stop the feed, and
 /// it does not fail the run.
 #[test]

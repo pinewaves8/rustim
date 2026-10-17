@@ -185,6 +185,39 @@ pub enum Command {
     /// tempo command is safe mid-beat. Answered by [`crate::SceneContext::handle`]
     /// with an empty diff, because a speed is not a node.
     Tempo { factor: f64 },
+    /// Remember the session as it is now, so [`Command::Undo`] can come back.
+    ///
+    /// A checkpoint is the whole of what a handover needs: the scene tree (camera
+    /// included), the lecture clock, the pause and the tempo. It is a **stack**
+    /// of at most [`crate::SceneContext::MAX_CHECKPOINTS`] snapshots, so several
+    /// "before this step" marks can be taken and unwound newest first.
+    ///
+    /// What it deliberately does not carry is the timeline: queued and running
+    /// animations are values with captured state, and replaying them into a tree
+    /// they were not captured against is not a rewind but a different lecture.
+    /// An undo therefore interrupts, exactly as `stop` does, and the restored
+    /// snapshot is the state to script from.
+    ///
+    /// Answered by [`crate::SceneContext::handle`] with an empty diff: a
+    /// checkpoint changes nothing a host can observe.
+    Checkpoint,
+    /// Restore the most recent [`Command::Checkpoint`] and report what moved.
+    ///
+    /// The reply is the one host-answered command whose diff is **not** empty,
+    /// and honestly so: an undo replaces the tree, so `created` lists the nodes
+    /// the snapshot brings back, `removed` lists the ones the abandoned present
+    /// had and the snapshot does not, and `modified` lists the survivors whose
+    /// state differs. An id that disappears here is **retired**: it can never be
+    /// issued again in this session, so a host that kept it gets `no_such_node`
+    /// rather than a different object wearing the old id.
+    ///
+    /// Three things it does not unwind, because they are not state a snapshot
+    /// can hold: narration already spoken (sound is not a tape), the animations
+    /// it interrupts (see [`Command::Checkpoint`]), and the checkpoint stack
+    /// itself — an undo consumes the entry it restores. With nothing to restore
+    /// it refuses with [`CommandError::NoCheckpoint`], a state error rather than
+    /// a malformed payload.
+    Undo,
     /// Point the camera, now or over a beat.
     ///
     /// All four fields are optional and omitted when absent, like every other
@@ -785,6 +818,16 @@ pub enum CommandError {
     Typeset {
         detail: String,
     },
+    /// There is no checkpoint to restore.
+    ///
+    /// A *state* error rather than a bad value: the payload of `undo` was never
+    /// wrong, the session simply has no earlier state to come back to, and the
+    /// fix is to take a `checkpoint` (before the next risky step) rather than to
+    /// rephrase anything. Kept apart from [`CommandError::OutOfRange`] for the
+    /// same reason [`CommandError::NoSuchLabel`] is kept apart from
+    /// [`CommandError::NoSuchNode`]: a host reading a log has to tell a model's
+    /// mistake from the session's history.
+    NoCheckpoint,
     /// The request was not a command at all — whoever read the wire could not
     /// turn it into one, and [`parse_command`] says why.
     ///
@@ -825,6 +868,7 @@ impl std::fmt::Display for CommandError {
                 write!(f, "this build does not support {feature}")
             }
             Self::Typeset { detail } => write!(f, "typesetting failed: {detail}"),
+            Self::NoCheckpoint => write!(f, "no checkpoint to restore"),
             Self::Unparseable { detail } => write!(f, "not a command: {detail}"),
         }
     }
@@ -1100,12 +1144,18 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // tree this function may touch. The arm keeps `apply` total, so a
             // caller driving it directly replays the same log without a panic.
         }
-        Command::Pause | Command::Resume | Command::Seek { .. } | Command::Tempo { .. } => {
-            // Playback controls. The pause flag, the tempo and the fast-forward
-            // all live on the `SceneContext` beside the clock they govern; the
-            // tree can express none of them. Keeping the arms is what lets a
-            // direct `apply` caller replay a whole session log — including the
-            // controls — without a panic.
+        Command::Pause
+        | Command::Resume
+        | Command::Seek { .. }
+        | Command::Tempo { .. }
+        | Command::Checkpoint
+        | Command::Undo => {
+            // Playback and session controls. The pause flag, the tempo, the
+            // fast-forward and the checkpoint stack all live on the
+            // `SceneContext` beside the clock they govern; the tree can express
+            // none of them. Keeping the arms is what lets a direct `apply`
+            // caller replay a whole session log — including the controls —
+            // without a panic.
         }
         Command::Camera { .. } => {
             // Likewise answered by `SceneContext::handle`: resolving `focus` needs
@@ -1886,6 +1936,9 @@ mod tests {
             r#"{"action":"resume"}"#.to_owned(),
             r#"{"action":"seek","to":6.5}"#.to_owned(),
             r#"{"action":"tempo","factor":2.0}"#.to_owned(),
+            // The session pair: both unit variants, so both are the bare tag.
+            r#"{"action":"checkpoint"}"#.to_owned(),
+            r#"{"action":"undo"}"#.to_owned(),
             // The handshake, in both spellings. An absent `protocol` is a client
             // that does not claim a version, and it must not come back as a
             // `null`; a *mismatched* version still parses — the refusal belongs
@@ -1934,6 +1987,8 @@ mod tests {
             Command::Resume,
             Command::Seek { to: 2.0 },
             Command::Tempo { factor: 2.0 },
+            Command::Checkpoint,
+            Command::Undo,
             Command::Motion {
                 mode: MotionMode::Reduced,
             },

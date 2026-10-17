@@ -56,6 +56,21 @@ pub trait Scene {
     }
 }
 
+/// One [`SceneContext::checkpoint`]: everything an undo restores.
+///
+/// The tree is the bulk of it, and the other four fields are the run state the
+/// tree cannot express — the lecture clock a restored picture is at, and the
+/// playback policy it was being shown under. The timeline is deliberately
+/// absent: queued and running animations are values with captured `begin`
+/// states, and there is no sound way to replay them against a different tree.
+struct Checkpoint {
+    tree: SceneTree,
+    clock: f64,
+    paused: bool,
+    tempo: f64,
+    motion: Motion,
+}
+
 /// Everything a scene is allowed to touch.
 ///
 /// The scene never sees a renderer, a window or a file. It mutates this context
@@ -128,6 +143,13 @@ pub struct SceneContext {
     /// [`SceneContext::take_narration`] may drain it — a host that read it
     /// directly would have to reproduce the "due at or before the clock" rule.
     narration: Vec<(f64, String)>,
+    /// The session snapshots [`SceneContext::undo`] unwinds, newest last.
+    ///
+    /// Private because the stack is only useful through the two named methods:
+    /// a host that popped it by hand would have to reproduce the retirement and
+    /// diff rules itself, and a second copy of "what an undo means" is the thing
+    /// this layer is meant to own.
+    checkpoints: Vec<Checkpoint>,
     /// Whatever this host typesets with, or nothing at all.
     ///
     /// The shaper is not a kernel dependency (see [`crate::typeset`]), so the
@@ -157,6 +179,7 @@ impl SceneContext {
             playback: Sequence::new(),
             clock: 0.0,
             narration: Vec::new(),
+            checkpoints: Vec::new(),
             typesetter: None,
         }
     }
@@ -348,6 +371,93 @@ impl SceneContext {
     /// `SEEK_STEP`, and a model that asks to skip an hour must be told no in
     /// one reply instead of holding the connection while 216 000 frames run.
     pub const MAX_SEEK_SECONDS: f64 = 600.0;
+
+    /// How many [`SceneContext::checkpoint`] snapshots are kept.
+    ///
+    /// A bound rather than a warning. A snapshot is a deep copy of the tree —
+    /// cheap per object, unbounded per scene — and a session that checkpointed
+    /// every command would grow without limit if the stack did. Sixteen steps of
+    /// history is more than a lecture needs; the oldest is dropped, which is
+    /// what "undo the last thing" needs and no more.
+    pub const MAX_CHECKPOINTS: usize = 16;
+
+    /// Remember the session as it is, so [`SceneContext::undo`] can return.
+    ///
+    /// The snapshot is the tree with its camera, the lecture clock, the pause
+    /// and the tempo. It is a stack: several marks can be taken and unwound
+    /// newest first, capped at [`SceneContext::MAX_CHECKPOINTS`] with the oldest
+    /// dropped.
+    ///
+    /// The *timeline* is not captured, deliberately. A queued beat is a boxed
+    /// animation that captured its start state in `begin`; replaying it into a
+    /// restored tree would apply a motion measured against a picture that no
+    /// longer exists. An undo therefore interrupts, exactly as
+    /// [`SceneContext::stop`] does, and the restored snapshot is where scripting
+    /// resumes.
+    pub fn checkpoint(&mut self) {
+        if self.checkpoints.len() == Self::MAX_CHECKPOINTS {
+            self.checkpoints.remove(0);
+        }
+        self.checkpoints.push(Checkpoint {
+            tree: self.tree.clone(),
+            clock: self.clock,
+            paused: self.paused,
+            tempo: self.tempo,
+            motion: self.motion,
+        });
+    }
+
+    /// Restore the newest checkpoint and report what the restore changed.
+    ///
+    /// The diff is computed, not remembered: `created` is every node the
+    /// snapshot has and the present does not, `removed` is the reverse, and
+    /// `modified` is a survivor whose `Mobject` compares unequal to its past —
+    /// so an undo after a `set` names the object, and an undo that only dropped
+    /// a temporary addition names that one. Order follows draw order on the side
+    /// each id came from, so a replay produces the same diff.
+    ///
+    /// Two behaviours are load-bearing. **Playback is interrupted**, not
+    /// rewound: an animation in flight is cleared without `finish`, for
+    /// [`SceneContext::stop`]'s reason and because its `begin` captured a tree
+    /// the restore replaces. And **the abandoned present is retired**: every id
+    /// the current tree handed out is remembered by the restored tree, so a host
+    /// still holding one gets `no_such_node` rather than a different object
+    /// wearing the old id — the generational promise, preserved across a clone
+    /// that would otherwise rewind the slot versions.
+    ///
+    /// Narration already spoken is not unspoken (sound is not a tape), and
+    /// lines still queued keep their due times on the restored clock. The
+    /// snapshot being restored is consumed; a second undo steps one checkpoint
+    /// further back, and with none left the answer is
+    /// [`CommandError::NoCheckpoint`].
+    pub fn undo(&mut self) -> Result<StateDiff, CommandError> {
+        let checkpoint = self.checkpoints.pop().ok_or(CommandError::NoCheckpoint)?;
+        self.stop();
+
+        let mut diff = StateDiff::default();
+        for id in self.tree.draw_order() {
+            match (self.tree.get(id), checkpoint.tree.get(id)) {
+                (Some(now), Some(past)) if !now.differs_from(past) => {}
+                (Some(_), Some(_)) => diff.modified.push(id),
+                (Some(_), None) => diff.removed.push(id),
+                (None, _) => {}
+            }
+        }
+        for id in checkpoint.tree.draw_order() {
+            if self.tree.get(id).is_none() {
+                diff.created.push(id);
+            }
+        }
+
+        let mut restored = checkpoint.tree;
+        restored.retire_ids_of(&self.tree);
+        self.tree = restored;
+        self.clock = checkpoint.clock;
+        self.paused = checkpoint.paused;
+        self.tempo = checkpoint.tempo;
+        self.motion = checkpoint.motion;
+        Ok(diff)
+    }
 
     /// Play the timeline at a different speed from now on.
     ///
@@ -541,6 +651,11 @@ impl SceneContext {
         // over for the same reason — the new scene's `at: 0` means *its* zero.
         self.clock = 0.0;
         self.narration.clear();
+        // A snapshot of the previous scene is not history for the new one:
+        // undoing into a tree the script never built would put back objects
+        // whose ids the new scene has already retired, and the host asking for
+        // that intended `reset`, not time travel across a rewrite.
+        self.checkpoints.clear();
         // A fresh run plays: a scene rewritten while the previous one was held
         // must not come up frozen at a speed nobody asked for. The pause and the
         // tempo belong to the *run*, like the clock they scale.
@@ -552,7 +667,8 @@ impl SceneContext {
     ///
     /// [`Command::Hello`], [`Command::Play`], [`Command::Stop`],
     /// [`Command::Pause`], [`Command::Resume`], [`Command::Tempo`],
-    /// [`Command::Seek`], [`Command::Camera`], [`Command::Motion`],
+    /// [`Command::Seek`], [`Command::Checkpoint`], [`Command::Undo`],
+    /// [`Command::Camera`], [`Command::Motion`],
     /// [`Command::Narrate`] and [`Command::Query`] are answered **here** rather
     /// than in `command::apply`:
     /// a hello answers with capabilities rather than a diff — a shape `apply`
@@ -573,6 +689,15 @@ impl SceneContext {
     /// empty diff: the timeline ends where the last frame left it, and no
     /// `finish` runs — see that method for what an interrupt deliberately does
     /// *not* do.
+    ///
+    /// A [`Command::Checkpoint`] pushes a snapshot and answers with an empty
+    /// diff (a mark changes nothing); a [`Command::Undo`] restores the newest
+    /// one and is the **only** host-answered command whose diff names nodes.
+    /// Both need this context rather than the tree — the snapshot is the tree
+    /// *with* its camera, clock, pause and tempo — and an undo interrupts
+    /// playback, so it needs the scheduler and the queue too. See
+    /// [`SceneContext::checkpoint`] and [`SceneContext::undo`] for what is and
+    /// is not captured.
     ///
     /// A camera command without a `duration` writes `tree.camera` now; one with a
     /// duration (including `0.0`) queues a single `CameraMove` beat, so it is
@@ -684,6 +809,16 @@ impl SceneContext {
         if let Command::Seek { to } = cmd {
             self.seek(*to)?;
             return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Checkpoint = cmd {
+            self.checkpoint();
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Undo = cmd {
+            // The one host-answered command whose diff is *not* empty, and
+            // honestly so: restoring a tree changes it, so the reply has to say
+            // what moved or a host would have to re-query to find out.
+            return self.undo().map(CommandOutcome::Applied);
         }
         if let Command::Motion { mode } = cmd {
             self.motion = (*mode).into();
@@ -2619,6 +2754,15 @@ mod playback_control_tests {
         ctx.handle(cmd).expect("a well-formed command");
     }
 
+    /// `handle` keeping the diff. The controls above answer with empty ones and
+    /// discard them; an undo is the command whose reply has to be read.
+    fn applied_diff(ctx: &mut SceneContext, cmd: &Command) -> StateDiff {
+        match ctx.handle(cmd).expect("a well-formed command") {
+            CommandOutcome::Applied(diff) => diff,
+            _ => panic!("a mutation is not a read"),
+        }
+    }
+
     /// A pause stops the beat and the clock together, and a resume continues
     /// from exactly where they stopped — not from where the pause began, and not
     /// from where the timeline would have been had nobody paused it.
@@ -2918,5 +3062,261 @@ mod playback_control_tests {
                 _ => panic!("a control is not a read"),
             }
         }
+    }
+
+    fn square(ctx: &mut SceneContext) -> NodeId {
+        ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ))
+    }
+
+    /// A mark changes nothing and says so; the undo that follows names exactly
+    /// what moved — the object added since, and the one whose opacity was
+    /// written.
+    ///
+    /// The diff is computed rather than remembered, which is why both halves are
+    /// in one test: a remembered diff could be right about the removal and wrong
+    /// about the property, and the tree would still look correct.
+    #[test]
+    fn undo_restores_the_tree_and_names_what_moved() {
+        let mut ctx = scene();
+        let kept = square(&mut ctx);
+
+        assert_eq!(
+            applied_diff(&mut ctx, &Command::Checkpoint),
+            StateDiff::default(),
+            "a mark is not a tree change"
+        );
+        let added = square(&mut ctx);
+        applied_diff(
+            &mut ctx,
+            &Command::Set {
+                target: kept.into(),
+                property: command::Property::Opacity(0.25),
+            },
+        );
+
+        let diff = applied_diff(&mut ctx, &Command::Undo);
+        assert!(diff.created.is_empty(), "{diff:?}");
+        assert_eq!(diff.removed, vec![added]);
+        assert_eq!(diff.modified, vec![kept]);
+        assert!(ctx.tree.get(added).is_none(), "the undo kept the addition");
+        assert_eq!(opacity(&ctx, kept), 1.0, "the undo kept the write");
+    }
+
+    /// An object deleted after the mark comes back **under the id it had**.
+    /// The restored tree is a clone, so the slot versions were cloned too and
+    /// the ids are the ones the host already holds.
+    #[test]
+    fn undo_puts_a_removed_object_back_under_its_old_id() {
+        let mut ctx = scene();
+        let id = square(&mut ctx);
+        applied_diff(&mut ctx, &Command::Checkpoint);
+        applied_diff(&mut ctx, &Command::Remove { target: id.into() });
+        assert!(ctx.tree.get(id).is_none());
+
+        let diff = applied_diff(&mut ctx, &Command::Undo);
+        assert_eq!(diff.created, vec![id]);
+        assert!(diff.modified.is_empty(), "{diff:?}");
+        assert!(diff.removed.is_empty(), "{diff:?}");
+        assert_eq!(
+            ctx.tree.get(id).map(|m| m.id),
+            Some(id),
+            "the restored node answers under the old id"
+        );
+    }
+
+    /// The snapshot is the *session*, not just the tree: the clock, the pause,
+    /// the tempo and the motion policy all come back.
+    #[test]
+    fn undo_restores_the_clock_the_pause_the_tempo_and_the_motion_mode() {
+        let mut ctx = scene();
+        applied_diff(&mut ctx, &Command::Checkpoint);
+
+        tick(&mut ctx, 60);
+        assert!((ctx.clock() - 1.0).abs() < 1e-12);
+        applied_diff(&mut ctx, &Command::Pause);
+        applied_diff(&mut ctx, &Command::Tempo { factor: 2.0 });
+        applied_diff(
+            &mut ctx,
+            &Command::Motion {
+                mode: command::MotionMode::Reduced,
+            },
+        );
+
+        applied_diff(&mut ctx, &Command::Undo);
+        assert_eq!(ctx.clock(), 0.0);
+        assert!(!ctx.is_paused());
+        assert_eq!(ctx.tempo(), 1.0);
+        assert_eq!(ctx.motion, Motion::Full);
+
+        // And it plays again at the restored pace rather than staying frozen.
+        tick(&mut ctx, 30);
+        assert!((ctx.clock() - 0.5).abs() < 1e-12);
+    }
+
+    /// Undo interrupts rather than rewinding. The restored tree is exactly what
+    /// the mark saw — an animation in flight is cleared without `finish`, so a
+    /// `FadeOut` that half happened leaves its target at the checkpoint's
+    /// opacity rather than removed or half-faded.
+    ///
+    /// The semantic tree is the assertion because it is the same document a host
+    /// reads back: anything the restore got wrong about a label, a bound or the
+    /// camera shows up here, not only in the node count. The diff names the node
+    /// and it should: the half-played fade *did* change its opacity, so a host
+    /// mirroring the tree has to hear that the restore put it back.
+    #[test]
+    fn undo_interrupts_playback_and_restores_the_snapshot_exactly() {
+        let mut ctx = scene();
+        let id = square(&mut ctx);
+        let before = ctx.semantic_tree(None);
+        applied_diff(&mut ctx, &Command::Checkpoint);
+
+        ctx.play(FadeOut::new(id).with_duration(1.0));
+        tick(&mut ctx, 30);
+        assert!(ctx.is_playing());
+        let half = opacity(&ctx, id);
+        assert!(half > 0.0 && half < 1.0, "opacity {half} is not mid-fade");
+
+        let diff = applied_diff(&mut ctx, &Command::Undo);
+        assert_eq!(diff.modified, vec![id]);
+        assert!(
+            diff.created.is_empty() && diff.removed.is_empty(),
+            "{diff:?}"
+        );
+        assert!(!ctx.is_playing(), "the abandoned beat was left running");
+        assert_eq!(ctx.semantic_tree(None), before);
+        assert_eq!(opacity(&ctx, id), 1.0);
+
+        // The cleared animation does not creep afterwards: it was dropped, not
+        // paused.
+        tick(&mut ctx, 120);
+        assert_eq!(opacity(&ctx, id), 1.0);
+    }
+
+    /// A node created after the mark is not handed out again. Cloning a tree
+    /// clones its slot versions, so without the retirement set the next `add`
+    /// would reuse the abandoned id and a host still holding it would silently
+    /// address a different object.
+    #[test]
+    fn an_id_from_the_abandoned_future_is_never_handed_out_again() {
+        let mut ctx = scene();
+        applied_diff(&mut ctx, &Command::Checkpoint);
+        let gone = square(&mut ctx);
+        applied_diff(&mut ctx, &Command::Undo);
+
+        let fresh = square(&mut ctx);
+        assert_ne!(fresh, gone, "the undone id was reissued");
+        // And naming the dead id is a clean refusal, not a hit on the new node.
+        let err = ctx
+            .handle(&Command::Set {
+                target: gone.into(),
+                property: command::Property::Opacity(0.5),
+            })
+            .expect_err("the id was retired");
+        assert!(matches!(err, CommandError::NoSuchNode { .. }), "{err:?}");
+    }
+
+    /// Several marks unwind newest first, one snapshot per undo.
+    #[test]
+    fn checkpoints_unwind_newest_first() {
+        let mut ctx = scene();
+        let a = square(&mut ctx);
+        applied_diff(&mut ctx, &Command::Checkpoint);
+        let b = square(&mut ctx);
+        applied_diff(&mut ctx, &Command::Checkpoint);
+        let c = square(&mut ctx);
+
+        assert_eq!(applied_diff(&mut ctx, &Command::Undo).removed, vec![c]);
+        assert_eq!(applied_diff(&mut ctx, &Command::Undo).removed, vec![b]);
+        assert!(ctx.tree.get(a).is_some());
+        assert!(ctx.tree.get(b).is_none());
+        assert_eq!(
+            ctx.undo(),
+            Err(CommandError::NoCheckpoint),
+            "three marks, two objects after them"
+        );
+    }
+
+    /// The stack is bounded, and what it forgets is the *oldest* mark.
+    #[test]
+    fn the_checkpoint_stack_keeps_the_newest_and_drops_the_oldest() {
+        let mut ctx = scene();
+        for _ in 0..=SceneContext::MAX_CHECKPOINTS {
+            applied_diff(&mut ctx, &Command::Checkpoint);
+            square(&mut ctx);
+        }
+
+        for _ in 0..SceneContext::MAX_CHECKPOINTS {
+            applied_diff(&mut ctx, &Command::Undo);
+        }
+        assert_eq!(
+            ctx.root_ids().len(),
+            1,
+            "the state before the first add is not reachable"
+        );
+        assert_eq!(ctx.undo(), Err(CommandError::NoCheckpoint));
+    }
+
+    /// Without a mark the answer is a refusal naming the state, not a panic —
+    /// a model that sends an extra `undo` must be told what was wrong with it.
+    #[test]
+    fn undo_without_a_checkpoint_is_a_refusal() {
+        let mut ctx = scene();
+        let err = ctx.undo().expect_err("nothing was marked");
+        assert_eq!(err, CommandError::NoCheckpoint);
+        assert_eq!(format!("{err}"), "no checkpoint to restore");
+
+        let err = ctx
+            .handle(&Command::Undo)
+            .expect_err("the handler answers the same way");
+        assert_eq!(err, CommandError::NoCheckpoint);
+        // The mark itself is idempotent in effect: two marks and one undo leave
+        // the session at the same place, and the second undo works.
+        applied_diff(&mut ctx, &Command::Checkpoint);
+        applied_diff(&mut ctx, &Command::Checkpoint);
+        assert!(applied_diff(&mut ctx, &Command::Undo).is_empty());
+        assert!(applied_diff(&mut ctx, &Command::Undo).is_empty());
+        assert_eq!(ctx.undo(), Err(CommandError::NoCheckpoint));
+    }
+
+    /// A `set` that writes the value a property already had is not a
+    /// modification. The mobject's dirty flags are bookkeeping the draw-list
+    /// diff replaced, so an equality that read them would report a restore of a
+    /// no-op as a change.
+    #[test]
+    fn a_write_that_changed_nothing_is_not_a_modification() {
+        let mut ctx = scene();
+        let id = square(&mut ctx);
+        // A fresh object carries `DirtyFlags::ALL`; clearing them makes the
+        // no-op write below observable at all.
+        ctx.tree.get_mut(id).unwrap().dirty = Default::default();
+
+        applied_diff(&mut ctx, &Command::Checkpoint);
+        applied_diff(
+            &mut ctx,
+            &Command::Set {
+                target: id.into(),
+                property: command::Property::Opacity(1.0),
+            },
+        );
+        assert!(
+            ctx.tree.get(id).unwrap().dirty.any(),
+            "the premise: the write did dirty the object"
+        );
+
+        let diff = applied_diff(&mut ctx, &Command::Undo);
+        assert!(diff.is_empty(), "{diff:?}");
+    }
+
+    /// A reset is a new scene, not a step back: the old marks would restore a
+    /// tree the rewritten script never built.
+    #[test]
+    fn reset_forgets_the_history() {
+        let mut ctx = scene();
+        applied_diff(&mut ctx, &Command::Checkpoint);
+        ctx.reset();
+        assert_eq!(ctx.undo(), Err(CommandError::NoCheckpoint));
     }
 }

@@ -532,6 +532,132 @@ fn a_stop_drops_a_beat_before_it_starts() {
     );
 }
 
+/// **A checkpoint and an undo are a delete the picture never sees.** The circle
+/// added after the mark is gone from the still, which is byte-identical to the
+/// script without it, and the undo's reply names the removal — the one
+/// host-answered command whose diff is not empty.
+#[test]
+fn an_undo_takes_the_still_back_to_the_checkpoint() {
+    let add = r#"{"action":"add","type":"square","params":{"width":2.0,"label":"方块"}}"#;
+    // Off the square and outside its fill: two shapes of the default colour at
+    // the same place would make the counterfactual below a comparison of one
+    // picture with itself.
+    let extra = r#"{"action":"add","type":"circle","params":{"radius":0.5,"position":[3.0,0.0],"label":"圆"}}"#;
+
+    let plain = scratch("undo-plain", &format!("{add}\n"));
+    let unwound = scratch(
+        "undo-unwound",
+        &format!("{add}\n{{\"action\":\"checkpoint\"}}\n{extra}\n{{\"action\":\"undo\"}}\n"),
+    );
+    let kept = scratch(
+        "undo-kept",
+        &format!("{add}\n{{\"action\":\"checkpoint\"}}\n{extra}\n"),
+    );
+
+    let unwound_png = out_path("undo-unwound");
+    let ran = run(&[
+        "--script",
+        unwound.to_str().unwrap(),
+        "--reply",
+        "--png",
+        unwound_png.to_str().unwrap(),
+    ]);
+    ran.ok("--script … --reply --png with a checkpoint and an undo");
+    let replies = ran.replies();
+    assert_eq!(replies.len(), 4);
+    assert!(
+        replies[1]
+            .diff
+            .as_ref()
+            .expect("a mark is applied")
+            .is_empty(),
+        "a checkpoint changes nothing in the tree"
+    );
+    let diff = replies[3]
+        .diff
+        .as_ref()
+        .expect("an undo is applied, not refused");
+    assert_eq!(diff.removed.len(), 1, "the undo must name the circle");
+    assert!(
+        diff.created.is_empty() && diff.modified.is_empty(),
+        "{diff:?}"
+    );
+    assert!(replies.iter().all(|r| r.error.is_none()));
+
+    let plain_png = out_path("undo-plain");
+    run(&[
+        "--script",
+        plain.to_str().unwrap(),
+        "--png",
+        plain_png.to_str().unwrap(),
+    ])
+    .ok("--script … --png");
+
+    let tolerance = Tolerance::default();
+    let same =
+        compare_png_files(&unwound_png, &plain_png, &tolerance).expect("both files are one frame");
+    assert_eq!(
+        same.max,
+        0,
+        "the undo left a pixel of the abandoned circle behind.\n{}",
+        same.report(&tolerance),
+    );
+    assert!(same.diff_bbox.is_none());
+
+    // The counterfactual: the same script without the undo shows the circle, so
+    // the identity above is the undo's doing and not an inert `add`.
+    let kept_png = out_path("undo-kept");
+    run(&[
+        "--script",
+        kept.to_str().unwrap(),
+        "--png",
+        kept_png.to_str().unwrap(),
+    ])
+    .ok("--script … --png");
+    let different =
+        compare_png_files(&kept_png, &plain_png, &tolerance).expect("both files are one frame");
+    assert!(
+        different.max > 0,
+        "the counterfactual is broken: the kept circle is invisible"
+    );
+}
+
+/// An `undo` with nothing marked is a refusal that names the *state*, and the
+/// feed keeps going: the next line still creates its object.
+#[test]
+fn an_undo_without_a_checkpoint_is_refused_and_the_feed_continues() {
+    let add = r#"{"action":"add","type":"square","params":{"width":2.0,"label":"方块"}}"#;
+    let script = scratch(
+        "undo-none",
+        &format!("{{\"action\":\"undo\"}}\n{add}\n{{\"action\":\"undo\"}}\n"),
+    );
+    let png = out_path("undo-none");
+    let ran = run(&[
+        "--script",
+        script.to_str().unwrap(),
+        "--reply",
+        "--png",
+        png.to_str().unwrap(),
+    ]);
+    ran.ok("a refused undo must not fail the run");
+
+    let replies = ran.replies();
+    assert_eq!(replies.len(), 3);
+    for refused in [&replies[0], &replies[2]] {
+        let error = refused
+            .error
+            .as_ref()
+            .expect("an undo with no marks is a refusal");
+        assert_eq!(format!("{error}"), "no checkpoint to restore");
+        assert!(refused.diff.is_none(), "a refusal carries no diff");
+    }
+    let created = replies[1]
+        .diff
+        .as_ref()
+        .expect("the middle line was applied");
+    assert_eq!(created.created.len(), 1, "the feed stopped after a refusal");
+}
+
 /// **A pause holds a beat for the whole run**, which is a claim a still frame can
 /// make after all: the settle runs ten virtual seconds, and a paused scene does
 /// not spend one of them. The still is therefore exactly the script without the

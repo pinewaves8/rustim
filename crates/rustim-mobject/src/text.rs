@@ -28,7 +28,7 @@ use rustim_math::{Affine2, Rect, TextGlyph};
 /// The fields are deliberately the same three the renderer's `DrawOp::GlyphRun`
 /// carries, so the draw walk is a field-for-field projection rather than a
 /// translation with rules of its own.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextRun {
     pub font: FontData,
     /// Em size in world units — the units the run is drawn in under the
@@ -38,7 +38,7 @@ pub struct TextRun {
 }
 
 /// A shaped block: the layout box plus the runs that fill it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextBlock {
     /// The laid-out width in world units.
     pub width: f32,

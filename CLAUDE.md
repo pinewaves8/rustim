@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **707 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **722 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -2521,6 +2521,23 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   the controls change what time does, not what a settled frame is — and the count moved 688 → 707.
   Deferred, deliberately: backward seek (checkpoints), pause/position in the semantic tree (they
   are session state, not nodes), per-beat tempo ramps, and stepping frame-by-frame from the wire.
+- **Phase 1's fourth slice — `checkpoint` / `undo` — is done**, and it is the command pair that makes
+  `seek`'s forward-only limit acceptable: a session can mark where it was and come back. A snapshot
+  is the tree *with its camera*, the clock, the pause, the tempo and the motion mode; the stack holds
+  at most 16 with the oldest dropped. `undo` **interrupts** rather than rewinds — the queue and the
+  scheduler are cleared without `finish`, for `stop`'s reason and because a captured `begin` refers
+  to a tree the restore replaces — and answers with a **non-empty** diff, the only host-answered
+  command that does: `created`/`removed`/`modified` are computed by comparing the two trees with
+  `Mobject::differs_from`, which excludes the `dirty` bookkeeping so a no-op write is not a change.
+  The step's structural change is the anti-ABA set: `SceneTree: Clone` plus `retired: HashSet<NodeId>`,
+  because cloning slot versions would otherwise let a restored tree reissue the ids of the future it
+  abandoned — `insert` retries past retired ids, `retire_ids_of` records them at undo, and `clear()`
+  clears the set because a reset is not an undo. `CommandError::NoCheckpoint` is a *state* error, kept
+  apart from `OutOfRange` the way `NoSuchLabel` is kept apart from `NoSuchNode`. Deferred,
+  deliberately: redo (a second stack with its own invalidation rules), named checkpoints,
+  snapshotting the animation timeline itself, unwinding narration already spoken, and undoing across
+  a `reset` (there is nothing left to undo into). See "AI integration" for the semantics a driver
+  sees.
 
 ## AI integration
 
@@ -2610,10 +2627,15 @@ stays in sync) within `0.05..=16.0`; zero is `pause`, and out-of-range values ar
 under `factor`. Both `pause` and `tempo` are session state, deliberately absent from the semantic
 tree; `reset` returns to playing at 1×.
 
-`stop`, `pause`, `resume`, `seek`, `tempo`, `camera`, `motion` and `narrate` are the commands
-intercepted by `SceneContext::handle`
-rather than by the pure `command::apply`, and all eight return an **empty** `StateDiff` for `play`'s
-reason — the timeline, the view, the motion policy and a spoken line are not nodes. `camera` writes the view now or queues a
+**`checkpoint`** / **`undo`** are the session snapshot — see the "Session snapshots" paragraph
+below; `checkpoint` is a mark and answers with an empty diff, `undo` is the one host-answered
+command whose diff names nodes.
+
+`stop`, `pause`, `resume`, `seek`, `tempo`, `checkpoint`, `undo`, `camera`, `motion` and `narrate`
+are the commands intercepted by `SceneContext::handle`
+rather than by the pure `command::apply`; all but `undo` return an **empty** `StateDiff` for `play`'s
+reason — the timeline, the view, the motion policy and a spoken line are not nodes, and `undo`'s
+non-empty diff is the honest exception because restoring a tree *is* a tree change. `camera` writes the view now or queues a
 `CameraMove`; `motion` (`{"action":"motion","mode":"full"|"reduced"}`) writes the policy the **next
 beat started** will be given, without touching the beat already running; `narrate` queues a line on
 the narration track, due `at` seconds after it arrived (see "Narration, captions and
@@ -2634,6 +2656,36 @@ formulas and groups: the `Typesetter` seam"), and their availability is in `hell
 lecture is therefore `add` a sentence, `add` a formula, `play` the two beats, `narrate` the sentence
 — with no compiled scene at all. `group` adopts existing nodes through `children`, which is how a
 model composes a figure it can move and fade as one object without losing the parts' ids.
+
+**Session snapshots** (`checkpoint` / `undo`) are what makes "that was the wrong thing to say" a
+command instead of a re-run. A checkpoint stores the tree *with its camera*, the lecture clock, the
+pause, the tempo and the motion mode — the session, not just the picture — in a stack of at most
+`SceneContext::MAX_CHECKPOINTS` (16; the oldest is dropped). `undo` pops the newest, **interrupts
+playback exactly as `stop` does** (no `finish`, so a half-played `FadeOut` cannot run its removal
+after the restore), and returns a diff *computed* from the two trees rather than remembered:
+`created` is a node the snapshot has and the present does not (undoing a delete), `removed` the
+reverse (undoing an add), `modified` a survivor whose `Mobject::differs_from` its past — the
+comparison deliberately ignores the `dirty` bookkeeping the draw-list diff replaced, so a `set` that
+wrote the value a property already had is not reported. Three absences are decisions: **the timeline
+is not captured** (a queued beat captured its start in `begin`; replaying it into a different tree
+would apply a motion measured against a picture that no longer exists), **narration already spoken is
+not unspoken**, and **`reset` clears the stack** (a mark from before a scene rewrite would restore a
+tree the new script never built).
+
+The restore has one structural consequence, and it is the reason `SceneTree` grew a set it would
+otherwise not need. Cloning a `SlotMap` clones its slot generations, so a restored tree would hand
+out again every id the abandoned future used — a host still holding one would silently address a
+different object. **`SceneTree::retired` is the anti-ABA set**: `insert` skips any id in it (removing
+and re-inserting until the slotmap yields a fresh generation), `retire_ids_of` adds the abandoned
+tree's ids on undo, and `clear()` empties it because `clear` is a reset — a rewritten scene reuses
+ids by design, while an undo must not. Evidence: ten `playback_control_tests` in `context.rs`
+(what the diff names for an add, a delete and a property write; clock/pause/tempo/motion restored;
+the exact snapshot after an interrupted fade, asserted on the whole `SemanticTree`; an abandoned id
+never reissued; newest-first unwinding; the 16-mark cap; the `NoCheckpoint` refusal and its wording;
+a no-op write reported as nothing; `reset` forgetting history), two `--script` stills (checkpoint →
+add → undo is pixel-identical to never adding, with the retained circle as the counterfactual, and
+a refusal that does not stop the feed), and one conformance arm over `rustim-client`. **All eight
+goldens are unchanged** — a snapshot draws nothing — and the count moved 707 → 722.
 
 `CommandOutcome` is the in-memory vocabulary that keeps the three answers apart — `Applied(StateDiff)`,
 `Queried(SemanticTree)` and `Greeted(Capabilities)` — and `reply_line` is the only thing that turns it

@@ -2,7 +2,7 @@
 
 use rustim_math::{Affine2, BezPath, Camera, Point, Rect, bezier};
 use slotmap::{SlotMap, new_key_type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::kind::NodeKind;
 use crate::style::{DirtyFlags, Style};
@@ -105,7 +105,7 @@ impl<'de> serde::Deserialize<'de> for NodeId {
 /// representation, rather than a tree of path commands, is what makes Manim-style
 /// morphing possible: interpolating two mobjects is a point-wise operation once
 /// the arrays have been padded to the same length.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Mobject {
     pub id: NodeId,
     /// Points in *local* space, before [`Mobject::transform`] is applied.
@@ -218,6 +218,50 @@ impl Mobject {
         self.style = style;
         self.dirty.style = true;
         self
+    }
+
+    /// Whether this object and `other` differ in anything a host can observe.
+    ///
+    /// [`Mobject`]'s derived `PartialEq` compares `dirty` too, and that field is
+    /// bookkeeping: the frame loop diffs draw lists rather than dirty flags, so
+    /// a `set` that writes the value a property already had flips a flag without
+    /// moving a pixel. An undo uses this to decide which survivors changed, and
+    /// reporting "modified" for a no-op write would tell a host a restore undid
+    /// something that never happened.
+    ///
+    /// The destructuring is the guarantee: every field not named here is a
+    /// compile error, so a field added to [`Mobject`] cannot silently drop out
+    /// of the comparison.
+    pub fn differs_from(&self, other: &Self) -> bool {
+        let Mobject {
+            id,
+            points,
+            style,
+            transform,
+            opacity,
+            label,
+            mathml,
+            kind,
+            local_bounds,
+            text,
+            children,
+            parent,
+            z,
+            dirty: _,
+        } = self;
+        *id != other.id
+            || *points != other.points
+            || *style != other.style
+            || *transform != other.transform
+            || *opacity != other.opacity
+            || *label != other.label
+            || *mathml != other.mathml
+            || *kind != other.kind
+            || *local_bounds != other.local_bounds
+            || *text != other.text
+            || *children != other.children
+            || *parent != other.parent
+            || *z != other.z
     }
 
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
@@ -444,7 +488,7 @@ pub fn bezier_path_from_points(points: impl IntoIterator<Item = Point>) -> BezPa
 /// everything that walks the tree (draw order, tab order, the semantic tree,
 /// `len()`) is about objects the user can see or address, and a camera is
 /// neither.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SceneTree {
     nodes: SlotMap<NodeId, Mobject>,
     /// Draw order per parent bucket. Renderers walk this rather than the
@@ -454,6 +498,17 @@ pub struct SceneTree {
     /// mutate it through `&mut SceneTree`, and `SceneContext::build_draw_list`
     /// folds it into the frame's one global transform.
     pub camera: Camera,
+    /// Every id this tree must never hand out again.
+    ///
+    /// The generational key is the whole reason a deleted node's id fails
+    /// cleanly instead of addressing its successor, and a restored snapshot
+    /// would otherwise break that promise: cloning a tree clones the slot
+    /// versions, so after an undo the slots the abandoned tree filled are free
+    /// here at their *checkpoint* versions, and the next insert reissues the
+    /// very ids the undo just removed. `SceneContext::undo` therefore calls
+    /// [`SceneTree::retire_ids_of`], and insert retries past any key it finds
+    /// here. The set is empty for every tree that was never restored.
+    retired: HashSet<NodeId>,
 }
 
 impl SceneTree {
@@ -462,12 +517,38 @@ impl SceneTree {
     }
 
     /// Insert a mobject, assigning it a fresh stable id.
+    ///
+    /// A restored tree may be holding a slot at an older version than an id its
+    /// session already handed out (see [`SceneTree::retired`] and
+    /// [`SceneTree::retire_ids_of`]). Inserting, noticing the id is retired, and
+    /// removing it again is what makes the slot move on: `SlotMap::remove`
+    /// bumps the slot's generation, so the retry loop cannot spin on one key.
     pub fn insert(&mut self, mut m: Mobject) -> NodeId {
         m.dirty = DirtyFlags::ALL;
-        let id = self.nodes.insert(m);
-        self.nodes[id].id = id;
-        self.order.entry(None).or_default().push(id);
-        id
+        loop {
+            let id = self.nodes.insert(m);
+            if !self.retired.contains(&id) {
+                self.nodes[id].id = id;
+                self.order.entry(None).or_default().push(id);
+                return id;
+            }
+            m = self
+                .nodes
+                .remove(id)
+                .expect("the slot was inserted a line ago");
+            m.dirty = DirtyFlags::ALL;
+        }
+    }
+
+    /// Keep every id `other` ever handed out from being reissued here.
+    ///
+    /// This is `undo`'s hook, and it is deliberately finer than "reserve the
+    /// ids `other` is using now": an id `other` has already retired (an earlier
+    /// undo in the same session) is just as dangerous, so both sets are merged.
+    /// See [`SceneTree::retired`] for why the clone alone is not enough.
+    pub fn retire_ids_of(&mut self, other: &SceneTree) {
+        self.retired.extend(other.retired.iter().copied());
+        self.retired.extend(other.nodes.keys());
     }
 
     /// Attach `child` under `parent`, removing it from the root bucket.
@@ -715,6 +796,11 @@ impl SceneTree {
         self.nodes.clear();
         self.order.clear();
         self.camera = Camera::default();
+        // `clear` is a session reset (`SceneContext::reset`), not an undo: the
+        // scene is new, so ids a host learned from the old one are history the
+        // host is expected to drop — and keeping them would grow this set for
+        // the life of the process.
+        self.retired.clear();
     }
 
     /// A detached, recursive copy of the subtree rooted at `id`.
@@ -1363,5 +1449,55 @@ mod tests {
 
         let b = tree.world_bounds(text).unwrap();
         assert_eq!((b.x0, b.y0, b.x1, b.y1), (2.0, 0.0, 4.0, 1.0));
+    }
+
+    /// Undo restores a clone of an older tree, whose slot versions are older
+    /// too, so without [`SceneTree::retire_ids_of`] the next insert reissues the
+    /// id the undo just removed — and a host still holding it would be told the
+    /// deleted object is back, as a different object. The retired set is what
+    /// keeps the generational promise across a restore.
+    #[test]
+    fn a_restored_tree_never_reissues_an_id_from_the_abandoned_future() {
+        let mut tree = SceneTree::new();
+        let before = tree.insert(Mobject::new(Vec::new()));
+        let checkpoint = tree.clone();
+
+        // `1` was issued from the checkpoint's free slot list; it is the id an
+        // unrestored clone would hand out next.
+        let after = tree.insert(Mobject::new(Vec::new()));
+        assert_ne!(after, before);
+
+        let mut restored = checkpoint.clone();
+        restored.retire_ids_of(&tree);
+        let next = restored.insert(Mobject::new(Vec::new()));
+        assert_ne!(
+            next, after,
+            "the id the undo removed must not come back naming another object"
+        );
+        assert_ne!(next, before);
+        assert!(restored.get(after).is_none());
+        assert!(restored.get(before).is_some());
+    }
+
+    /// Retiring survives an id that had already been retired by an earlier
+    /// undo: the abandoned tree's `retired` set is merged, not replaced.
+    #[test]
+    fn retirement_accumulates_across_restores() {
+        let mut tree = SceneTree::new();
+        let first = tree.insert(Mobject::new(Vec::new()));
+        let checkpoint = tree.clone();
+        let second = tree.insert(Mobject::new(Vec::new()));
+
+        let mut restored = checkpoint.clone();
+        restored.retire_ids_of(&tree);
+        let third = restored.insert(Mobject::new(Vec::new()));
+
+        let mut again = checkpoint.clone();
+        again.retire_ids_of(&restored);
+        let fourth = again.insert(Mobject::new(Vec::new()));
+
+        for id in [first, second, third] {
+            assert_ne!(fourth, id);
+        }
     }
 }
