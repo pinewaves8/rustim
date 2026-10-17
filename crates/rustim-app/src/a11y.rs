@@ -350,7 +350,7 @@ impl A11yCore {
         // should be a no-op, not an error message.
         let value = (current + delta).clamp(0.0, 1.0);
         Some(Command::Set {
-            target,
+            target: target.into(),
             property: Property::Opacity(value),
         })
     }
@@ -381,7 +381,7 @@ impl A11yCore {
                 Some(ActionData::NumericValue(v)) => {
                     let target = self.focus.focused()?;
                     Some(Request::Command(Box::new(Command::Set {
-                        target,
+                        target: target.into(),
                         property: Property::Opacity(v.clamp(0.0, 1.0)),
                     })))
                 }
@@ -1057,7 +1057,7 @@ mod tests {
         assert_eq!(
             core.adjust(-OPACITY_STEP, &ctx),
             Some(Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::Opacity(0.95),
             })
         );
@@ -1068,7 +1068,7 @@ mod tests {
         assert_eq!(
             core.adjust(-OPACITY_STEP, &ctx),
             Some(Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::Opacity(0.0),
             })
         );
@@ -1095,14 +1095,14 @@ mod tests {
         assert_eq!(
             core.on_action(&request(Action::Increment, None), &ctx),
             Some(Request::Command(Box::new(Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::Opacity(1.0),
             })))
         );
         assert_eq!(
             core.on_action(&request(Action::Decrement, None), &ctx),
             Some(Request::Command(Box::new(Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::Opacity(0.95),
             })))
         );
@@ -1112,7 +1112,7 @@ mod tests {
                 &ctx
             ),
             Some(Request::Command(Box::new(Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::Opacity(0.25),
             })))
         );

@@ -325,6 +325,83 @@ fn a_query_answers_with_the_tree_and_no_diff() {
     assert!(replies[3].tree.is_none());
 }
 
+/// A script may address objects by the label it gave them, and a label two
+/// objects share is refused with both ids — the browser and the desktop share
+/// this path, so one end-to-end run covers both hosts' use of it.
+#[test]
+fn a_script_can_address_objects_by_label() {
+    let script = scratch(
+        "label",
+        concat!(
+            r#"{"action":"add","type":"square","params":{"label":"方块"}}"#,
+            "\n",
+            // The write half: a label instead of an id, and the diff names the id
+            // so a host can switch to the unambiguous spelling afterwards.
+            r#"{"action":"set","target":"方块","property":{"name":"opacity","value":0.5}}"#,
+            "\n",
+            // The read half: the query is rooted at the labelled node.
+            r#"{"action":"query","target":"方块"}"#,
+            "\n",
+            // A second object with the same label makes the name ambiguous.
+            r#"{"action":"add","type":"circle","params":{"label":"方块"}}"#,
+            "\n",
+            r#"{"action":"remove","target":"方块"}"#,
+            "\n",
+            r#"{"action":"remove","target":"没有"}"#,
+            "\n",
+        ),
+    );
+    let ran = run(&[
+        "--script",
+        script.to_str().unwrap(),
+        "--reply",
+        "--png",
+        out_path("label").to_str().unwrap(),
+    ]);
+    ran.ok("--script … --reply --png");
+    let replies = ran.replies();
+    assert_eq!(replies.len(), 6);
+
+    let first = replies[0].diff.as_ref().expect("the add reports its id");
+    assert_eq!(first.created[0].raw(), 4294967297);
+    let set = replies[1].diff.as_ref().expect("a label target mutates");
+    assert_eq!(
+        set.modified, first.created,
+        "the diff names the resolved id"
+    );
+
+    let tree = replies[2].tree.as_ref().expect("a query is a document");
+    assert_eq!(tree.root.raw(), 4294967297);
+    assert_eq!(tree.nodes.len(), 1);
+
+    let square = replies[0].diff.as_ref().unwrap().created[0];
+    let circle = replies[3].diff.as_ref().unwrap().created[0];
+
+    // Two nodes now carry 方块; removing by that name must not guess.
+    let ambiguous = replies[4]
+        .error
+        .as_ref()
+        .expect("a duplicate label is refused");
+    assert!(
+        matches!(ambiguous, rustim_scene::CommandError::AmbiguousLabel { .. }),
+        "{ambiguous:?}"
+    );
+    assert_eq!(
+        format!("{ambiguous}"),
+        format!(
+            "label \"方块\" names 2 nodes: {}, {}",
+            square.raw(),
+            circle.raw()
+        ),
+    );
+
+    // A label nothing carries names the label, not an id.
+    assert_eq!(
+        replies[5].error.as_ref().map(|e| format!("{e}")).as_deref(),
+        Some("no such label: 没有")
+    );
+}
+
 /// A refused command is answered, and the session continues.
 ///
 /// This is the whole posture of the command layer — a refusal is a value, never a

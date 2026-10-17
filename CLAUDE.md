@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **595 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **604 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -315,7 +315,7 @@ last property.
 |---|---|---|
 | `rustim-math` | Points, `Affine2`, rate functions and the `Rate` wire vocabulary, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` / `paths` / `rate_functions` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
-| `rustim-mobject` | `Mobject` (points / declared `local_bounds` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
+| `rustim-mobject` | `Mobject` (points / declared `local_bounds` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors`, `ids_with_label` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
@@ -1924,8 +1924,8 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   find in their own script; and `--reply` exposed that `--png` and the frame-rate line both wrote to
   stdout, so `main::note` now routes every informational line to stderr when stdout is protocol. What
   it deliberately leaves for P3+: the query command (no way to read a live tree), label addressing,
-  and a merged `--reply`/`--inspect`. See "The feed" under AI integration. **The query command has
-  since landed** (P3+ step 22a, below); label addressing and stop/interrupt are the remaining two.
+  and a merged `--reply`/`--inspect`. See "The feed" under AI integration. **The query command and
+  label addressing have since landed** (P3+ steps 22a and 22b, below); stop/interrupt is the last one.
 - **P3's camera is done** (the first half of the `axes`/`plot` step). `Viewport` was cut down to the
   window, `Camera` moved onto `SceneTree`, `CameraMove` joined the animation set, and
   `{"action":"camera","center"?,"zoom"?,"focus"?,"duration"?}` joined the protocol — see "The
@@ -2121,8 +2121,27 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   second read format), a subtree test with a sibling outside it and a deleted id refused, a feed test
   that a query reaches no `on_command`, a browser-session test, and an end-to-end `--script --reply`
   case over the real binary. **No golden moved**: a query draws nothing.
-- **P3+** — the AI command surface at full width: label addressing (22b) and stop/interrupt (22c)
-  remain.
+- **P3+ step 22b — label addressing — is done.** Every field that names a node (`set`/`remove`'s
+  `target`, `animation.target`, a morph's `into`, `camera.focus`, `query.target`) is now a `Target`:
+  a `NodeId` **or** the label the object was created with, in the same field. The type is
+  hand-written over serde (`serialize_u64` / `serialize_str`, `deserialize_any`) so the spelling
+  survives the round trip and a bad value says what the field wanted instead of an untagged enum's
+  "did not match any variant". Resolution is one function, `Target::resolve`, called by `apply`,
+  `animation_for` and `camera_for` before they touch anything; `rustim-anim` never sees a label.
+  Two new refusals, because a label is not a key: `NoSuchLabel` (distinct from a stale id's
+  `NoSuchNode`) and `AmbiguousLabel`, which lists candidates **in draw order** —
+  `SceneTree::ids_with_label` walks `draw_order()`, since `SlotMap` order is not a promise.
+  Evidence: seven
+  command-layer tests (both spellings resolve to one id, unknown/duplicate/dead-id refusals with
+  their exact JSON and Display, `set`/`remove` by label, `play` naming both subject and donor by
+  label, a camera focus giving the same `Camera` by either spelling), a context test that a query
+  can be rooted at a label, a browser-session label query, an end-to-end `--script --reply` run that
+  also proves the ambiguous refusal names both ids, and the round-trip fixture gained six label
+  cases. **No golden moved**, and the 595 → 604 test count is the nine new tests. Deferred on
+  purpose: renaming on ambiguity (a command that rewrites the label would be a mutation nobody
+  asked for), and prefix/glob matching — exact match only, because a fuzzy address that resolves is
+  harder to explain than a refusal.
+- **P3+** — the AI command surface at full width: stop/interrupt (22c) is the last item.
 
 ## AI integration
 
@@ -2136,13 +2155,29 @@ The product is an AI explainer assistant, so the engine exposes a JSON command i
 { "action": "narrate", "text": "两条直角边是 3 和 4", "at": 2.0 }
 ```
 
-`target` is a `NodeId`: an **opaque 64-bit integer**, not a small index (see the `slotmap` note above
-— the low half is the slot, the high half the generation). Because the key is generational, a command
-naming a deleted node fails cleanly instead of hitting a recycled object. Objects also carry an
-optional human-readable `label`, which is what the accessibility layer speaks and what the AI layer
-may address instead of the opaque id. Every command returns a `StateDiff` (`created` / `modified` /
-`removed`), so a host learns the id of what it just added and a renderer learns exactly what to
-invalidate.
+`target` is a **`Target`**: either a `NodeId` — an **opaque 64-bit integer**, not a small index (see
+the `slotmap` note above — the low half is the slot, the high half the generation) — or the
+human-readable `label` the object was given. Because the id is generational, a command naming a
+deleted node fails cleanly instead of hitting a recycled object.
+
+The label spelling is the one a model reaches for: it sent `"label": "圆"` when it created the object
+and has no reason to remember `4294967297`. It is the **same field**, not a second one — an integer
+and a string are unambiguous in JSON, and each serialises back exactly as it arrived, so a
+label-addressed command replays byte for byte and a logged session stays readable a week later. Every
+place a command names a node takes the two spellings: `set`/`remove`'s `target`, `play`'s
+`animation.target`, a morph's `into`, `camera.focus` and `query.target`. Resolution happens once, in
+the command layer, before anything is touched (`apply`, `animation_for`, `camera_for`, and the query
+arm of `handle` all call `Target::resolve`); the animations themselves only ever see an id, because
+`rustim-anim` has no tree to look a label up in. A label is **not a key** — the engine has never
+refused a duplicate and a scene with two "圆"s is legitimate — so an unknown label is `NoSuchLabel`
+(a different bug, and a different fix, from a stale id's `NoSuchNode`) and a duplicated one is
+`AmbiguousLabel`, which **lists every candidate in draw order** rather than picking one. Guessing
+which of two "圆"s was meant would be invisible in the reply; being handed the ids is not.
+
+Every command returns a `StateDiff` (`created` / `modified` / `removed`), so a host learns the id of
+what it just added and a renderer learns exactly what to invalidate. A diff always names **ids**,
+even when the command addressed the object by label — the label is an input spelling, and the
+unambiguous handle is what a host stores for the commands that come after.
 
 `play` is the one command that **appends rather than mutates**: it queues an animation as the next
 beat of the same timeline a scene's own `ctx.play` writes into, which is what makes the picture a pure
@@ -2160,7 +2195,7 @@ the narration track, due `at` seconds after it arrived (see "Narration, captions
 self-voicing").
 
 **`query` is the read half of the same surface** — `{"action":"query"}` or
-`{"action":"query","target":<id>}` — and it is answered with a *document*, not a diff:
+`{"action":"query","target":<id|label>}` — and it is answered with a *document*, not a diff:
 `{"seq":4,"tree":{…}}`, where the tree is exactly the `SemanticTree` `--inspect` prints, projected
 against the context's viewport and the scene's current camera. It lives in `handle` rather than
 `apply` because a pure tree-level function has no viewport to compute pixel bounds with. A `target`
@@ -2233,8 +2268,7 @@ of I/O and of a JSON parser (it compiles to wasm).
 until this step — now fires for every command that reached the tree, from the feed *and* from the
 keyboard/AT path. A command that was refused does not fire it.
 
-**Known limits, deliberately:** commands address nodes by `NodeId` only (the "labels may be
-addressed" sentence above is a design question this step did not settle); `--reply` and `--inspect`
-cannot both own stdout; and `play` still cannot interrupt a running beat — a stop command is the
-next P3+ step, and it is not a variant of `play` for the same reason an interruption would be a
-command of its own.
+**Known limits, deliberately:** `--reply` and `--inspect` cannot both own stdout; and `play` still
+cannot interrupt a running beat — a stop command is the next P3+ step, and it is not a variant of
+`play` for the same reason an interruption would be a command of its own. Label addressing is no
+longer on this list: `Target` settled it (step 22b), including what to do about duplicates.

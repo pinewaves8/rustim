@@ -30,9 +30,11 @@ const DEFAULT_ANIMATION_RUN_TIME: f64 = 1.0;
 /// { "action": "add", "type": "triangle", "params": { "width": 3, "height": 4 } }
 /// ```
 ///
-/// Every variant that names an existing object uses `target`, and every one uses
-/// the same field names as the JSON, so the serde attributes stay the only
-/// translation layer.
+/// Every variant that names an existing object uses `target` — or `focus`, or
+/// `into`, which are the same question asked about a different role — and every
+/// one takes a [`Target`], so a model may name a node by the label it created it
+/// with instead of the opaque id. All fields use the same names as the JSON, so
+/// the serde attributes stay the only translation layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Command {
@@ -44,10 +46,10 @@ pub enum Command {
         params: ShapeParams,
     },
     /// Set one named property of one object.
-    Set { target: NodeId, property: Property },
+    Set { target: Target, property: Property },
     /// Delete an object and its subtree.
-    Remove { target: NodeId },
-    /// Play an animation that names its subject by id.
+    Remove { target: Target },
+    /// Play an animation that names its subject by id or label.
     Play { animation: AnimationSpec },
     /// Point the camera, now or over a beat.
     ///
@@ -62,7 +64,7 @@ pub enum Command {
         #[serde(skip_serializing_if = "Option::is_none")]
         zoom: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        focus: Option<NodeId>,
+        focus: Option<Target>,
         #[serde(skip_serializing_if = "Option::is_none")]
         duration: Option<f64>,
     },
@@ -120,8 +122,142 @@ pub enum Command {
     /// tree-level function has none.
     Query {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        target: Option<NodeId>,
+        target: Option<Target>,
     },
+}
+
+/// How a command names a node: by its opaque id, or by the human-readable label.
+///
+/// The two spellings share one field because they answer one question — *which
+/// node?* — and a separate `target_label` beside `target` would make every
+/// command carry two mutually exclusive halves that the protocol has to keep
+/// saying are exclusive. The label spelling is the one a model reaches for: it
+/// sent `"label": "圆"` when it created the object and has no reason to remember
+/// `4294967297`.
+///
+/// An integer and a string are unambiguous on the wire, and each serialises back
+/// as exactly what it was: a label-addressed command replays byte for byte and is
+/// never rewritten into an id. That property is why the label stays a *name* — a
+/// host that logs a session can still read it a week later.
+///
+/// Resolution needs the tree, so [`Target::resolve`] takes one, and every entry
+/// point that reads a target ([`apply`], [`animation_for`], [`camera_for`],
+/// [`crate::SceneContext::handle`]'s query arm) resolves **before** touching
+/// anything. A label is not a key: see [`SceneTree::ids_with_label`] for why
+/// duplicates are representable, and [`CommandError::AmbiguousLabel`] for what
+/// this layer does about them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Id(NodeId),
+    Label(String),
+}
+
+impl From<NodeId> for Target {
+    fn from(id: NodeId) -> Self {
+        Self::Id(id)
+    }
+}
+
+impl From<&str> for Target {
+    fn from(label: &str) -> Self {
+        Self::Label(label.to_owned())
+    }
+}
+
+impl From<String> for Target {
+    fn from(label: String) -> Self {
+        Self::Label(label)
+    }
+}
+
+impl Target {
+    /// The node this names, if exactly one live node has it.
+    ///
+    /// Three outcomes, each a value:
+    ///
+    /// * an id that is in the tree, or a label exactly one node carries — that
+    ///   node's id;
+    /// * an id the tree has never held or has deleted — [`CommandError::NoSuchNode`],
+    ///   the refusal every command has always given;
+    /// * a label no node carries — [`CommandError::NoSuchLabel`], kept distinct
+    ///   from `NoSuchNode` because "there is no node called 圆" and "there is no
+    ///   node 4294967297" are different bugs to fix;
+    /// * a label several nodes carry — [`CommandError::AmbiguousLabel`], carrying
+    ///   their ids in draw order. Picking one would be guessing which of two
+    ///   objects the caller meant, and the guess is invisible in the reply.
+    pub fn resolve(&self, tree: &SceneTree) -> Result<NodeId, CommandError> {
+        match self {
+            Self::Id(id) => {
+                if tree.get(*id).is_none() {
+                    return Err(CommandError::NoSuchNode { target: *id });
+                }
+                Ok(*id)
+            }
+            Self::Label(label) => match tree.ids_with_label(label).as_slice() {
+                [] => Err(CommandError::NoSuchLabel {
+                    label: label.clone(),
+                }),
+                [id] => Ok(*id),
+                candidates => Err(CommandError::AmbiguousLabel {
+                    label: label.clone(),
+                    candidates: candidates.to_vec(),
+                }),
+            },
+        }
+    }
+}
+
+/// Hand-written rather than `#[serde(untagged)]`, for the error message: an
+/// untagged enum reports "data did not match any variant", which tells a model
+/// that sent `"target": true` nothing it can act on. This one says what the
+/// field wanted.
+impl Serialize for Target {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Id(id) => s.serialize_u64(id.raw()),
+            Self::Label(label) => s.serialize_str(label),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Target {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, Visitor};
+
+        struct TargetVisitor;
+
+        impl Visitor<'_> for TargetVisitor {
+            type Value = Target;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a node id (integer) or a label (string)")
+            }
+
+            fn visit_u64<E: Error>(self, v: u64) -> Result<Target, E> {
+                Ok(Target::Id(NodeId::from_raw(v)))
+            }
+
+            fn visit_i64<E: Error>(self, v: i64) -> Result<Target, E> {
+                u64::try_from(v)
+                    .map(|v| Target::Id(NodeId::from_raw(v)))
+                    .map_err(|_| {
+                        E::invalid_value(
+                            serde::de::Unexpected::Signed(v),
+                            &"a non-negative node id",
+                        )
+                    })
+            }
+
+            fn visit_str<E: Error>(self, v: &str) -> Result<Target, E> {
+                Ok(Target::Label(v.to_owned()))
+            }
+        }
+
+        // `deserialize_any` is right here and only here: the wire is JSON, which
+        // is self-describing, and the whole point of the type is to accept two
+        // JSON shapes in one field.
+        d.deserialize_any(TargetVisitor)
+    }
 }
 
 /// The wire spelling of [`rustim_anim::Motion`].
@@ -193,7 +329,7 @@ pub struct AnimationSpec {
     /// non-group kind with no target is a refusal, not a parse error, so the model
     /// gets told what is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<NodeId>,
+    pub target: Option<Target>,
     #[serde(rename = "type")]
     pub kind: AnimationKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,11 +352,12 @@ pub struct AnimationSpec {
     pub about_point: Option<[f64; 2]>,
     /// The node a `transform` morphs its target into.
     ///
-    /// A `NodeId` rather than an inline `Mobject`, because the target is already
-    /// in the scene and a host should address it rather than restate it. The
-    /// animation reads it once in `begin` and never writes to it.
+    /// A [`Target`] rather than an inline `Mobject`, because the donor is already
+    /// in the scene and a host should address it rather than restate it — by id
+    /// or by the label it was created with. The animation reads it once in
+    /// `begin` and never writes to it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub into: Option<NodeId>,
+    pub into: Option<Target>,
     /// A `transform`'s arc, in radians: the route every point takes instead of a
     /// straight line. Read only by `transform`; the other kinds ignore it, the
     /// same way they ignore `to` or `angle`.
@@ -305,6 +442,27 @@ pub enum CommandError {
     NoSuchNode {
         target: NodeId,
     },
+    /// A label no node in the tree carries.
+    ///
+    /// Separate from [`CommandError::NoSuchNode`] on purpose: a host reading a
+    /// session log has to be able to tell "that object was deleted" (the id is
+    /// stale) from "no object was ever called that" (the label is wrong), and
+    /// they are fixed by different edits — one re-queries, the other renames.
+    NoSuchLabel {
+        label: String,
+    },
+    /// A label several nodes carry, with every candidate in draw order.
+    ///
+    /// Ambiguity is refused rather than resolved by a rule, because no rule this
+    /// engine could pick is the one the caller meant: draw order would silently
+    /// prefer the first object drawn, creation order the oldest, and the reply
+    /// would say the command succeeded. The candidates are in the error so the
+    /// caller can retry with an id — which is the only spelling that can be
+    /// unambiguous.
+    AmbiguousLabel {
+        label: String,
+        candidates: Vec<NodeId>,
+    },
     /// A property value the engine cannot accept, with the range that would be.
     OutOfRange {
         property: String,
@@ -333,6 +491,16 @@ impl std::fmt::Display for CommandError {
             // string is what a refusal says to a human. The wire form is the
             // number, so the message uses the number.
             Self::NoSuchNode { target } => write!(f, "no such node: {}", target.raw()),
+            Self::NoSuchLabel { label } => write!(f, "no such label: {label}"),
+            Self::AmbiguousLabel { label, candidates } => {
+                let ids: Vec<String> = candidates.iter().map(|id| id.raw().to_string()).collect();
+                write!(
+                    f,
+                    "label {label:?} names {} nodes: {}",
+                    candidates.len(),
+                    ids.join(", ")
+                )
+            }
             Self::OutOfRange { property, detail } => {
                 write!(f, "{property} out of range: {detail}")
             }
@@ -501,21 +669,24 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             diff.created.push(id);
         }
         Command::Remove { target } => {
-            if tree.get(*target).is_none() {
-                return Err(CommandError::NoSuchNode { target: *target });
-            }
+            // `resolve` is also the existence check, for both spellings: an id
+            // the tree never held and a label no node carries are refused before
+            // anything is touched, and the diff never names a node that was not
+            // there.
+            let target = target.resolve(tree)?;
             // The walk lives on the tree rather than here, because `FadeOut`'s
             // finish step needs exactly the same one — and two copies of "delete
             // this subtree" would eventually disagree about children.
-            tree.remove_subtree(*target);
-            diff.removed.push(*target);
+            tree.remove_subtree(target);
+            diff.removed.push(target);
         }
         Command::Set { target, property } => {
-            let Some(m) = tree.get_mut(*target) else {
-                return Err(CommandError::NoSuchNode { target: *target });
+            let target = target.resolve(tree)?;
+            let Some(m) = tree.get_mut(target) else {
+                return Err(CommandError::NoSuchNode { target });
             };
             property.write(m)?;
-            diff.modified.push(*target);
+            diff.modified.push(target);
         }
         Command::Play { .. } => {
             // `SceneContext::handle` answers this one, because playing is the one
@@ -576,7 +747,9 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
 ///   command named nothing to change, and answering it with silence would teach
 ///   a model that an empty camera request is fine;
 /// * a `focus` naming a missing node — [`CommandError::NoSuchNode`], the same
-///   refusal every other command that names a node gives;
+///   refusal every other command that names a node gives — or a label that
+///   resolves to none or several ([`CommandError::NoSuchLabel`],
+///   [`CommandError::AmbiguousLabel`]); see [`Target::resolve`];
 /// * a `focus` naming a node with neither points nor a declared
 ///   [`Mobject::local_bounds`] — an empty placeholder, or text whose owner never
 ///   told the tree how big it is — or with zero extent:
@@ -593,7 +766,7 @@ pub fn camera_for(
     viewport: &Viewport,
     center: Option<[f64; 2]>,
     zoom: Option<f64>,
-    focus: Option<NodeId>,
+    focus: Option<&Target>,
 ) -> Result<Camera, CommandError> {
     if center.is_none() && zoom.is_none() && focus.is_none() {
         return Err(CommandError::OutOfRange {
@@ -605,10 +778,8 @@ pub fn camera_for(
     let mut at = tree.camera.center;
     let mut scale = tree.camera.zoom;
 
-    if let Some(target) = focus {
-        if tree.get(target).is_none() {
-            return Err(CommandError::NoSuchNode { target });
-        }
+    if let Some(focus) = focus {
+        let target = focus.resolve(tree)?;
         let Some(bounds) = tree.world_bounds(target) else {
             return Err(CommandError::OutOfRange {
                 property: "focus".into(),
@@ -704,7 +875,10 @@ pub fn camera_duration(duration: Option<f64>) -> Result<Option<f64>, CommandErro
 /// * a kind other than `group`/`succession` with **no** `target` —
 ///   [`CommandError::OutOfRange`]. Every animation but a composition acts on
 ///   exactly one node, and "which node?" is a question the reply can answer;
-/// * a target that is not in the tree — [`CommandError::NoSuchNode`];
+/// * a target that is not in the tree — [`CommandError::NoSuchNode`] — or a
+///   label resolving to none or to several ([`CommandError::NoSuchLabel`],
+///   [`CommandError::AmbiguousLabel`]); the donor `into` is resolved the same
+///   way;
 /// * `MoveTo` with no `to` — [`CommandError::OutOfRange`], because there is no
 ///   destination and silently doing nothing would teach a model that `to` is
 ///   optional when every `move_to` needs it;
@@ -768,7 +942,7 @@ pub fn animation_for(
 /// comes from [`composed_for`] — the early return that used to open
 /// [`animation_for`] left no place to say "wrap whatever this produced".
 fn simple_for(tree: &SceneTree, spec: &AnimationSpec) -> Result<Box<dyn Animation>, CommandError> {
-    let Some(target) = spec.target else {
+    let Some(target) = spec.target.as_ref() else {
         return Err(CommandError::OutOfRange {
             property: "target".into(),
             detail: format!(
@@ -778,9 +952,10 @@ fn simple_for(tree: &SceneTree, spec: &AnimationSpec) -> Result<Box<dyn Animatio
             .to_lowercase(),
         });
     };
-    if tree.get(target).is_none() {
-        return Err(CommandError::NoSuchNode { target });
-    }
+    // An id or a label, resolved once, here, before the kind reads it. The
+    // animation itself only ever sees the id — the wire spelling stops at this
+    // function, which is what keeps `rustim-anim` free of tree lookups.
+    let target = target.resolve(tree)?;
     if let Some(d) = spec.duration
         && (!d.is_finite() || d < 0.0)
     {
@@ -846,20 +1021,18 @@ fn simple_for(tree: &SceneTree, spec: &AnimationSpec) -> Result<Box<dyn Animatio
         AnimationKind::Create => Box::new(Create::new(target).with_duration(duration)),
         AnimationKind::Uncreate => Box::new(Uncreate::new(target).with_duration(duration)),
         AnimationKind::Transform => {
-            let Some(into) = spec.into else {
+            let Some(into) = spec.into.as_ref() else {
                 return Err(CommandError::OutOfRange {
                     property: "into".into(),
                     detail: "a transform morphs into another node; it needs `into`".into(),
                 });
             };
+            let into = into.resolve(tree)?;
             if into == target {
                 return Err(CommandError::OutOfRange {
                     property: "into".into(),
                     detail: "an object cannot be morphed into itself".into(),
                 });
-            }
-            if tree.get(into).is_none() {
-                return Err(CommandError::NoSuchNode { target: into });
             }
             // The engine refuses both of these by staying still (it has no error
             // channel), so the refusal has to be here — before a beat a host is
@@ -1198,6 +1371,17 @@ mod tests {
             // subtree. Neither writes a field it did not receive.
             r#"{"action":"query"}"#.to_owned(),
             format!(r#"{{"action":"query","target":{id}}}"#),
+            // The label spelling of a target. The field is the same one; only
+            // the JSON type differs, and it survives the round trip as a label —
+            // a logged session stays readable, and replaying it resolves the
+            // same names against the same tree.
+            r#"{"action":"remove","target":"方块"}"#.to_owned(),
+            r#"{"action":"set","target":"方块","property":{"name":"label","value":"圆"}}"#.to_owned(),
+            r#"{"action":"play","animation":{"target":"圆","type":"fade_in"}}"#.to_owned(),
+            r#"{"action":"play","animation":{"target":"圆","type":"transform","into":"方块"}}"#
+                .to_owned(),
+            r#"{"action":"camera","focus":"方块"}"#.to_owned(),
+            r#"{"action":"query","target":"方块"}"#.to_owned(),
         ];
         for json in cases {
             let cmd: Command =
@@ -1307,6 +1491,170 @@ mod tests {
         );
     }
 
+    /// Both spellings of a target answer with the same id, which is the whole
+    /// contract: a label is an alternative *name* for a node, not a second way
+    /// of identifying something else.
+    #[test]
+    fn a_target_resolves_by_id_or_by_label() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(vec![]).with_label("方块"));
+        assert_eq!(Target::Id(id).resolve(&tree), Ok(id));
+        assert_eq!(Target::from("方块").resolve(&tree), Ok(id));
+        // The label of a *different* node is not this node.
+        tree.insert(Mobject::new(vec![]).with_label("圆"));
+        assert_eq!(Target::from("方块").resolve(&tree), Ok(id));
+    }
+
+    /// A label nothing carries is its own refusal, not `NoSuchNode`: the two
+    /// are fixed by different edits, and a host reading the log has to be able
+    /// to tell "deleted" from "never called that".
+    #[test]
+    fn an_unknown_label_is_its_own_refusal() {
+        let tree = SceneTree::new();
+        let e = Target::from("不存在").resolve(&tree).unwrap_err();
+        assert_eq!(
+            e,
+            CommandError::NoSuchLabel {
+                label: "不存在".into()
+            }
+        );
+        assert_eq!(e.to_string(), "no such label: 不存在");
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"error":"no_such_label","label":"不存在"}"#,
+        );
+    }
+
+    /// Duplicates are refused with every candidate, in draw order — the order
+    /// the renderer and the accessibility tree already use, so a host can look
+    /// at the scene and know which id is which.
+    #[test]
+    fn a_duplicate_label_is_refused_with_its_candidates_in_draw_order() {
+        let mut tree = SceneTree::new();
+        let a = tree.insert(Mobject::new(vec![]).with_label("圆"));
+        let b = tree.insert(Mobject::new(vec![]).with_label("圆"));
+        let e = Target::from("圆").resolve(&tree).unwrap_err();
+        assert_eq!(
+            e,
+            CommandError::AmbiguousLabel {
+                label: "圆".into(),
+                candidates: vec![a, b],
+            }
+        );
+        assert_eq!(
+            e.to_string(),
+            format!("label \"圆\" names 2 nodes: {}, {}", a.raw(), b.raw()),
+        );
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            format!(
+                r#"{{"error":"ambiguous_label","label":"圆","candidates":[{},{}]}}"#,
+                a.raw(),
+                b.raw()
+            ),
+        );
+    }
+
+    /// A dead id is not resolved, so no command can act on one — the
+    /// generational key's promise, kept for the new spelling too.
+    #[test]
+    fn a_dead_id_is_refused_not_resolved() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(vec![]));
+        tree.remove(id);
+        assert_eq!(
+            Target::Id(id).resolve(&tree),
+            Err(CommandError::NoSuchNode { target: id })
+        );
+    }
+
+    /// The mutation commands resolve labels before touching anything, so the
+    /// diff names the id — the part of the address a renderer can act on.
+    #[test]
+    fn commands_can_address_an_object_by_its_label() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(vec![]).with_label("方块"));
+
+        let set: Command = serde_json::from_str(
+            r#"{"action":"set","target":"方块","property":{"name":"opacity","value":0.25}}"#,
+        )
+        .unwrap();
+        assert_eq!(apply(&mut tree, &set).unwrap().modified, [id]);
+        assert_eq!(tree.get(id).unwrap().opacity, 0.25);
+
+        let remove: Command =
+            serde_json::from_str(r#"{"action":"remove","target":"方块"}"#).unwrap();
+        assert_eq!(apply(&mut tree, &remove).unwrap().removed, [id]);
+        assert!(tree.get(id).is_none());
+    }
+
+    /// `play` resolves both node names a spec can carry: the subject and a
+    /// morph's donor. The animation itself never sees a label — `rustim-anim`
+    /// has no tree to look one up in, and that is by design.
+    #[test]
+    fn a_play_can_name_its_subject_and_its_donor_by_label() {
+        let mut tree = SceneTree::new();
+        let a = tree.insert(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        let b = tree.insert(rustim_mobject::shapes::build(
+            ShapeKind::Circle,
+            &ShapeParams::default(),
+        ));
+        tree.get_mut(a).unwrap().label = Some("方".into());
+        tree.get_mut(b).unwrap().label = Some("圆".into());
+
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"play","animation":{"target":"方","type":"transform","into":"圆"}}"#,
+        )
+        .unwrap();
+        let Command::Play { animation } = cmd else {
+            panic!("a play command");
+        };
+        animation_for(&tree, &animation).expect("both labels resolve");
+
+        let missing: Command = serde_json::from_str(
+            r#"{"action":"play","animation":{"target":"无","type":"fade_in"}}"#,
+        )
+        .unwrap();
+        let Command::Play { animation } = missing else {
+            panic!("a play command");
+        };
+        assert_eq!(
+            animation_for(&tree, &animation).err(),
+            Some(CommandError::NoSuchLabel {
+                label: "无".into()
+            })
+        );
+    }
+
+    /// A camera `focus` is a target too, and resolving it by label gives the
+    /// same camera as resolving it by id — a label cannot quietly focus
+    /// something else.
+    #[test]
+    fn a_camera_focus_can_be_a_label() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        tree.get_mut(id).unwrap().label = Some("方块".into());
+        let viewport = Viewport::default();
+
+        let by_id = camera_for(&tree, &viewport, None, None, Some(&Target::Id(id)))
+            .expect("an id resolves");
+        let by_label = camera_for(&tree, &viewport, None, None, Some(&Target::from("方块")))
+            .expect("the label resolves");
+        assert_eq!(by_id, by_label);
+        assert_eq!(
+            camera_for(&tree, &viewport, None, None, Some(&Target::from("无"))).unwrap_err(),
+            CommandError::NoSuchLabel {
+                label: "无".into()
+            }
+        );
+    }
+
     #[test]
     fn a_deleted_nodes_id_does_not_round_trip_onto_the_replacement() {
         // The generational key, seen from the protocol: reusing a slot must not
@@ -1338,7 +1686,7 @@ mod tests {
         let ghost = tree.insert(Mobject::new(vec![]));
         tree.remove(ghost);
         let cmd = Command::Set {
-            target: ghost,
+            target: ghost.into(),
             property: Property::Opacity(0.5),
         };
         assert_eq!(
@@ -1352,7 +1700,7 @@ mod tests {
         let mut tree = SceneTree::new();
         let id = tree.insert(Mobject::new(vec![]));
         let cmd = Command::Set {
-            target: id,
+            target: id.into(),
             property: Property::Opacity(7.0),
         };
         assert!(matches!(
@@ -1394,7 +1742,7 @@ mod tests {
             apply(
                 &mut tree,
                 &Command::Set {
-                    target: id,
+                    target: id.into(),
                     property,
                 },
             )
@@ -1418,7 +1766,7 @@ mod tests {
         let id = tree.insert(Mobject::new(vec![]));
         for bad in [1.5, -0.1, f64::NAN] {
             let cmd = Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::StrokeOpacity(bad),
             };
             assert!(matches!(
@@ -1435,7 +1783,7 @@ mod tests {
         let id = tree.insert(Mobject::new(vec![]));
         for bad in [-0.1, f64::NAN, f64::INFINITY] {
             let cmd = Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::StrokeWidth(bad),
             };
             assert!(matches!(
@@ -1448,7 +1796,7 @@ mod tests {
         apply(
             &mut tree,
             &Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::StrokeWidth(0.0),
             },
         )
@@ -1462,7 +1810,13 @@ mod tests {
         let parent = tree.insert(Mobject::new(vec![]));
         let child = tree.insert(Mobject::new(vec![]));
         assert!(tree.reparent(child, parent));
-        apply(&mut tree, &Command::Remove { target: parent }).unwrap();
+        apply(
+            &mut tree,
+            &Command::Remove {
+                target: parent.into(),
+            },
+        )
+        .unwrap();
         assert!(tree.get(parent).is_none());
         assert!(tree.get(child).is_none(), "the subtree must go too");
     }
@@ -1475,7 +1829,7 @@ mod tests {
             &mut tree,
             &Command::Play {
                 animation: AnimationSpec {
-                    target: Some(id),
+                    target: Some(id.into()),
                     kind: AnimationKind::FadeIn,
                     duration: None,
                     to: None,
@@ -1509,7 +1863,7 @@ mod tests {
     /// the case three of the refusals below are about.
     fn spec(id: NodeId, kind: AnimationKind) -> AnimationSpec {
         AnimationSpec {
-            target: Some(id),
+            target: Some(id.into()),
             kind,
             duration: None,
             to: None,
@@ -1632,7 +1986,7 @@ mod tests {
         apply(
             &mut tree,
             &Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::Position([2.0, -1.0]),
             },
         )
@@ -1674,7 +2028,7 @@ mod tests {
                 AnimationKind::MoveTo => what.to = Some([0.0, 0.0]),
                 AnimationKind::Rotate => what.angle = Some(1.0),
                 AnimationKind::Scale => what.factor = Some(1.5),
-                AnimationKind::Transform => what.into = Some(donor),
+                AnimationKind::Transform => what.into = Some(donor.into()),
                 _ => {}
             }
             assert_eq!(
@@ -1949,7 +2303,7 @@ mod tests {
     fn a_composition_command_names_no_target() {
         let (tree, id) = scene_with_a_blank();
         let mut what = composed(AnimationKind::Group, vec![spec(id, AnimationKind::FadeIn)]);
-        what.target = Some(id);
+        what.target = Some(id.into());
         assert!(matches!(
             animation_for(&tree, &what),
             Err(CommandError::OutOfRange { ref property, .. }) if property == "target"
@@ -2039,7 +2393,7 @@ mod tests {
             .collect();
 
         let mut what = spec(source, AnimationKind::Transform);
-        what.into = Some(donor);
+        what.into = Some(donor.into());
         let mut anim = animation_for(&tree, &what).unwrap();
         anim.begin(&tree);
         anim.interpolate(1.0, &mut tree);
@@ -2062,7 +2416,7 @@ mod tests {
         let before = tree.get(donor_child).unwrap().points.clone();
 
         let mut what = spec(source, AnimationKind::Transform);
-        what.into = Some(donor);
+        what.into = Some(donor.into());
         let mut anim = animation_for(&tree, &what).unwrap();
         anim.begin(&tree);
         anim.interpolate(0.5, &mut tree);
@@ -2086,7 +2440,7 @@ mod tests {
         let ghost = tree.insert(Mobject::new(vec![]));
         tree.remove(ghost);
         let mut what = spec(id, AnimationKind::Transform);
-        what.into = Some(ghost);
+        what.into = Some(ghost.into());
         assert!(matches!(
             animation_for(&tree, &what),
             Err(CommandError::NoSuchNode { target }) if target == ghost
@@ -2103,21 +2457,21 @@ mod tests {
         let child = tree.child_ids(parent)[0];
 
         let mut itself = spec(parent, AnimationKind::Transform);
-        itself.into = Some(parent);
+        itself.into = Some(parent.into());
         assert!(matches!(
             animation_for(&tree, &itself),
             Err(CommandError::OutOfRange { ref property, .. }) if property == "into"
         ));
 
         let mut downward = spec(parent, AnimationKind::Transform);
-        downward.into = Some(child);
+        downward.into = Some(child.into());
         assert!(matches!(
             animation_for(&tree, &downward),
             Err(CommandError::OutOfRange { ref property, .. }) if property == "into"
         ));
 
         let mut upward = spec(child, AnimationKind::Transform);
-        upward.into = Some(parent);
+        upward.into = Some(parent.into());
         assert!(matches!(
             animation_for(&tree, &upward),
             Err(CommandError::OutOfRange { ref property, .. }) if property == "into"
@@ -2133,14 +2487,14 @@ mod tests {
         let group = group_of(&mut tree, 1);
 
         let mut into_group = spec(shape, AnimationKind::Transform);
-        into_group.into = Some(group);
+        into_group.into = Some(group.into());
         let Err(CommandError::OutOfRange { detail, .. }) = animation_for(&tree, &into_group) else {
             panic!("a shape into a group must be refused");
         };
         assert!(detail.contains("shape"), "{detail}");
 
         let mut into_shape = spec(group, AnimationKind::Transform);
-        into_shape.into = Some(shape);
+        into_shape.into = Some(shape.into());
         let Err(CommandError::OutOfRange { detail, .. }) = animation_for(&tree, &into_shape) else {
             panic!("a group into a shape must be refused");
         };
@@ -2154,7 +2508,7 @@ mod tests {
         let (mut tree, id) = scene_with_a_blank();
         let circle = tree.insert(Mobject::new(rustim_mobject::shapes::circle(1.0)));
         let mut what = spec(id, AnimationKind::Transform);
-        what.into = Some(circle);
+        what.into = Some(circle.into());
 
         let mut anim = animation_for(&tree, &what).unwrap();
         anim.begin(&tree);
@@ -2182,7 +2536,7 @@ mod tests {
             .set_transform(Affine2::translate((4.0, 0.0)));
 
         let mut what = spec(source, AnimationKind::Transform);
-        what.into = Some(donor);
+        what.into = Some(donor.into());
         what.path_arc = Some(PI);
         let mut anim = animation_for(&tree, &what).unwrap();
         anim.begin(&tree);
@@ -2268,7 +2622,7 @@ mod tests {
         let (mut tree, id) = scene_with_a_blank();
         let donor = tree.insert(Mobject::new(rustim_mobject::shapes::square(1.0, 1.0)));
         let mut what = spec(id, AnimationKind::Transform);
-        what.into = Some(donor);
+        what.into = Some(donor.into());
         what.path_arc = Some(f64::NAN);
         assert!(matches!(
             animation_for(&tree, &what),
@@ -2305,7 +2659,7 @@ mod tests {
         apply(
             &mut tree,
             &Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::Rotation(std::f64::consts::FRAC_PI_2),
             },
         )
@@ -2335,7 +2689,7 @@ mod tests {
         apply(
             &mut tree,
             &Command::Set {
-                target: id,
+                target: id.into(),
                 property: Property::Scale(3.0),
             },
         )
@@ -2367,7 +2721,7 @@ mod tests {
                     apply(
                         &mut tree,
                         &Command::Set {
-                            target: id,
+                            target: id.into(),
                             property: Property::Scale(bad),
                         }
                     ),
@@ -2474,7 +2828,7 @@ mod tests {
         let ghost = tree.insert(Mobject::new(vec![]));
         tree.remove(ghost);
         assert!(matches!(
-            camera_for(&tree, &Viewport::default(), None, None, Some(ghost)),
+            camera_for(&tree, &Viewport::default(), None, None, Some(&Target::Id(ghost))),
             Err(CommandError::NoSuchNode { target }) if target == ghost
         ));
     }
@@ -2487,7 +2841,7 @@ mod tests {
         let mut tree = SceneTree::new();
         let empty = tree.insert(Mobject::new(vec![]));
         assert!(matches!(
-            camera_for(&tree, &Viewport::default(), None, None, Some(empty)),
+            camera_for(&tree, &Viewport::default(), None, None, Some(&Target::Id(empty))),
             Err(CommandError::OutOfRange { ref property, .. }) if property == "focus"
         ));
     }
@@ -2503,7 +2857,14 @@ mod tests {
                 .with_local_bounds(Rect::new(-2.0, -0.5, 2.0, 0.5)),
         );
 
-        let camera = camera_for(&tree, &Viewport::default(), None, None, Some(text)).unwrap();
+        let camera = camera_for(
+            &tree,
+            &Viewport::default(),
+            None,
+            None,
+            Some(&Target::Id(text)),
+        )
+        .unwrap();
         assert_eq!(camera.center, (0.0, 0.0));
         // 4 wide and 1 tall: the width is the tighter axis at 1280x720
         // (visible width is ~14.22, so a 4-unit box fills it at ~2.96x), while
@@ -2519,7 +2880,14 @@ mod tests {
     #[test]
     fn a_focus_frames_the_box_with_a_margin() {
         let (tree, id) = tree_with_a_square();
-        let camera = camera_for(&tree, &Viewport::default(), None, None, Some(id)).unwrap();
+        let camera = camera_for(
+            &tree,
+            &Viewport::default(),
+            None,
+            None,
+            Some(&Target::Id(id)),
+        )
+        .unwrap();
         assert_eq!(camera.center, (0.0, 0.0));
         assert!(
             (camera.zoom - Camera::WORLD_HEIGHT / (1.2 * 2.0)).abs() < 1e-12,
@@ -2535,7 +2903,7 @@ mod tests {
         let mut tree = SceneTree::new();
         let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(4.0, 1.0)));
         let vp = Viewport::default();
-        let camera = camera_for(&tree, &vp, None, None, Some(id)).unwrap();
+        let camera = camera_for(&tree, &vp, None, None, Some(&Target::Id(id))).unwrap();
         let by_width = Camera::WORLD_HEIGHT
             * (f64::from(vp.frame_width) / f64::from(vp.frame_height))
             / (1.2 * 4.0);
@@ -2552,7 +2920,14 @@ mod tests {
     fn a_flat_focus_is_fitted_by_its_long_axis() {
         let mut tree = SceneTree::new();
         let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(4.0, 0.0)));
-        let camera = camera_for(&tree, &Viewport::default(), None, None, Some(id)).unwrap();
+        let camera = camera_for(
+            &tree,
+            &Viewport::default(),
+            None,
+            None,
+            Some(&Target::Id(id)),
+        )
+        .unwrap();
         let expected = Camera::WORLD_HEIGHT * (1280.0 / 720.0) / (1.2 * 4.0);
         assert!((camera.zoom - expected).abs() < 1e-12, "{}", camera.zoom);
     }
@@ -2565,7 +2940,7 @@ mod tests {
             &Viewport::default(),
             Some([10.0, -4.0]),
             Some(1.5),
-            Some(id),
+            Some(&Target::Id(id)),
         )
         .unwrap();
         assert_eq!(camera, Camera::new((10.0, -4.0), 1.5));

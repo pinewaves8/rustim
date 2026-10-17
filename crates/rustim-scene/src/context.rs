@@ -403,7 +403,8 @@ impl SceneContext {
             duration,
         } = cmd
         {
-            let to = command::camera_for(&self.tree, &self.viewport, *center, *zoom, *focus)?;
+            let to =
+                command::camera_for(&self.tree, &self.viewport, *center, *zoom, focus.as_ref())?;
             match command::camera_duration(*duration)? {
                 None => self.tree.camera = to,
                 Some(seconds) => self.play(CameraMove::new(to).with_duration(seconds)),
@@ -414,13 +415,16 @@ impl SceneContext {
             let tree = self.semantic_tree(None);
             let tree = match target {
                 None => tree,
-                // The refusal is `NoSuchNode` rather than an empty subtree: a
-                // host that asked about a node it believes exists has a bug or
-                // a stale id, and a document with no nodes reads as "it is
-                // empty", which is a different (and false) answer.
-                Some(id) => tree
-                    .subtree(*id)
-                    .ok_or(CommandError::NoSuchNode { target: *id })?,
+                // The refusal is `NoSuchNode` (or a label refusal) rather than
+                // an empty subtree: a host that asked about a node it believes
+                // exists has a bug or a stale id, and a document with no nodes
+                // reads as "it is empty", which is a different (and false)
+                // answer.
+                Some(target) => {
+                    let id = target.resolve(&self.tree)?;
+                    tree.subtree(id)
+                        .ok_or(CommandError::NoSuchNode { target: id })?
+                }
             };
             return Ok(CommandOutcome::Queried(tree));
         }
@@ -831,7 +835,7 @@ mod tests {
 
         let outcome = ctx
             .handle(&Command::Query {
-                target: Some(parent),
+                target: Some(parent.into()),
             })
             .unwrap();
         let CommandOutcome::Queried(tree) = outcome else {
@@ -850,9 +854,41 @@ mod tests {
         ctx.tree.remove(ghost);
         assert!(matches!(
             ctx.handle(&Command::Query {
-                target: Some(ghost)
+                target: Some(ghost.into())
             }),
             Err(CommandError::NoSuchNode { .. })
+        ));
+    }
+
+    /// A query may name its subject by label, and the document is rooted at the
+    /// node that label resolves to. The refusal for a label no node carries is
+    /// `NoSuchLabel`, which is a different bug from a stale id.
+    #[test]
+    fn a_query_can_name_its_subject_by_label() {
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        ctx.tree.get_mut(id).unwrap().label = Some("方块".into());
+
+        let outcome = ctx
+            .handle(&Command::Query {
+                target: Some("方块".into()),
+            })
+            .unwrap();
+        let CommandOutcome::Queried(tree) = outcome else {
+            panic!("a query is a read");
+        };
+        assert_eq!(tree.root, id);
+        assert_eq!(tree.nodes.len(), 1);
+        assert_eq!(tree.get(id).unwrap().name, "方块");
+
+        assert!(matches!(
+            ctx.handle(&Command::Query {
+                target: Some("不存在".into())
+            }),
+            Err(CommandError::NoSuchLabel { .. })
         ));
     }
 
@@ -1105,7 +1141,7 @@ mod tests {
         let id = invisible_square(&mut ctx);
         let cmd = Command::Play {
             animation: command::AnimationSpec {
-                target: Some(id),
+                target: Some(id.into()),
                 kind: command::AnimationKind::FadeIn,
                 duration: Some(0.5),
                 to: None,
@@ -1231,7 +1267,7 @@ mod tests {
         let id = invisible_square(&mut ctx);
         let cmd = Command::Play {
             animation: command::AnimationSpec {
-                target: Some(id),
+                target: Some(id.into()),
                 kind: command::AnimationKind::FadeIn,
                 duration: Some(0.5),
                 to: None,
@@ -1273,7 +1309,7 @@ mod tests {
         ctx.tree.remove(ghost);
         let cmd = Command::Play {
             animation: command::AnimationSpec {
-                target: Some(ghost),
+                target: Some(ghost.into()),
                 kind: command::AnimationKind::FadeIn,
                 duration: None,
                 to: None,

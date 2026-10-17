@@ -220,6 +220,22 @@ fn a_query_answers_with_the_tree_and_no_diff() {
     assert_eq!(subtree["tree"]["root"].as_u64(), Some(id));
     assert_eq!(subtree["tree"]["nodes"].as_array().unwrap().len(), 1);
 
+    // The label spelling reaches the same node: the browser host is a thin
+    // wrapper over the shared protocol, so this is the desktop feed's answer.
+    let labelled: serde_json::Value = serde_json::from_str(
+        &session
+            .apply(r#"{"action":"query","target":"直角三角形"}"#)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(labelled["tree"]["nodes"].as_array().unwrap().len(), 1);
+    let triangle = nodes
+        .iter()
+        .find(|n| n["name"] == "直角三角形")
+        .expect("the triangle is in the whole tree");
+    assert_eq!(labelled["tree"]["root"], triangle["id"]);
+    assert!(labelled.get("diff").is_none());
+
     // And a node that is not there is a refusal, not an empty document.
     let refused: serde_json::Value =
         serde_json::from_str(&session.apply(r#"{"action":"query","target":999}"#).unwrap())

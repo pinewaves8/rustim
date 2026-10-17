@@ -639,6 +639,29 @@ impl SceneTree {
         out
     }
 
+    /// Every node whose label is exactly `label`, in draw order.
+    ///
+    /// A label is **not a key**: the engine has never refused a duplicate, and a
+    /// scene that creates two objects called "圆" is legitimate. So the answer is
+    /// a list, and the caller decides what "the node called 圆" means when there
+    /// are several — the command layer refuses such an address and names the
+    /// candidates rather than picking whichever the storage happened to return
+    /// first.
+    ///
+    /// Draw order is what makes the list deterministic: `SlotMap`'s iteration
+    /// order is an implementation detail, and a refusal that lists candidates in
+    /// a different order per run is not something a host can test against.
+    pub fn ids_with_label(&self, label: &str) -> Vec<NodeId> {
+        self.draw_order()
+            .into_iter()
+            .filter(|id| {
+                self.nodes
+                    .get(*id)
+                    .is_some_and(|m| m.label.as_deref() == Some(label))
+            })
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
