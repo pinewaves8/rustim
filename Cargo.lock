@@ -3187,6 +3187,7 @@ dependencies = [
 name = "rustim-mobject"
 version = "0.0.0"
 dependencies = [
+ "peniko",
  "rustim-color",
  "rustim-math",
  "serde",

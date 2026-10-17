@@ -21,9 +21,11 @@
 pub mod kind;
 pub mod shapes;
 pub mod style;
+pub mod text;
 pub mod tree;
 
 pub use kind::NodeKind;
 pub use shapes::{ShapeKind, ShapeParams, build};
 pub use style::{DirtyFlags, Style};
+pub use text::{TextBlock, TextRun};
 pub use tree::{Mobject, NodeId, SceneTree, Subtree};

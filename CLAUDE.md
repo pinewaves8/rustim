@@ -54,13 +54,16 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **649 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **677 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
-`rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
+`rustim-app` and **not** from `rustim-scene`, and with no parley or Typst in it), all eight golden
+scenes match their checked-in
 baselines, a script replays to a byte-identical frame, an exported frame equals the still pixel for
-pixel, and `rustim-app --png out.png` reproduces the
+pixel, a scripted `add` of `text` / `formula` / `group` builds real objects through the host's
+`Typesetter` (the desktop `hello` advertises all **11** shapes; the plain browser page advertises
+nine, the formula page ten), and `rustim-app --png out.png` reproduces the
 Manim reference frame with an **identical content bounding box** (`343,90,936,629`); only 0.012% of
 pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The browser host
 builds both ways (with and without Typst) and was **run in Chrome 151**, where its canvas matches the
@@ -348,15 +351,15 @@ last property.
 |---|---|---|
 | `rustim-math` | Points, `Affine2`, rate functions and the `Rate` wire vocabulary, the pixel-only `Viewport` and the `Camera` view (world→screen), the pointer gesture vocabulary (`gesture`: drag, scroll, zoom factor, zoom range) shared by both hosts, and literal ports of Manim's `bezier` / `space_ops` / `paths` / `rate_functions` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
-| `rustim-mobject` | `Mobject` (points / declared `local_bounds` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors`, `ids_with_label` | Real |
+| `rustim-mobject` | `Mobject` (points / declared `local_bounds` / a wire-shaped `text: Option<TextBlock>` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot` / `group`) and `AxesScale`, `text` (`TextBlock` / `TextRun` / `FontData` — the glyph geometry a shaper hands over), `critical_point`, `world_anchors`, `ids_with_label` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
-| `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
+| `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it) and `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
-| `rustim-app` | The winit event loop, softbuffer presentation, keyboard and pointer input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
-| `rustim-web` | The browser host: `Session` (scene + context + renderer + draw list, target-independent and testable natively), `aria` (the semantic tree → flat ARIA projection), `pointer` (DOM wheel/pointer units and signs → `rustim-math::gesture`, pure and natively tested), `web` (the wasm shell: canvas, rAF loop, pointer/wheel listeners, DOM/ARIA overlay), the command bridge and the optional `formula` scene | Real (Chrome-verified) |
+| `rustim-app` | The winit event loop, softbuffer presentation, keyboard and pointer input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, `typeset` (the desktop `Typesetter`: parley text, Typst formulas, installed on every `SceneContext` the binary builds), the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
+| `rustim-web` | The browser host: `Session` (scene + context + renderer + draw list, target-independent and testable natively), `aria` (the semantic tree → flat ARIA projection), `pointer` (DOM wheel/pointer units and signs → `rustim-math::gesture`, pure and natively tested), `typeset` (the formula-only `Typesetter`, `from_embedded`, under the `formula` feature), `web` (the wasm shell: canvas, rAF loop, pointer/wheel listeners, DOM/ARIA overlay), the command bridge and the optional `formula` scene | Real (Chrome-verified) |
 | `rustim-client` | The **client half** of the command protocol: `read_reply` (one reply line, the presence rule enforced) and `StdioClient` (spawn, `send`, `send_raw`, `write_raw`, `hello`, `close`, seq checking). No engine logic, no rendering, no platform code — it spawns a process, which is a host's job, so it is **not** one of the six wasm kernel crates | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
@@ -1181,7 +1184,8 @@ Three crates, and the boundaries are the point:
 | Crate | What it owns |
 |---|---|
 | `rustim-text` | `FontProvider` (a `parley`/`fontique` collection fed from a directory or a buffer, **never** from system font paths), `shape()`, and the `MissingGlyph` / `FontSubstitution` reports. Knows nothing about drawing |
-| `rustim-app::text` | The conversion: parley's runs → `DrawOp::GlyphRun`. The one place a shaper's output meets a rasteriser's input |
+| `rustim-scene::text` | `TextBlock` → `DrawOp::GlyphRun` (`text_ops`, `push_text`). The one place a shaper's output meets a rasteriser's input, and it lives in the kernel because a **wire-created** text mobject is drawn by `SceneContext::build_draw_list` — the scene that pushed its own text used to be the only writer |
+| `rustim-app::text` | The shaper side: `ShapedText` → `TextBlock`, then delegates to `rustim_scene::text`. `rustim-text` knows nothing about drawing |
 | `rustim-render` | `DrawOp::GlyphRun` → `glifo`. **`rustim-render` must never depend on `rustim-text`,** and the shared type is `rustim_math::TextGlyph` |
 
 CJK ships in the repository at `assets/fonts/` (Noto Sans CJK, OFL) and is read at **run time**, not
@@ -1222,6 +1226,77 @@ node; the declared box described under "Accessibility" fixed both, and the shape
 72 to the world unit. Measured, not derived — see the constant's doc and
 `tests/manim_text_scale.rs`; multiplying Manim's `TEXT2SVG_ADJUSTMENT_FACTOR` by
 `TEXT_MOB_SCALE_FACTOR` gives `0.5` and is wrong by a third.
+
+### Wire-level text, formulas and groups: the `Typesetter` seam
+
+`add` accepts three kinds that are not built by `shapes::build`: `text`, `formula` and `group`. The
+first two need a shaper, and **the kernel has none** — `rustim-scene` must keep compiling to wasm
+without parley or Typst — so the host installs one through a trait:
+
+```rust
+pub trait Typesetter {
+    fn supports_text(&self) -> bool { false }
+    fn supports_formula(&self) -> bool { false }
+    fn text(&mut self, text: &str, spec: &TextSpec) -> Result<TextBlock, TypesetError>;
+    fn formula(&mut self, source: &str, tree: &mut SceneTree) -> Result<TypesetFormula, TypesetError>;
+}
+```
+
+`SceneContext::set_typesetter` stores a `Box<dyn Typesetter>`; a context built without one (every
+kernel test, the export path before the app installs one, the plain browser page) simply has no text
+or formula vocabulary. Four properties are load-bearing:
+
+- **`handle` intercepts the two kinds; `command::apply` refuses them.** A pure tree-level function
+  cannot typeset, so `apply` answers `Unsupported { feature }` rather than inserting a node with no
+  picture — a scene that was told it added text must not then draw nothing. The interception lives
+  beside `play`/`query`/`camera` for the same reason: those need state (the timeline, the viewport)
+  that `apply` does not have. `group` is *not* intercepted: adopting children is pure tree surgery.
+- **`hello`'s capability list is filtered by the installed typesetter**
+  (`SceneContext::capabilities` → `Capabilities::with_typesetting`), so a build never advertises a
+  kind its first `add` would refuse. `Capabilities::current()` stays the full vocabulary — it is what
+  the conformance suite reads as the protocol's word list, and it is not a claim about any binary.
+- **The error mapping is the seam's, once.** `TypesetError::Invalid { detail }` is a source the caller
+  can rewrite and becomes `OutOfRange { property: "text", detail }`; `TypesetError::Failed { detail }`
+  is a backend that cannot run (a missing `assets/fonts/`, an engine with no output) and becomes
+  `CommandError::Typeset { detail }`. Retrying a sentence does not fix the second, which is why the two
+  variants exist.
+- **The desktop's provider is lazy and caches its failures** (`rustim_app::typeset::AppTypesetter`):
+  `FontProvider::with_bundled` parses 19 MB and `FormulaCompiler::new` builds Typst's library, so a
+  `--png` of a scene with no text pays neither. `supports_text`/`supports_formula` answer `true`
+  unconditionally — the build was compiled with the shaper; whether the font directory is reachable
+  on this machine is a runtime fact and belongs in `Failed`, not in a handshake that would then
+  describe the deployment's disk.
+
+**A wire text node stores a `TextBlock`, and the draw walk draws it.** `Mobject::text` is a new field
+(`rustim_mobject::text::TextBlock`) holding the shaper's runs; `build_draw_list` emits
+`rustim_scene::text::text_ops(block, parent_transform * m.transform, ctx.affine(), paint)` and then
+reinstates `SetTransform(affine)` — the sharp edge `text_ops` documents: it returns ops and leaves the
+transform belonging to the block. Paint alpha is `m.opacity * style.fill_opacity`, the same composition
+every filled path uses. `local_bounds` is set from the block's `width`/`height`, which is what gives
+the node measured bounds, a centre for `MoveTo` and a `camera focus` subject.
+
+**A wire formula is a subtree, styled at insertion.** `Typesetter::formula` compiles and inserts into
+the live tree, returning the root and the created nodes (`glyphs` and `rules`); the context then
+writes the command's `color` (`fill_opacity = 1`, `stroke_opacity = 0`) onto **every** created node,
+because a formula's glyphs are ordinary mobjects and their default style is off, and applies `label` /
+`position` / `scale` to the root in `build`'s order (`translate * scale`). The answer's
+`created` is the root id alone — a host asked for one object and gets one handle; the glyphs stay
+addressable through `query`. `spec.text` is Typst math source without `$`.
+
+**`group` is the one container the wire can build.** `children: Option<Vec<Target>>` is meaningful
+only for `"type":"group"`: every entry is resolved before anything is inserted (so a bad id leaves no
+half-built group), then reparented under the new node in the given order — draw order, so a later child
+paints over an earlier one. `diff.created` names the group, `diff.modified` the adopted children;
+`children` on any other kind is `OutOfRange { property: "children" }`, and an empty list is legal. A
+group has no geometry of its own, so `set position`, `MoveTo` and `FadeOut` act on the whole set while
+the members keep their ids and labels — which is what makes "name a compound figure, then move it" a
+two-command idea instead of a reparenting dance.
+
+The browser host's answer is `rustim_web::typeset::WebTypesetter`, compiled only under the `formula`
+feature: `FormulaCompiler::from_embedded` (typst-assets, no filesystem) and `supports_text() -> false`
+— the embedded font set has no CJK face, and promising text would make `hello` describe a deployment
+rather than the artifact. The plain page installs nothing and advertises neither kind. Both halves are
+pinned by `crates/rustim-web/tests/session.rs` under `cfg(feature)`.
 
 ### Web (WASM)
 
@@ -2362,6 +2437,33 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   `使用说明.md` §4 documents the handshake for a user. Deliberately not done here: label addressing
   already existed (step 22b), and no second transport, no MCP surface, no checkpointing — those are
   later phases and the documents say so.
+- **Phase 1's first slice — wire-level `text` / `formula` / `group` — is done.** `add` now accepts
+  the three kinds that made a scripted lecture impossible: a sentence, a Typst formula and a group
+  that adopts existing nodes by `Target`, all through the ordinary command feed. The structural
+  change is `rustim_scene::typeset::Typesetter` — a trait with no fonts in it, installed on
+  `SceneContext` by the host — so the kernel still compiles to wasm with neither parley nor Typst,
+  and `hello`'s shape list is filtered by what the installed typesetter can actually build (11 on
+  the desktop, 9 on the plain browser page, 10 on the formula page). `handle` intercepts the two
+  shaped kinds and `command::apply` refuses them with `Unsupported`, because a pure tree function
+  cannot typeset; `TypesetError::Invalid` maps to `OutOfRange { property: "text" }` and `Failed` to
+  the new `Typeset` refusal. A wire text node stores a `TextBlock` in `Mobject::text` and
+  `build_draw_list` draws it through `rustim_scene::text::text_ops` (now in the kernel, so a
+  compiled scene's text and a scripted `add` produce the same ops); a wire formula is inserted as a
+  subtree and every compiler-created node takes the command's colour, with `label` / `position` /
+  `scale` on the root. The desktop provider (`rustim_app::typeset`) is lazy and caches a missing
+  font directory as a value; the browser's (`rustim_web::typeset`) is formula-only, under the
+  `formula` feature, from `typst-assets`. Evidence: six `context.rs` tests (no typesetter → refusal;
+  half a typesetter advertises and refuses exactly that half; the draw walk's glyph run and the
+  reinstated frame transform; a formula's coloured children; a refusal keeps its kind; `children`
+  on a shaped kind names the field), five command-layer tests (group adoption, created/modified,
+  draw order, the two refusals, an empty group), three `AppTypesetter` tests, two `WebTypesetter`
+  tests, two feature-gated browser-session tests, and manual end-to-end runs: `--inspect` shows a
+  wire text node with measured bounds and a wire formula with its `<math>` MathML and glyph
+  children, `--png` renders both, and setting a group's position moved both children's bounds by
+  exactly 90 px. **All eight goldens are unchanged** — no compiled scene uses wire typesetting —
+  and the count moved 649 → 677. Deferred, deliberately: text styling on the wire (size and
+  `max_width` only; no font family, weight or colour per run), formula styling per element, and a
+  browser text path (the embedded font set has no CJK face).
 
 ## AI integration
 
@@ -2456,6 +2558,12 @@ keeps that node and its descendants and sets the document's `root` to it; a miss
 `NoSuchNode`, never an empty tree, because "there is nothing under it" and "it is not there" are
 different answers and a host cannot tell them apart afterwards. The reply's `live` is always `null`:
 the announcement text belongs to a host's accessibility layer, not to the kernel.
+
+`add` builds more than polygons: `text`, `formula` and `group` are on the wire (see "Wire-level text,
+formulas and groups: the `Typesetter` seam"), and their availability is in `hello`. A scripted
+lecture is therefore `add` a sentence, `add` a formula, `play` the two beats, `narrate` the sentence
+— with no compiled scene at all. `group` adopts existing nodes through `children`, which is how a
+model composes a figure it can move and fade as one object without losing the parts' ids.
 
 `CommandOutcome` is the in-memory vocabulary that keeps the three answers apart — `Applied(StateDiff)`,
 `Queried(SemanticTree)` and `Greeted(Capabilities)` — and `reply_line` is the only thing that turns it

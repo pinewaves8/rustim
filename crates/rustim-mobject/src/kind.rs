@@ -58,8 +58,8 @@ pub enum NodeKind {
     /// drawn as filled outlines. It is measured like a line (the corner set's
     /// diameter), not like a box, for the same rotation reason.
     NumberLine,
-    /// A container. Reserved: nothing builds one yet, `SceneTree::reparent` is
-    /// the only way to make a group today.
+    /// A container. `ShapeKind::Group` builds one; the command layer attaches
+    /// its children with `SceneTree::reparent`.
     Group,
     Text,
     Heading,
@@ -79,6 +79,9 @@ impl From<ShapeKind> for NodeKind {
             ShapeKind::NumberLine => Self::NumberLine,
             ShapeKind::Axes => Self::Axes,
             ShapeKind::Plot => Self::Plot,
+            ShapeKind::Text => Self::Text,
+            ShapeKind::Formula => Self::Formula,
+            ShapeKind::Group => Self::Group,
         }
     }
 }
@@ -90,21 +93,27 @@ mod tests {
     #[test]
     fn the_shape_kinds_keep_their_wire_names() {
         // The point of the flat enum: `ShapeKind::Square` and `NodeKind::Square`
-        // are the same word on the wire.
-        for kind in [
-            ShapeKind::Square,
-            ShapeKind::Circle,
-            ShapeKind::RightTriangle,
-            ShapeKind::Line,
-            ShapeKind::Arrow,
-            ShapeKind::NumberLine,
-            ShapeKind::Axes,
-            ShapeKind::Plot,
-        ] {
+        // are the same word on the wire. Iterating `ALL` rather than a second
+        // literal list means a kind added to the vocabulary is checked here in
+        // the same commit that adds it — the failure mode of a hand-written list
+        // is a new kind nobody compares.
+        for kind in ShapeKind::ALL {
             assert_eq!(
                 serde_json::to_string(&NodeKind::from(kind)).unwrap(),
                 serde_json::to_string(&kind).unwrap(),
+                "{kind:?}",
             );
+        }
+    }
+
+    /// Every `ShapeKind` variant is in `ALL`, and every one has a `NodeKind`
+    /// spelling distinct from `Unknown`'s — the two ways the vocabulary above
+    /// could silently shrink.
+    #[test]
+    fn every_shape_kind_is_in_the_vocabulary() {
+        assert_eq!(ShapeKind::ALL.len(), 11);
+        for kind in ShapeKind::ALL {
+            assert_ne!(NodeKind::from(kind), NodeKind::Unknown, "{kind:?}");
         }
     }
 

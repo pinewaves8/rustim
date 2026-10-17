@@ -165,6 +165,20 @@ pub struct Mobject {
     ///
     /// `Mobject` is not `Serialize`, so this field changes no wire JSON.
     pub local_bounds: Option<Rect>,
+    /// A shaped glyph run, for an object whose picture is text rather than a
+    /// point array.
+    ///
+    /// Text has no points — its geometry comes from a shaper — so this is the
+    /// object's picture, carried as plain data ([`crate::TextBlock`]): the font
+    /// handles, the em sizes and the glyph offsets, with no font parser in this
+    /// crate. A mobject with this field set is drawn by
+    /// `SceneContext::build_draw_list`, which emits one `GlyphRun` op per run;
+    /// a text mobject is still addressable, still carries a label, and still
+    /// answers bounds from [`Mobject::local_bounds`].
+    ///
+    /// `None` for every other object, including the ones a compiled scene
+    /// shapes and draws itself.
+    pub text: Option<Box<crate::TextBlock>>,
     pub children: Vec<NodeId>,
     pub parent: Option<NodeId>,
     /// Draw order within a parent. Manim has no explicit z; order of addition
@@ -185,6 +199,7 @@ impl Mobject {
             mathml: None,
             kind: NodeKind::Unknown,
             local_bounds: None,
+            text: None,
             children: Vec::new(),
             parent: None,
             z: 0,
@@ -225,6 +240,24 @@ impl Mobject {
     pub fn with_local_bounds(mut self, bounds: Rect) -> Self {
         self.local_bounds = Some(bounds);
         self.dirty.semantic = true;
+        self
+    }
+
+    /// Give this object a shaped glyph run as its picture.
+    ///
+    /// The block's layout box becomes [`Mobject::local_bounds`] in the same
+    /// step, because that is what makes the object measurable, frameable and
+    /// scalable — a text node with no box would have no centre for `MoveTo` or
+    /// `Rotate`, no bounds in the semantic tree, and no answer for
+    /// `camera focus`. A block whose extent is zero (an empty string) leaves
+    /// the bounds alone rather than declaring a zero box a caller could focus.
+    pub fn with_text(mut self, block: crate::TextBlock) -> Self {
+        if let Some(bounds) = block.local_bounds() {
+            self.local_bounds = Some(bounds);
+            self.dirty.semantic = true;
+        }
+        self.text = Some(Box::new(block));
+        self.dirty.geometry = true;
         self
     }
 
@@ -352,11 +385,13 @@ impl Mobject {
     /// reader can still be told it exists — and a single combined predicate
     /// could not express both.
     ///
-    /// The plain tree walk in `SceneContext::build_draw_list` is narrower still
-    /// and tests the points directly: it can only emit a filled path, and text
-    /// has none for it to fill.
+    /// The tree walk in `SceneContext::build_draw_list` tests for a picture in
+    /// its own way: it emits a glyph run when [`Mobject::text`] is set, and a
+    /// fill/stroke when the points hold at least one curve.
     pub fn has_picture(&self) -> bool {
-        matches!(self.kind, NodeKind::Text | NodeKind::Formula) || self.points.len() >= 2
+        self.text.is_some()
+            || matches!(self.kind, NodeKind::Text | NodeKind::Formula)
+            || self.points.len() >= 2
     }
 }
 

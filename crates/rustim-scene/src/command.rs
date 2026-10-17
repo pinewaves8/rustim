@@ -70,11 +70,28 @@ pub enum Command {
         protocol: Option<u32>,
     },
     /// Create a shape and return its new id.
+    ///
+    /// `children` is meaningful for `"type":"group"` and for nothing else: each
+    /// entry is a [`Target`], resolved before anything is inserted, and every
+    /// child is moved under the new group. A group is the one node whose
+    /// picture *is* its children, so this is how a lecture gets a compound
+    /// object it can name, move and fade as one thing while the parts stay
+    /// addressable. The refusals are values: children on a non-group is
+    /// [`CommandError::OutOfRange`] under `children`, and an unknown child is
+    /// refused as the target it was before anything is created, so a failed
+    /// `add` leaves the tree exactly as it was.
+    ///
+    /// `text` and `formula` are the two kinds whose geometry is produced by the
+    /// host's typesetter rather than by a shape builder (see
+    /// [`crate::SceneContext::handle`]); a build with no typesetter refuses them
+    /// with [`CommandError::Unsupported`].
     Add {
         #[serde(rename = "type")]
         kind: ShapeKind,
         #[serde(default)]
         params: ShapeParams,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        children: Option<Vec<Target>>,
     },
     /// Set one named property of one object.
     Set { target: Target, property: Property },
@@ -572,12 +589,38 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// The capabilities of the running build.
+    /// The vocabulary of the protocol: every name the wire defines.
+    ///
+    /// This is the *vocabulary*, not a promise that a particular binary has a
+    /// provider behind every name — `hello` asks the context
+    /// ([`crate::SceneContext::capabilities`]) for the build's own answer.
+    /// Kept as the full list because it is derived from the serde definitions,
+    /// and the conformance suite reads it as the vocabulary's source of truth.
     pub fn current() -> Self {
+        Self::with_typesetting(true, true)
+    }
+
+    /// The capabilities of a build that may or may not typeset.
+    ///
+    /// `text` and `formula` are the only names a build can lack: every other
+    /// shape is geometry the kernel builds itself, while these two need a
+    /// [`crate::Typesetter`] the host installs. Omitting a name this build
+    /// cannot honour is what makes the handshake worth sending — a capability
+    /// list that promised a shape the first `add` would refuse is worse than
+    /// one that made the client read the refusal it was always going to get.
+    pub fn with_typesetting(text: bool, formula: bool) -> Self {
+        let shapes: Vec<ShapeKind> = ShapeKind::ALL
+            .into_iter()
+            .filter(|kind| match kind {
+                ShapeKind::Text => text,
+                ShapeKind::Formula => formula,
+                _ => true,
+            })
+            .collect();
         Self {
             protocol: PROTOCOL_VERSION,
             engine: format!("rustim/{}", env!("CARGO_PKG_VERSION")),
-            shapes: wire_names(&ShapeKind::ALL),
+            shapes: wire_names(&shapes),
             animations: wire_names(&AnimationKind::ALL),
             properties: PROPERTY_NAMES.iter().map(|n| (*n).to_owned()).collect(),
             rates: wire_names(&Rate::ALL),
@@ -646,6 +689,28 @@ pub enum CommandError {
         property: String,
         detail: String,
     },
+    /// A feature this build does not have, whatever the arguments.
+    ///
+    /// Separate from [`CommandError::OutOfRange`] because the fix is different:
+    /// an out-of-range value is a payload the caller can correct, while an
+    /// unsupported feature is a property of the binary — a `text` object on a
+    /// host with no typesetter will not work however it is phrased. The name is
+    /// the *feature*, so a client learns what to stop asking for; `hello`'s
+    /// capabilities already said as much, and this is the answer to a client
+    /// that asked anyway.
+    Unsupported {
+        feature: String,
+    },
+    /// The host's typesetter failed on source it was given.
+    ///
+    /// The other half of [`CommandError::OutOfRange`]'s typeset arm: a source
+    /// the *caller* can rewrite is refused under `text`, while a backend that
+    /// cannot run — no font directory, an engine that produced nothing — is
+    /// this variant. Retrying the same sentence will not help, and the detail
+    /// says why.
+    Typeset {
+        detail: String,
+    },
     /// The request was not a command at all — whoever read the wire could not
     /// turn it into one, and [`parse_command`] says why.
     ///
@@ -682,6 +747,10 @@ impl std::fmt::Display for CommandError {
             Self::OutOfRange { property, detail } => {
                 write!(f, "{property} out of range: {detail}")
             }
+            Self::Unsupported { feature } => {
+                write!(f, "this build does not support {feature}")
+            }
+            Self::Typeset { detail } => write!(f, "typesetting failed: {detail}"),
             Self::Unparseable { detail } => write!(f, "not a command: {detail}"),
         }
     }
@@ -866,9 +935,56 @@ pub fn reply_line(seq: u64, outcome: Result<CommandOutcome, CommandError>) -> St
 pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandError> {
     let mut diff = StateDiff::default();
     match cmd {
-        Command::Add { kind, params } => {
+        Command::Add {
+            kind,
+            params,
+            children,
+        } => {
+            // The two kinds the kernel cannot build: their geometry is glyphs
+            // and shaping is the host's job. `apply` is pure over the tree and
+            // has no typesetter to ask, so it refuses rather than inserting the
+            // empty container `shapes::build` would hand it — an invisible
+            // object that reports success is the worst of the three answers.
+            // A host with a provider intercepts these before reaching here; see
+            // [`crate::SceneContext::handle`].
+            if kind.needs_typesetter() {
+                return Err(CommandError::Unsupported {
+                    feature: match kind {
+                        ShapeKind::Text => "text",
+                        _ => "formula",
+                    }
+                    .to_owned(),
+                });
+            }
+            if children.is_some() && *kind != ShapeKind::Group {
+                return Err(CommandError::OutOfRange {
+                    property: "children".to_owned(),
+                    detail: "only a group takes children".to_owned(),
+                });
+            }
+            // Every child resolves **before** anything is inserted, so a bad
+            // target leaves the tree exactly as the command found it rather
+            // than leaving a half-filled group behind.
+            let children: Vec<NodeId> = match children {
+                Some(targets) => targets
+                    .iter()
+                    .map(|target| target.resolve(tree))
+                    .collect::<Result<_, _>>()?,
+                None => Vec::new(),
+            };
             let id = tree.insert(rustim_mobject::shapes::build(*kind, params));
             diff.created.push(id);
+            for child in children {
+                // Unconditional, with the result checked separately: this is
+                // the `reparent`-inside-`debug_assert!` trap that has cost
+                // `Formula::insert` twice. The result cannot be false here —
+                // the child exists and a fresh group has no ancestors — so a
+                // false is left out of the diff rather than claimed as a move.
+                let moved = tree.reparent(child, id);
+                if moved {
+                    diff.modified.push(child);
+                }
+            }
         }
         Command::Remove { target } => {
             // `resolve` is also the existence check, for both spellings: an id
@@ -1501,6 +1617,20 @@ mod tests {
                 .to_owned(),
             r#"{"action":"add","type":"plot","params":{"thickness":0.05,"points":[[0.0,0.0],[1.0,1.0],[2.0,0.0]]}}"#
                 .to_owned(),
+            // The two kinds only a hosted typesetter can build. The source
+            // string is `params.text`, and the layout knobs are optional: a
+            // read-back that wrote them as `null` would fail here.
+            r#"{"action":"add","type":"text","params":{"label":"字","text":"你好","size":0.5,"max_width":3.0}}"#
+                .to_owned(),
+            r#"{"action":"add","type":"formula","params":{"label":"公式","text":"x^2 + 1","scale":2.0}}"#
+                .to_owned(),
+            // A group names *nodes* rather than geometry, and `children` is the
+            // one field on `add` that does. Two spellings, because a child may
+            // be an id or a label.
+            format!(
+                r#"{{"action":"add","type":"group","params":{{"label":"g"}},"children":[{id}]}}"#
+            ),
+            r#"{"action":"add","type":"group","params":{},"children":["leg a"]}"#.to_owned(),
             // Stroke knobs. The colour's `[u8; 3]` is the same spelling
             // `params.color` uses, and the alpha never appears in the colour
             // itself — one alpha per channel, in its own property.
@@ -2020,6 +2150,112 @@ mod tests {
         assert_eq!(diff.created.len(), 1);
         let id = diff.created[0];
         assert_eq!(tree.get(id).unwrap().label.as_deref(), Some("leg a"));
+    }
+
+    /// A group is the one node built from *other nodes*: every child named is
+    /// resolved, moved under the new group, and reported — the group in
+    /// `created`, each child in `modified`. Both address spellings work in the
+    /// same list, and the draw order puts the group before the children it
+    /// adopted.
+    #[test]
+    fn a_group_add_adopts_the_children_it_names() {
+        let mut tree = SceneTree::new();
+        let a = tree.insert(rustim_mobject::Mobject::new(vec![]).with_label("a"));
+        let b = tree.insert(rustim_mobject::Mobject::new(vec![]));
+        let cmd: Command = serde_json::from_str(&format!(
+            r#"{{"action":"add","type":"group","params":{{"label":"g"}},"children":[{}, "a"]}}"#,
+            b.raw()
+        ))
+        .unwrap();
+        let diff = apply(&mut tree, &cmd).unwrap();
+        let group = diff.created[0];
+        assert_eq!(diff.created.len(), 1, "the group is the object");
+        assert_eq!(diff.modified, [b, a]);
+        assert_eq!(tree.child_ids(group), [b, a]);
+        assert!(!tree.root_ids().contains(&a) && !tree.root_ids().contains(&b));
+
+        let order = tree.draw_order();
+        let at = |id| order.iter().position(|node| *node == id).unwrap();
+        assert!(at(group) < at(b) && at(b) < at(a), "draw order: {order:?}");
+    }
+
+    /// `children` is a group's grammar. On any other kind it is a malformed
+    /// payload, refused under the field it named — before anything is built.
+    #[test]
+    fn children_on_a_non_group_are_refused() {
+        let mut tree = SceneTree::new();
+        let a = tree.insert(rustim_mobject::Mobject::new(vec![]));
+        let cmd: Command = serde_json::from_str(&format!(
+            r#"{{"action":"add","type":"square","children":[{}]}}"#,
+            a.raw()
+        ))
+        .unwrap();
+        assert_eq!(
+            apply(&mut tree, &cmd),
+            Err(CommandError::OutOfRange {
+                property: "children".to_owned(),
+                detail: "only a group takes children".to_owned()
+            })
+        );
+        assert!(tree.root_ids().contains(&a), "the child was not moved");
+    }
+
+    /// **Nothing is inserted until every child resolves.** A `children` list
+    /// with one bad entry must leave the tree exactly as it found it — a group
+    /// that adopted half its children would be a compound object nobody can
+    /// reason about, and the caller has no way to undo it.
+    #[test]
+    fn an_unresolvable_child_leaves_no_half_built_group() {
+        let mut tree = SceneTree::new();
+        let before = tree.len();
+        let cmd: Command =
+            serde_json::from_str(r#"{"action":"add","type":"group","children":[4294967297]}"#)
+                .unwrap();
+        assert_eq!(
+            apply(&mut tree, &cmd),
+            Err(CommandError::NoSuchNode {
+                target: NodeId::from_raw(4294967297)
+            })
+        );
+        assert_eq!(tree.len(), before, "no group, no colourless orphan");
+    }
+
+    /// An empty group is legal: "a compound object this lecture will fill as it
+    /// goes" is a thing a script builds, and `children: []` says so.
+    #[test]
+    fn a_group_may_start_empty() {
+        let mut tree = SceneTree::new();
+        let cmd: Command =
+            serde_json::from_str(r#"{"action":"add","type":"group","children":[]}"#).unwrap();
+        let diff = apply(&mut tree, &cmd).unwrap();
+        assert_eq!(diff.created.len(), 1);
+        assert!(tree.child_ids(diff.created[0]).is_empty());
+    }
+
+    /// The pure path has no typesetter, so the two shaped kinds are refused
+    /// with the feature named rather than inserted as invisible containers. A
+    /// host that has a provider intercepts them before reaching here — see
+    /// `SceneContext::add_typeset`.
+    #[test]
+    fn apply_refuses_the_two_kinds_it_cannot_shape() {
+        let mut tree = SceneTree::new();
+        for (kind, feature) in [(ShapeKind::Text, "text"), (ShapeKind::Formula, "formula")] {
+            let cmd = Command::Add {
+                kind,
+                params: ShapeParams {
+                    text: Some("x".to_owned()),
+                    ..ShapeParams::default()
+                },
+                children: None,
+            };
+            assert_eq!(
+                apply(&mut tree, &cmd),
+                Err(CommandError::Unsupported {
+                    feature: feature.to_owned()
+                })
+            );
+        }
+        assert!(tree.is_empty());
     }
 
     #[test]

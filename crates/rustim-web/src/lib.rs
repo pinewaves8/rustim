@@ -26,6 +26,8 @@
 pub mod aria;
 pub mod pointer;
 pub mod session;
+#[cfg(feature = "formula")]
+pub mod typeset;
 
 #[cfg(target_arch = "wasm32")]
 mod web;

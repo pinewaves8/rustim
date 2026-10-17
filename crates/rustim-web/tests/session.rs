@@ -364,6 +364,70 @@ fn the_formula_scene_carries_its_mathml() {
     assert_eq!(node.mathml.as_deref(), Some(mathml));
 }
 
+/// The handshake is the build's vocabulary, and the browser's typesetting
+/// capability is the `formula` feature: the plain artifact must not advertise a
+/// kind its first `add` would refuse, and the formula artifact must advertise
+/// exactly the half it can build.
+#[cfg(not(feature = "formula"))]
+#[test]
+fn the_default_build_advertises_no_typeset_kind() {
+    let mut session = Session::new(WIDTH, HEIGHT, "pythagorean").expect("the scene builds");
+    let hello: serde_json::Value =
+        serde_json::from_str(&session.apply(r#"{"action":"hello"}"#).expect("a reply")).unwrap();
+    let shapes = hello["capabilities"]["shapes"]
+        .as_array()
+        .expect("a capability list");
+    for absent in ["text", "formula"] {
+        assert!(
+            !shapes.iter().any(|shape| shape == absent),
+            "{absent} is advertised without a typesetter: {shapes:?}"
+        );
+    }
+
+    let refused: serde_json::Value = serde_json::from_str(
+        &session
+            .apply(r#"{"action":"add","type":"formula","params":{"text":"x"}}"#)
+            .expect("a reply"),
+    )
+    .unwrap();
+    assert_eq!(refused["error"]["error"], "unsupported");
+    assert_eq!(refused["error"]["feature"], "formula");
+}
+
+/// With Typst linked, a wire `add` of a formula typesets through the same seam
+/// the desktop uses — and text stays refused, because the embedded font set has
+/// no CJK face.
+#[cfg(feature = "formula")]
+#[test]
+fn the_formula_build_advertises_and_typesets_formulas_only() {
+    let mut session = Session::new(WIDTH, HEIGHT, "pythagorean").expect("the scene builds");
+    let hello: serde_json::Value =
+        serde_json::from_str(&session.apply(r#"{"action":"hello"}"#).expect("a reply")).unwrap();
+    let shapes = hello["capabilities"]["shapes"]
+        .as_array()
+        .expect("a capability list");
+    assert!(shapes.iter().any(|shape| shape == "formula"), "{shapes:?}");
+    assert!(!shapes.iter().any(|shape| shape == "text"), "{shapes:?}");
+
+    let reply: serde_json::Value = serde_json::from_str(
+        &session
+            .apply(r#"{"action":"add","type":"formula","params":{"text":"y^3","label":"三次方"}}"#)
+            .expect("a reply"),
+    )
+    .unwrap();
+    let created = reply["diff"]["created"].as_array().expect("the root's id");
+    assert_eq!(created.len(), 1, "a formula is one object: {reply}");
+
+    let refused: serde_json::Value = serde_json::from_str(
+        &session
+            .apply(r#"{"action":"add","type":"text","params":{"text":"x"}}"#)
+            .expect("a reply"),
+    )
+    .unwrap();
+    assert_eq!(refused["error"]["error"], "unsupported");
+    assert_eq!(refused["error"]["feature"], "text");
+}
+
 /// A build knows exactly the scenes it can construct, and says so otherwise.
 #[test]
 fn an_unknown_scene_is_a_value_not_a_panic() {

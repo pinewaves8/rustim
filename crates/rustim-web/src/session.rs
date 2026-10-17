@@ -139,6 +139,13 @@ impl Session {
             frame_height: height,
         };
         let mut ctx = SceneContext::new(viewport, Motion::Full);
+        // The feature *is* the capability: the formula artifact links Typst and
+        // can answer a wire `add` of a formula; the plain artifact cannot, and
+        // its `hello` says so rather than promising what the first command
+        // would refuse. The desktop binary's answer is installed the same way
+        // (`rustim_app::typeset`), which is the point of the seam.
+        #[cfg(feature = "formula")]
+        ctx.set_typesetter(Box::new(crate::typeset::WebTypesetter::new()));
         scene.construct(&mut ctx);
         Ok(Self {
             scene,

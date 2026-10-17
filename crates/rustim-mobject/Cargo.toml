@@ -9,6 +9,11 @@ license.workspace = true
 [dependencies]
 rustim-math.workspace = true
 rustim-color.workspace = true
+# The font handle a shaped run carries. Pure data — an `Arc`-backed blob and an
+# index — and already in the graph through `rustim-color`, so naming it here
+# adds no crate and no platform code. `rustim-mobject` never opens a font; the
+# shaper lives in `rustim-text`, which is not a kernel crate. See `text.rs`.
+peniko.workspace = true
 slotmap = "1.0.7"
 serde = { version = "1", features = ["derive"] }
 

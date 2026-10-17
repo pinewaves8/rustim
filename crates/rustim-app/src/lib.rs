@@ -30,6 +30,7 @@ pub mod input;
 pub mod motion;
 pub mod speech;
 pub mod text;
+pub mod typeset;
 
 pub use a11y::{A11y, A11yCore, Request};
 pub use announce::{Announcer, Narrator};

@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (8 shapes, 10 animations, 10 properties, 45 rates);
+//!    the build actually has (11 shapes, 10 animations, 10 properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
 //!    against the parser rather than trusted;
@@ -147,7 +147,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     // The sizes are the build's, not a documentation count: a shape or
     // animation added without joining `ALL` fails here before it can ship an
     // incomplete capability list.
-    assert_eq!(caps.shapes.len(), 8, "{:?}", caps.shapes);
+    assert_eq!(caps.shapes.len(), 11, "{:?}", caps.shapes);
     assert_eq!(caps.animations.len(), 10, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
@@ -165,7 +165,15 @@ fn every_advertised_word_is_accepted_by_the_binary() {
     let caps = client.hello().expect("the handshake");
 
     for name in &caps.shapes {
-        let line = format!(r#"{{"action":"add","type":"{name}"}}"#);
+        // The two typeset kinds need their source string: an empty text or
+        // formula is refused under `text` (the payload a model most easily
+        // sends by accident), so a bare probe would be testing that refusal
+        // rather than the vocabulary. Every other kind is self-describing.
+        let line = match name.as_str() {
+            "text" => r#"{"action":"add","type":"text","params":{"text":"你好"}}"#.to_owned(),
+            "formula" => r#"{"action":"add","type":"formula","params":{"text":"x^2"}}"#.to_owned(),
+            _ => format!(r#"{{"action":"add","type":"{name}"}}"#),
+        };
         let diff = expect_diff(&mut client, &line);
         assert_eq!(diff.created.len(), 1, "{line}");
     }
@@ -470,6 +478,7 @@ fn a_blank_line_is_skipped_and_counted() {
         .send(&Command::Add {
             kind: rustim_mobject::shapes::ShapeKind::Circle,
             params: Default::default(),
+            children: None,
         })
         .expect("a typed command");
     assert_eq!(reply.diff.expect("a diff").created.len(), 1);

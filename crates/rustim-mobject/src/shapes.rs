@@ -30,6 +30,23 @@ pub enum ShapeKind {
     /// filled polygon: the fill rule would close the open polyline with its
     /// chord and paint the region under the curve.
     Plot,
+    /// A string, typeset by the host's [`crate::TextBlock`] provider.
+    ///
+    /// This kind is the one that needs something outside the kernel: its
+    /// geometry is a glyph run only a shaper can produce. The command layer
+    /// builds it through `rustim_scene::Typesetter`, and
+    /// [`build`] returns the empty container that provider's block is attached
+    /// to — calling `build` directly yields no picture, on purpose, because
+    /// there is nothing here to shape with.
+    Text,
+    /// A Typst math fragment, likewise typeset by the host.
+    Formula,
+    /// A container whose picture is its children.
+    ///
+    /// The one kind [`build`] constructs with full semantics: an empty
+    /// `NodeKind::Group` mobject. The command layer attaches the children named
+    /// by the `add` command with `SceneTree::reparent`.
+    Group,
 }
 
 impl ShapeKind {
@@ -41,7 +58,7 @@ impl ShapeKind {
     /// second copy of the enum that can drift. A shape added to the enum and to
     /// [`build`] but not here fails the capabilities conformance test by
     /// omission only if the test counts — it does.
-    pub const ALL: [ShapeKind; 8] = [
+    pub const ALL: [ShapeKind; 11] = [
         ShapeKind::Square,
         ShapeKind::Circle,
         ShapeKind::RightTriangle,
@@ -50,7 +67,23 @@ impl ShapeKind {
         ShapeKind::NumberLine,
         ShapeKind::Axes,
         ShapeKind::Plot,
+        ShapeKind::Text,
+        ShapeKind::Formula,
+        ShapeKind::Group,
     ];
+
+    /// Whether [`build`] alone can give this kind a picture.
+    ///
+    /// The two typeset kinds cannot: their geometry is a glyph run only a shaper
+    /// produces, so they are built by the command layer through
+    /// `rustim_scene::Typesetter` and never by a bare `build`. Stated as a
+    /// method so a capability query, the command layer and a host's tool schema
+    /// all ask the same question instead of each spelling out a two-variant
+    /// match. (No intra-doc link: this crate is a kernel crate and must not name
+    /// the scene crate, even in a comment.)
+    pub fn needs_typesetter(self) -> bool {
+        matches!(self, ShapeKind::Text | ShapeKind::Formula)
+    }
 }
 
 /// Parameters for a shape. Every field is optional so a partial description —
@@ -113,6 +146,32 @@ pub struct ShapeParams {
     /// that against the axes it is drawing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub points: Option<Vec<[f64; 2]>>,
+    /// The string a [`ShapeKind::Text`] or [`ShapeKind::Formula`] is made of.
+    ///
+    /// For a formula this is the math body, without the `$…$` delimiters: the
+    /// kind already says it is math, and requiring the delimiters would make one
+    /// more thing for a model to get wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// The em size, in world units, of a [`ShapeKind::Text`]'s runs.
+    ///
+    /// Absent is the shaper's default (`rustim_text::TextStyle::default`), not a
+    /// number of the engine's: a host that has no opinion should get the same
+    /// size a compiled scene's `TextStyle::default()` does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+    /// The widest a [`ShapeKind::Text`] may be before it wraps, in world units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<f64>,
+    /// A uniform scale applied to a [`ShapeKind::Text`] or [`ShapeKind::Formula`]
+    /// once it is typeset.
+    ///
+    /// Typesetting produces a block at its natural size; a lecture needs "make
+    /// this bigger". It is a *post-typeset* scale — the transform, not a second
+    /// font size — so the glyph advances scale with the outlines and the text
+    /// cannot reflow into a different layout when a host nudges it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
 }
 
 impl ShapeParams {
@@ -133,6 +192,25 @@ impl ShapeParams {
     }
     pub fn tick_size(&self) -> f64 {
         self.tick_size.unwrap_or(DEFAULT_TICK_SIZE)
+    }
+    /// The string to typeset. Absent is the empty string, which a typesetter
+    /// refuses rather than drawing — an empty text object is not a description
+    /// anyone meant to send.
+    pub fn text(&self) -> &str {
+        self.text.as_deref().unwrap_or("")
+    }
+    /// The post-typeset scale, defaulting to 1.
+    ///
+    /// A non-finite or non-positive factor is answered with 1 rather than with
+    /// itself: a scale of zero collapses the object to a point and a negative
+    /// one mirrors it, and neither is a thing a lecture asks for. This is the
+    /// same posture the shape builders take — a bad number in, a drawable
+    /// object out — because every field here can come from a model.
+    pub fn scale(&self) -> f64 {
+        match self.scale {
+            Some(s) if s.is_finite() && s > 0.0 => s,
+            _ => 1.0,
+        }
     }
 }
 
@@ -200,6 +278,15 @@ pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
             // than an error, which is what `add` can say.
             None => Vec::new(),
         },
+        // Neither can be built from geometry: the picture is a glyph run, and
+        // the shaper lives above this crate. The command layer intercepts both
+        // kinds and attaches the block a `Typesetter` produced; a caller that
+        // reaches `build` directly gets an empty object wearing the right kind
+        // and label — visible in `--inspect`, absent from the frame — rather
+        // than a plausible-looking wrong shape.
+        ShapeKind::Text | ShapeKind::Formula => Vec::new(),
+        // A group has no geometry of its own: its picture is its children.
+        ShapeKind::Group => Vec::new(),
     };
 
     let color = params.color.map_or(rustim_color::FG, |[r, g, b]| {
@@ -235,6 +322,15 @@ pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
         .with_kind(kind.into());
     if let Some([x, y]) = params.position {
         m.transform = Affine2::translate((x, y));
+    }
+    // Scale *then* place: `*` applies its right operand first, so the other
+    // order would scale the position along with the object. Written for the
+    // typeset kinds — a shaper produces an object at its natural size and the
+    // lecture needs "make this bigger" — but a uniform scale on any kind's
+    // deferred transform is the same operation, so no kind refuses it.
+    let scale = params.scale();
+    if scale != 1.0 {
+        m.transform *= Affine2::scale(scale);
     }
     if let Some(label) = params.label.clone() {
         m.label = Some(label);
@@ -1206,6 +1302,85 @@ mod tests {
         // The local points are untouched; only the transform moved.
         assert_eq!(m.points[0], Point::new(-1.0, -1.0));
         assert_eq!(m.materialize()[0], Point::new(2.0, -2.0));
+    }
+
+    /// A group is an addressable, movable, labelable node with no geometry of
+    /// its own — its picture is its children, which the command layer attaches.
+    ///
+    /// The transform matters even though the object draws nothing: a `MoveTo`
+    /// on a group has to move the children through the parent transform, and
+    /// that is the whole reason a group is a node and not a bookkeeping list.
+    #[test]
+    fn a_group_is_an_empty_container_that_can_be_placed() {
+        let m = build(
+            ShapeKind::Group,
+            &ShapeParams {
+                position: Some([1.0, -2.0]),
+                label: Some("一组".into()),
+                ..Default::default()
+            },
+        );
+        assert!(m.points.is_empty(), "a group has no geometry of its own");
+        assert_eq!(m.kind, crate::NodeKind::Group);
+        assert_eq!(m.label.as_deref(), Some("一组"));
+        assert_eq!(m.materialize(), Vec::new());
+        // The point of the position: it is inherited by the children.
+        assert_eq!(m.transform, Affine2::translate((1.0, -2.0)));
+    }
+
+    /// The two typeset kinds build *nothing* on their own, and say so.
+    ///
+    /// `build` cannot shape text — the shaper is above this crate — so the
+    /// honest result is an empty object wearing the right kind rather than a
+    /// placeholder rectangle that would render as a wrong picture. The command
+    /// layer asks [`ShapeKind::needs_typesetter`] and takes the other route.
+    #[test]
+    fn the_typeset_kinds_build_no_geometry_and_admit_it() {
+        for kind in [ShapeKind::Text, ShapeKind::Formula] {
+            assert!(kind.needs_typesetter(), "{kind:?}");
+            let m = build(kind, &ShapeParams::default());
+            assert!(m.points.is_empty(), "{kind:?}");
+            // `has_picture` is true *by kind*, and deliberately so: a scene can
+            // own a text mobject whose glyph run it pushes itself (that is what
+            // `TextScene` does), so the kind — not the presence of a block — is
+            // what says "a reader can reach this".
+            assert!(m.has_picture(), "{kind:?}");
+            assert!(m.text.is_none(), "{kind:?}: build shapes no text");
+        }
+        for kind in [
+            ShapeKind::Square,
+            ShapeKind::Circle,
+            ShapeKind::Plot,
+            ShapeKind::Group,
+        ] {
+            assert!(!kind.needs_typesetter(), "{kind:?}");
+        }
+    }
+
+    /// `scale` is a post-typeset uniform scale on the deferred transform, and a
+    /// nonsense factor is answered with 1 rather than collapsing the object.
+    #[test]
+    fn a_scale_factor_rides_the_transform_and_refuses_nonsense() {
+        let m = build(
+            ShapeKind::Square,
+            &ShapeParams {
+                scale: Some(2.0),
+                position: Some([1.0, 0.0]),
+                ..Default::default()
+            },
+        );
+        // Scale first, then place: the corner at `(-1, -1)` doubles to
+        // `(-2, -2)` and then moves by `(1, 0)`. The other order would scale
+        // the position too, landing it at `(0, -2)` — half the offset.
+        assert_eq!(m.materialize()[0], Point::new(-1.0, -2.0));
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let p = ShapeParams {
+                scale: Some(bad),
+                ..Default::default()
+            };
+            assert_eq!(p.scale(), 1.0, "scale {bad}");
+        }
     }
 
     #[test]

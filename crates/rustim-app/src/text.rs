@@ -1,11 +1,15 @@
-//! Turning a shaped run into draw operations.
+//! A compiled scene's text: `ShapedText` → the kernel's op builder.
 //!
-//! This is the one place in the workspace where a shaper's output and a
-//! rasteriser's input meet, and it is here — in the library half of the app crate
-//! — rather than in `main.rs` beside the other scenes, because the conversion is
-//! where the subtle mistakes live and it can be tested exactly: build a scene,
-//! ask for the ops, and check where the glyphs landed. The scene that *uses* it
-//! is boilerplate around this function.
+//! The op builder itself lives in [`rustim_scene::text`], because a text object
+//! created by a script's `add` is drawn by `SceneContext::build_draw_list` and
+//! must go through the same transform rule as a scene that pushes its own run.
+//! This module is the app-side adapter: it carries the shaper's type across the
+//! boundary ([`block_of`]), re-exports the one layout conversion, and keeps the
+//! `push_text` helper the scenes and the caption band call.
+//!
+//! The doc comment below is about that conversion, and it is worth keeping here
+//! — next to the shaper's type — because the subtle mistakes it names are made
+//! when someone is looking at a `ShapedText`, not at a `TextBlock`.
 //!
 //! # One conversion, and it belongs in the transform
 //!
@@ -56,22 +60,26 @@
 
 use rustim_color::Srgb;
 use rustim_math::{Affine2, Rect};
+use rustim_mobject::TextBlock;
 use rustim_render::{DrawList, DrawOp};
 use rustim_text::ShapedText;
 
 /// The conversion from the shaper's layout space to a mobject's local space.
 ///
-/// Layout space has its origin at the block's top-left and `y` growing down;
-/// local space is centred on the origin with `y` growing up, so that a block
-/// scales and rotates about its middle like every other shape in the engine.
+/// Re-exported from [`rustim_mobject::text`], which is where the wire-level
+/// `add` path also reads it: the flip and the centring have to happen in exactly
+/// one place, and that place is the kernel — a compiled scene's text and a
+/// scripted `add` must not be two conversions that agree today.
+pub use rustim_mobject::text::layout_to_local;
+
+/// A shaped block in the kernel's data form.
 ///
-/// Written as a translation composed with a flip rather than as two statements
-/// about each coordinate because that is what it is, and because the order
-/// matters: flipping first puts the block's top-left at `(-width/2, +height/2)`,
-/// which is the corner a caller would expect to find it in.
-pub fn layout_to_local(width: f32, height: f32) -> Affine2 {
-    Affine2::translate((-f64::from(width) / 2.0, f64::from(height) / 2.0))
-        * Affine2::scale_non_uniform(1.0, -1.0)
+/// This is the boundary crossing: `ShapedText` is what the shaper hands out,
+/// `TextBlock` is what the kernel stores and draws. Everything below is a thin
+/// wrapper so a scene's own text goes through the same code as a wire-created
+/// one — [`rustim_scene::text`] holds the actual op builder.
+pub fn block_of(shaped: &ShapedText) -> TextBlock {
+    TextBlock::from(shaped)
 }
 
 /// A shaped block's extent in its own local space.
@@ -86,24 +94,15 @@ pub fn layout_to_local(width: f32, height: f32) -> Affine2 {
 /// `None` for a block with no extent: an empty string has nothing to frame, and
 /// a zero-area bounds would be a focus target with no size.
 pub fn local_bounds(shaped: &ShapedText) -> Option<Rect> {
-    let (w, h) = (f64::from(shaped.width), f64::from(shaped.height));
-    if w <= 0.0 || h <= 0.0 {
-        return None;
-    }
-    Some(Rect::new(-w / 2.0, -h / 2.0, w / 2.0, h / 2.0))
+    block_of(shaped).local_bounds()
 }
 
 /// The ops that draw one shaped block, centred on the origin of its own frame.
 ///
-/// `world` is the mobject's own transform composed with its ancestors' — the
-/// caller folds those, because only the scene tree knows them. `to_device` is the
-/// world→screen transform for the frame: the viewport *and the camera*, already
-/// composed (`SceneContext::affine`). Taking the composed transform rather than
-/// the two pieces is deliberate — this module has no business knowing where the
-/// view is looking, and a caller who passed only the viewport would draw text at
-/// the wrong place while every filled path moved correctly. The paint is given
-/// rather than read from a mobject so that this stays a pure function of its
-/// arguments, which is what makes it testable without a tree.
+/// See [`rustim_scene::text::text_ops`] for what the transform is and why the
+/// flip lives in it rather than in the glyph positions. This wrapper exists so a
+/// scene holding a [`ShapedText`] does not have to convert by hand; the body is
+/// the shared builder, not a second copy of it.
 ///
 /// Emits a [`DrawOp::SetTransform`] first, since the draw list's transform is
 /// global to the frame and the view has to be reinstated after whatever was
@@ -116,25 +115,7 @@ pub fn text_ops(
     to_device: Affine2,
     paint: Srgb,
 ) -> Vec<DrawOp> {
-    if shaped.runs.iter().all(|r| r.glyphs.is_empty()) {
-        return Vec::new();
-    }
-    // The block's own placement in the world, then the view: the glyphs keep the
-    // shaper's coordinates, so this is the only place the flip and the centring
-    // happen.
-    let place = to_device * world * layout_to_local(shaped.width, shaped.height);
-
-    let mut ops = Vec::with_capacity(shaped.runs.len() * 2 + 1);
-    ops.push(DrawOp::SetTransform(place));
-    ops.push(DrawOp::SetPaint(paint));
-    for run in &shaped.runs {
-        ops.push(DrawOp::GlyphRun {
-            font: run.font.clone(),
-            size: run.size,
-            glyphs: run.glyphs.clone(),
-        });
-    }
-    ops
+    rustim_scene::text::text_ops(&block_of(shaped), world, to_device, paint)
 }
 
 /// The ops for one shaped block, appended to `list`.

@@ -2,11 +2,13 @@
 
 use rustim_anim::{Animation, AnimationScheduler, CameraMove, Motion, Sequence, Wait};
 use rustim_math::{Affine2, Camera, Viewport};
+use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 use rustim_mobject::{NodeId, SceneTree};
 use rustim_render::{DrawList, DrawOp};
 
 use crate::a11y;
 use crate::command::{self, Capabilities, Command, CommandError, CommandOutcome, StateDiff};
+use crate::typeset::{TextSpec, TypesetError, Typesetter};
 
 /// A scene: the user-facing entry point, mirroring Manim's `construct()`.
 ///
@@ -111,6 +113,16 @@ pub struct SceneContext {
     /// [`SceneContext::take_narration`] may drain it — a host that read it
     /// directly would have to reproduce the "due at or before the clock" rule.
     narration: Vec<(f64, String)>,
+    /// Whatever this host typesets with, or nothing at all.
+    ///
+    /// The shaper is not a kernel dependency (see [`crate::typeset`]), so the
+    /// capability is injected. `None` is the honest default and not a
+    /// placeholder: a context with no typesetter refuses `text` and `formula`
+    /// with [`CommandError::Unsupported`] and advertises neither in
+    /// [`SceneContext::capabilities`], which is exactly what a host that cannot
+    /// shape glyphs should say. It survives [`SceneContext::reset`], because it
+    /// is a property of the binary rather than of the scene.
+    typesetter: Option<Box<dyn Typesetter>>,
 }
 
 impl SceneContext {
@@ -128,7 +140,31 @@ impl SceneContext {
             playback: Sequence::new(),
             clock: 0.0,
             narration: Vec::new(),
+            typesetter: None,
         }
+    }
+
+    /// Install the build's typesetter.
+    ///
+    /// Called by a host once, at construction: the desktop binary installs the
+    /// parley + Typst provider, the browser's default build installs none. A
+    /// later call replaces the previous one whole — see [`Typesetter`]'s doc for
+    /// why one provider per build is the contract — and it takes effect at the
+    /// next `add` (nothing already in the tree is reshaped).
+    pub fn set_typesetter(&mut self, typesetter: Box<dyn Typesetter>) {
+        self.typesetter = Some(typesetter);
+    }
+
+    /// The vocabulary this build advertises in a handshake.
+    ///
+    /// [`Capabilities::current`] describes the protocol; this describes the
+    /// *binary*. The two differ only in the typeset shapes, and only when the
+    /// host has no typesetter (or one that claims only half the pair): a client
+    /// that reads `hello` must not be told `"formula"` is available and then be
+    /// refused, so the list is filtered by what the installed provider says it
+    /// can do rather than by what the parser can spell.
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities::with_typesetting(self.supports_text(), self.supports_formula())
     }
 
     /// Queue one animation as the next beat, and play it when the current one ends.
@@ -399,12 +435,26 @@ impl SceneContext {
     /// accessibility layer, not to the kernel.
     ///
     /// A [`Command::Hello`] is the handshake: it answers with
-    /// [`CommandOutcome::Greeted`], i.e. [`Capabilities::current`] — the
-    /// vocabularies this build accepts, derived from the serde definitions
-    /// themselves. A `protocol` naming a version this build does not speak is
-    /// [`CommandError::OutOfRange`] under `protocol`, with both numbers in the
-    /// detail — refusing is what stops a client from believing its v2 field was
-    /// merely optional here, and the numbers are what it needs to fall back.
+    /// [`CommandOutcome::Greeted`], i.e. [`SceneContext::capabilities`] — the
+    /// vocabularies this *build* accepts, derived from the serde definitions
+    /// themselves and narrowed by whether the host installed a typesetter for
+    /// `text` / `formula`. A `protocol` naming a version this build does not
+    /// speak is [`CommandError::OutOfRange`] under `protocol`, with both
+    /// numbers in the detail — refusing is what stops a client from believing
+    /// its v2 field was merely optional here, and the numbers are what it needs
+    /// to fall back.
+    ///
+    /// An [`Command::Add`] of `text` or `formula` is the one *mutation* answered
+    /// here rather than by [`command::apply`], for the same purity reason: a
+    /// text mobject's geometry comes from the host's [`Typesetter`], and
+    /// `apply` may not read a font. A context with no provider — or one that
+    /// claims only half the pair — refuses with
+    /// [`CommandError::Unsupported`], naming the missing feature; a provider
+    /// that cannot compile the particular source refuses with the protocol's
+    /// own vocabulary, a [`CommandError::OutOfRange`] under `text` for source
+    /// the caller can fix and [`CommandError::Typeset`] for a backend failure
+    /// it cannot. Every other `add` — groups included — still goes through the
+    /// pure path.
     pub fn handle(&mut self, cmd: &Command) -> Result<CommandOutcome, CommandError> {
         if let Command::Hello { protocol } = cmd {
             if let Some(client) = protocol
@@ -418,7 +468,7 @@ impl SceneContext {
                     ),
                 });
             }
-            return Ok(CommandOutcome::Greeted(Capabilities::current()));
+            return Ok(CommandOutcome::Greeted(self.capabilities()));
         }
         if let Command::Play { animation } = cmd {
             let anim = command::animation_for(&self.tree, animation)?;
@@ -486,10 +536,130 @@ impl SceneContext {
             };
             return Ok(CommandOutcome::Queried(tree));
         }
+        if let Command::Add {
+            kind,
+            params,
+            children,
+        } = cmd
+            && kind.needs_typesetter()
+        {
+            // The children rule belongs to `Group`, and saying so here rather
+            // than letting `apply` answer "unsupported" would report the wrong
+            // field: a `text` with children is a malformed payload whatever
+            // this build can typeset.
+            if children.is_some() {
+                return Err(CommandError::OutOfRange {
+                    property: "children".to_owned(),
+                    detail: "only a group takes children".to_owned(),
+                });
+            }
+            return Ok(CommandOutcome::Applied(self.add_typeset(*kind, params)?));
+        }
         Ok(CommandOutcome::Applied(command::apply(
             &mut self.tree,
             cmd,
         )?))
+    }
+
+    /// An `add` of a kind no tree walk can build: ask the host's typesetter.
+    ///
+    /// The reason this arm lives in the context and not in `command::apply` is
+    /// the same one that puts `play` here: `apply` is pure over the tree, and
+    /// shaping text reads fonts and runs a typesetting engine. Splitting it this
+    /// way keeps the rest of the protocol replayable through a bare tree.
+    fn add_typeset(
+        &mut self,
+        kind: ShapeKind,
+        params: &ShapeParams,
+    ) -> Result<StateDiff, CommandError> {
+        let (supported, feature) = match kind {
+            ShapeKind::Text => (self.supports_text(), "text"),
+            // `needs_typesetter` is the only gate on this call, and it names
+            // exactly `Text` and `Formula`; everything else is the formula case.
+            _ => (self.supports_formula(), "formula"),
+        };
+        if !supported {
+            return Err(CommandError::Unsupported {
+                feature: feature.to_owned(),
+            });
+        }
+        let Some(typesetter) = self.typesetter.as_mut() else {
+            // Unreachable by the two lines above — `supports_*` reads the same
+            // field — and answered rather than unwrapped because this path
+            // takes input a model wrote.
+            return Err(CommandError::Unsupported {
+                feature: feature.to_owned(),
+            });
+        };
+
+        let mut diff = StateDiff::default();
+        if kind == ShapeKind::Text {
+            let spec = TextSpec {
+                size: params.size,
+                max_width: params.max_width,
+            };
+            let block = typesetter
+                .text(params.text(), &spec)
+                .map_err(typeset_error)?;
+            // Built through the same `shapes::build` every other kind uses, so
+            // the label, colour, `position` and `scale` arrive by the one code
+            // path. An empty string is a legitimate text object — it has a
+            // label and an opacity and just draws nothing — which is why the
+            // block is attached even when it is empty.
+            let m = rustim_mobject::shapes::build(kind, params).with_text(block);
+            diff.created.push(self.tree.insert(m));
+            return Ok(diff);
+        }
+
+        let formula = typesetter
+            .formula(params.text(), &mut self.tree)
+            .map_err(typeset_error)?;
+        let (root, nodes) = (formula.root, formula.nodes);
+        // The compiler produces geometry and no style, so the command's colour
+        // is applied to every glyph and rule here. It has to be applied *now*
+        // rather than left to a later `set` of the root: opacity and paint do
+        // not inherit in this draw walk, which is also why `FormulaScene`
+        // colours its glyphs one by one. The root keeps its own label and
+        // transform, which are the parts a subtree *can* own.
+        let color = params.color.map_or(rustim_color::FG, |[r, g, b]| {
+            rustim_color::Srgb::from_rgba8(r, g, b, 255)
+        });
+        for id in &nodes {
+            if let Some(m) = self.tree.get_mut(*id) {
+                m.style.fill = color;
+                m.style.fill_opacity = 1.0;
+                m.style.stroke_opacity = 0.0;
+            }
+        }
+        if let Some(m) = self.tree.get_mut(root) {
+            // `shapes::build` would have done exactly this and cannot: the
+            // compiler owns the root. Same order as `build` — scale first, then
+            // place — because `*` applies its right operand first.
+            if params.label.is_some() {
+                m.label = params.label.clone();
+            }
+            if let Some([x, y]) = params.position {
+                m.transform = Affine2::translate((x, y));
+            }
+            let scale = params.scale();
+            if scale != 1.0 {
+                m.transform *= Affine2::scale(scale);
+            }
+            diff.created.push(root);
+        }
+        Ok(diff)
+    }
+
+    fn supports_text(&self) -> bool {
+        self.typesetter
+            .as_ref()
+            .is_some_and(|typesetter| typesetter.supports_text())
+    }
+
+    fn supports_formula(&self) -> bool {
+        self.typesetter
+            .as_ref()
+            .is_some_and(|typesetter| typesetter.supports_formula())
     }
 
     /// Where the view is looking.
@@ -551,16 +721,47 @@ impl SceneContext {
     /// upstream of this call ever materialises world coordinates.
     pub fn build_draw_list(&self, list: &mut DrawList) {
         self.begin_frame(list);
+        // Computed once. Every glyph run needs it twice — to place the run and
+        // then to put the frame transform back — and the projection cannot
+        // change part-way through one walk.
+        let frame = self.affine();
         for id in self.tree.draw_order() {
             let Some(m) = self.tree.get(id) else { continue };
+            if m.opacity <= 0.0 {
+                continue;
+            }
+            // A wire-created text mobject carries its shaped block here and is
+            // drawn by this walk; a text object a *scene* shaped has no block
+            // and pushes its own ops, which is why the test below is for the
+            // block and not for the kind. The block is skipped rather than
+            // drawn at zero alpha for the reason the fill pass is: a fully
+            // transparent object should cost nothing.
+            if let Some(block) = &m.text
+                && !block.is_empty()
+            {
+                let alpha = m.opacity * m.style.fill_opacity;
+                if alpha > 0.0 {
+                    let mut color = m.style.fill;
+                    color.components[3] = alpha as f32;
+                    let world = self.tree.parent_transform(id) * m.transform;
+                    for op in crate::text::text_ops(block, world, frame, color) {
+                        list.push(op);
+                    }
+                    // The builder leaves the run's placement in the list's
+                    // transform — a glyph run is placed by it — so the frame
+                    // goes back before the next object draws a path.
+                    list.push(DrawOp::SetTransform(frame));
+                }
+            }
             // Points rather than `Mobject::has_picture`, and deliberately so: this
             // walk emits paths — filled and/or stroked — so an object with no
-            // points has nothing here to draw *and nothing is missing* — a text
-            // mobject is drawn by the scene that shaped it. The wider predicate is
-            // what the keyboard and the semantic tree ask, and they must not ask
-            // this one, or text would be unreadable by both. One point is not a
-            // path either: `bezier_path_from_points` needs a segment to emit.
-            if m.opacity <= 0.0 || m.points.len() < 2 {
+            // points has nothing further to draw *and nothing is missing*: text
+            // was either drawn from its block above or is drawn by the scene that
+            // shaped it. The wider predicate is what the keyboard and the
+            // semantic tree ask, and they must not ask this one, or text would be
+            // unreadable by both. One point is not a path either:
+            // `bezier_path_from_points` needs a segment to emit.
+            if m.points.len() < 2 {
                 continue;
             }
             // The mobject's own transform is folded in here rather than via a
@@ -607,12 +808,35 @@ impl SceneContext {
     }
 }
 
+/// A typesetter refusal, expressed as the protocol's.
+///
+/// The split is the one a caller can act on: an `Invalid` source is the
+/// command's own `text` field and can be rewritten, while a `Failed` backend is
+/// the build's problem and retrying the same sentence will not help. Naming
+/// `text` for both kinds is deliberate — it is the field the command carried,
+/// and a refusal that named `formula` would send a model looking for a field it
+/// never wrote.
+fn typeset_error(error: TypesetError) -> CommandError {
+    match error {
+        TypesetError::Invalid { detail } => CommandError::OutOfRange {
+            property: "text".to_owned(),
+            detail,
+        },
+        TypesetError::Failed { detail } => CommandError::Typeset { detail },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustim_anim::{FadeIn, FadeOut, Motion, MoveTo, Wait, rate};
     use rustim_math::Affine2;
     use rustim_mobject::shapes::{ShapeKind, ShapeParams};
+    use rustim_mobject::text::FontData;
+    use rustim_mobject::{Mobject, NodeKind, TextBlock, TextRun};
+    use rustim_render::TextGlyph;
+
+    use crate::typeset::TypesetFormula;
 
     /// The frame grid. Virtual time, never wall-clock — the same `1/60` the app's
     /// frame loop and the golden capture use.
@@ -683,7 +907,20 @@ mod tests {
             CommandOutcome::Greeted(caps) => {
                 assert_eq!(caps.protocol, command::PROTOCOL_VERSION);
                 assert_eq!(caps.animations.len(), 10);
-                assert_eq!(caps.shapes.len(), 8);
+                // Nine of the eleven kinds: this context has no typesetter, so
+                // it must not advertise the two that need one. Advertising them
+                // and refusing the first `add` would teach a client to distrust
+                // the handshake.
+                assert_eq!(caps.shapes.len(), 9, "{:?}", caps.shapes);
+                for absent in ["text", "formula"] {
+                    assert!(
+                        !caps.shapes.iter().any(|shape| shape == absent),
+                        "{absent} advertised without a typesetter"
+                    );
+                }
+                // The full protocol vocabulary still names them, which is what
+                // makes the two lists different rather than redundant.
+                assert_eq!(Capabilities::current().shapes.len(), 11);
             }
             other => panic!("expected a greeting, got {other:?}"),
         }
@@ -1849,5 +2086,285 @@ mod tests {
 
         ctx.advance(-10.0);
         assert_eq!(ctx.clock, 0.0);
+    }
+
+    // ---- the typesetter seam ----------------------------------------------
+
+    /// A provider with no shaper behind it: it returns the smallest block that
+    /// has a glyph, which is all the draw walk needs to see a `GlyphRun`, and a
+    /// formula of one root and one square child. The point of the fake is that
+    /// the kernel never learns what a font is; this test module need not either.
+    #[derive(Clone, Default)]
+    struct FakeTypesetter {
+        text: bool,
+        formula: bool,
+        refuse: Option<TypesetError>,
+    }
+
+    impl FakeTypesetter {
+        fn both() -> Self {
+            Self {
+                text: true,
+                formula: true,
+                refuse: None,
+            }
+        }
+    }
+
+    impl Typesetter for FakeTypesetter {
+        fn supports_text(&self) -> bool {
+            self.text
+        }
+
+        fn supports_formula(&self) -> bool {
+            self.formula
+        }
+
+        fn text(&mut self, text: &str, spec: &TextSpec) -> Result<TextBlock, TypesetError> {
+            if let Some(error) = self.refuse.clone() {
+                return Err(error);
+            }
+            Ok(TextBlock::new(
+                text.chars().count() as f32,
+                1.0,
+                vec![TextRun {
+                    font: FontData::new(Vec::<u8>::new().into(), 0),
+                    size: spec.size.map_or(1.0, |size| size as f32),
+                    glyphs: vec![TextGlyph {
+                        id: 3,
+                        x: 0.5,
+                        y: 0.5,
+                    }],
+                }],
+            ))
+        }
+
+        fn formula(
+            &mut self,
+            _source: &str,
+            tree: &mut SceneTree,
+        ) -> Result<TypesetFormula, TypesetError> {
+            if let Some(error) = self.refuse.clone() {
+                return Err(error);
+            }
+            let root = tree.insert(Mobject::new(Vec::new()).with_kind(NodeKind::Formula));
+            let glyph = tree.insert(rustim_mobject::shapes::build(
+                ShapeKind::Square,
+                &ShapeParams::default(),
+            ));
+            // Unconditional, result checked separately — see `Formula::insert`.
+            let moved = tree.reparent(glyph, root);
+            debug_assert!(moved);
+            Ok(TypesetFormula {
+                root,
+                nodes: vec![glyph],
+            })
+        }
+    }
+
+    fn with_typesetter(typesetter: FakeTypesetter) -> SceneContext {
+        let mut ctx = scene();
+        ctx.set_typesetter(Box::new(typesetter));
+        ctx
+    }
+
+    fn add_text() -> Command {
+        serde_json::from_str(
+            r#"{"action":"add","type":"text","params":{"text":"你好","label":"字","position":[1,2],"size":0.5}}"#,
+        )
+        .expect("a text add")
+    }
+
+    fn add_formula() -> Command {
+        serde_json::from_str(
+            r#"{"action":"add","type":"formula","params":{"text":"x^2","label":"公式","position":[1,2],"scale":2.0,"color":[100,181,246]}}"#,
+        )
+        .expect("a formula add")
+    }
+
+    /// **The honest default is "we cannot".** A context with no provider refuses
+    /// both kinds with the feature named, and — the half a client actually
+    /// reads — does not advertise them in the handshake either.
+    #[test]
+    fn text_and_formula_are_refused_without_a_typesetter() {
+        let mut ctx = scene();
+        for (cmd, feature) in [(add_text(), "text"), (add_formula(), "formula")] {
+            assert_eq!(
+                ctx.handle(&cmd).unwrap_err(),
+                CommandError::Unsupported {
+                    feature: feature.to_owned()
+                }
+            );
+        }
+        assert!(
+            ctx.tree.is_empty(),
+            "a refusal must not leave a node behind"
+        );
+
+        let caps = ctx.capabilities();
+        for absent in ["text", "formula"] {
+            assert!(!caps.shapes.iter().any(|shape| shape == absent));
+        }
+    }
+
+    /// A provider that claims one half advertises one half, and the other
+    /// refusal still names the feature that is missing rather than the one that
+    /// is present.
+    #[test]
+    fn half_a_typesetter_advertises_and_refuses_exactly_that_half() {
+        let mut ctx = with_typesetter(FakeTypesetter {
+            text: true,
+            ..FakeTypesetter::default()
+        });
+        let caps = ctx.capabilities();
+        assert!(caps.shapes.iter().any(|shape| shape == "text"));
+        assert!(!caps.shapes.iter().any(|shape| shape == "formula"));
+        assert_eq!(
+            ctx.handle(&add_formula()).unwrap_err(),
+            CommandError::Unsupported {
+                feature: "formula".to_owned()
+            }
+        );
+        assert!(ctx.handle(&add_text()).is_ok());
+    }
+
+    /// **A wire-created text object is drawn by the kernel's own walk.** The
+    /// block rides the mobject, the declared bounds give it a centre, and the
+    /// frame transform is put back after the run — which is the sharp edge of a
+    /// builder that places its subject through the list's global transform.
+    #[test]
+    fn a_typeset_text_node_is_drawn_and_the_frame_transform_comes_back() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &add_text());
+        let id = diff.created[0];
+
+        let m = ctx.tree.get(id).unwrap();
+        assert!(m.text.is_some(), "the shaped block is the object's picture");
+        assert!(
+            m.local_bounds.is_some(),
+            "a text node declares its box, or it has no bounds at all"
+        );
+        assert_eq!(m.label.as_deref(), Some("字"));
+        assert_eq!(
+            m.transform,
+            Affine2::translate((1.0, 2.0)),
+            "`position` places the block like any other kind"
+        );
+
+        let mut list = DrawList::default();
+        ctx.build_draw_list(&mut list);
+        let runs = list
+            .ops
+            .iter()
+            .filter(|op| matches!(op, DrawOp::GlyphRun { .. }))
+            .count();
+        assert_eq!(runs, 1, "one run of one glyph, from the fake");
+        let Some(DrawOp::SetTransform(last)) = list.ops.last() else {
+            panic!("the walk has to leave the frame transform installed");
+        };
+        assert_eq!(*last, ctx.affine());
+
+        // And the block is placed, not merely drawn: the transform installed
+        // *before* the run is the block's placement, and the block's own centre
+        // (its layout centre, where `layout_to_local` puts the local origin)
+        // lands at the point `position` named.
+        let run = list
+            .ops
+            .iter()
+            .position(|op| matches!(op, DrawOp::GlyphRun { .. }))
+            .expect("a glyph run");
+        let place = list.ops[..run]
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                DrawOp::SetTransform(t) => Some(*t),
+                _ => None,
+            })
+            .expect("the run is placed by a transform");
+        let block = ctx.tree.get(id).unwrap().text.clone().expect("the block");
+        let (x, y) = ctx.viewport.to_screen(ctx.camera(), (1.0, 2.0));
+        let centre = place
+            * rustim_math::Point::new(f64::from(block.width / 2.0), f64::from(block.height / 2.0));
+        assert!((centre.x - x).abs() < 1e-9 && (centre.y - y).abs() < 1e-9);
+    }
+
+    /// A formula comes back as **one** object: the root. Its glyphs are its
+    /// picture, coloured from the command, and the root carries the label, the
+    /// position and the scale — the four things a caller can name.
+    #[test]
+    fn a_typeset_formula_is_one_root_with_coloured_children() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &add_formula());
+        assert_eq!(diff.created.len(), 1, "the root is the object");
+        let root = diff.created[0];
+
+        let m = ctx.tree.get(root).unwrap();
+        assert_eq!(m.kind, NodeKind::Formula);
+        assert_eq!(m.label.as_deref(), Some("公式"));
+        assert_eq!(
+            m.transform,
+            Affine2::translate((1.0, 2.0)) * Affine2::scale(2.0),
+            "scale first, then place — `shapes::build`'s order"
+        );
+
+        let children = ctx.tree.child_ids(root);
+        assert_eq!(children.len(), 1);
+        let glyph = ctx.tree.get(children[0]).unwrap();
+        let want = rustim_color::Srgb::from_rgba8(100, 181, 246, 255);
+        assert_eq!(
+            glyph.style.fill, want,
+            "the command's colour reaches every glyph"
+        );
+        assert_eq!(glyph.style.fill_opacity, 1.0);
+        assert_eq!(glyph.style.stroke_opacity, 0.0);
+    }
+
+    /// The two refusal kinds are the two different fixes, and the *field* named
+    /// is the one the command carried — `text` — for both kinds of source.
+    #[test]
+    fn a_typesetter_refusal_keeps_its_kind() {
+        let mut ctx = with_typesetter(FakeTypesetter {
+            text: true,
+            formula: true,
+            refuse: Some(TypesetError::invalid("unbalanced brace")),
+        });
+        assert_eq!(
+            ctx.handle(&add_formula()).unwrap_err(),
+            CommandError::OutOfRange {
+                property: "text".to_owned(),
+                detail: "unbalanced brace".to_owned()
+            }
+        );
+
+        let mut ctx = with_typesetter(FakeTypesetter {
+            text: true,
+            formula: true,
+            refuse: Some(TypesetError::failed("assets/fonts is missing")),
+        });
+        assert_eq!(
+            ctx.handle(&add_text()).unwrap_err(),
+            CommandError::Typeset {
+                detail: "assets/fonts is missing".to_owned()
+            }
+        );
+    }
+
+    /// Children are a group's grammar, so a text object with children is a
+    /// malformed payload — refused for that before the provider is asked, and
+    /// without needing one to be installed.
+    #[test]
+    fn children_on_a_typeset_kind_name_the_children_field() {
+        let mut ctx = scene();
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"add","type":"text","params":{"text":"x"},"children":[4294967297]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.handle(&cmd).unwrap_err(),
+            CommandError::OutOfRange {
+                property: "children".to_owned(),
+                detail: "only a group takes children".to_owned()
+            }
+        );
     }
 }

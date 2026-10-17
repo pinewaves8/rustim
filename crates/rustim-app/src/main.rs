@@ -1195,6 +1195,21 @@ fn blit_damage(src: &[u8], dst: &mut [u32], frame_width: u16, damage: Damage) {
     }
 }
 
+/// The context every path of this binary runs on: the scene's own state plus
+/// the desktop's typesetter.
+///
+/// One constructor rather than four `SceneContext::new` calls with a
+/// `set_typesetter` after each, because the four paths (`--inspect`, `--png`,
+/// the export loop and the window) must advertise the *same* capabilities — the
+/// handshake is a fact about the build, and a path that forgot the provider would
+/// answer `hello` with a narrower vocabulary than the next one. The provider is
+/// lazy (see [`rustim_app::typeset`]), so a text-free scene pays nothing.
+fn context(viewport: Viewport, motion: Motion) -> SceneContext {
+    let mut ctx = SceneContext::new(viewport, motion);
+    ctx.set_typesetter(Box::new(rustim_app::typeset::AppTypesetter::new()));
+    ctx
+}
+
 fn build_frame(scene: &mut dyn Scene, ctx: &mut SceneContext, list: &mut DrawList, dt: f64) {
     scene.update(dt, ctx);
     // Through the scene, not straight through the context: a scene may have
@@ -2385,7 +2400,7 @@ fn main() {
     // one: see `rustim_app::a11y`), and it is what a script or a future agent
     // surface reads instead of a window.
     if inspect {
-        let mut ctx = SceneContext::new(viewport, motion);
+        let mut ctx = context(viewport, motion);
         scene.construct(&mut ctx);
         // After `construct`, so the scene's own objects keep the ids they always
         // had and a script's ids follow them deterministically — and before
@@ -2407,7 +2422,7 @@ fn main() {
     }
 
     if let Some(path) = png {
-        let mut ctx = SceneContext::new(viewport, motion);
+        let mut ctx = context(viewport, motion);
         scene.construct(&mut ctx);
         if let Some(script) = &script {
             apply_script(script, &mut *scene, &mut ctx, reply);
@@ -2455,7 +2470,7 @@ fn main() {
     }
 
     if exporting_video {
-        let mut ctx = SceneContext::new(viewport, motion);
+        let mut ctx = context(viewport, motion);
         scene.construct(&mut ctx);
         if let Some(script) = &script {
             apply_script(script, &mut *scene, &mut ctx, reply);
@@ -2584,7 +2599,7 @@ fn main() {
     let event_loop = builder.build().expect("event loop");
     let proxy = event_loop.create_proxy();
 
-    let mut ctx = SceneContext::new(viewport, motion);
+    let mut ctx = context(viewport, motion);
     scene.construct(&mut ctx);
 
     // The feed, connected *before* the loop runs. A file is applied here, at

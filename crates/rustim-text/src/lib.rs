@@ -69,6 +69,13 @@ pub use parley::FontData;
 
 pub use rustim_math::TextGlyph;
 
+/// The kernel's data form of a shaped block; see the `From<&ShapedText>` impl
+/// below for the one conversion into it. Not re-exported under the crate's own
+/// `TextRun`, which is a different type with the same fields on purpose: this
+/// crate's run is what the *shaper* hands out, that one is what the *kernel*
+/// stores, and the conversion between them is the boundary.
+use rustim_mobject::TextBlock;
+
 /// Where the bundled face lives, relative to this crate.
 ///
 /// `assets/fonts/` is in the repository, deliberately as a *file* rather than an
@@ -263,6 +270,32 @@ impl ShapedText {
     /// Whether there is anything to draw.
     pub fn is_empty(&self) -> bool {
         self.runs.iter().all(|r| r.glyphs.is_empty())
+    }
+}
+
+/// Convert a shaped block into the kernel's data form.
+///
+/// The two types carry the same four numbers per run, and this is the only place
+/// they are copied from one into the other — which is why it belongs here, next
+/// to the shaper that produced the coordinates, rather than in each host. The
+/// drop is deliberate: `missing` and `substituted` are *reports for the scene
+/// author*, not geometry, and a wire-created text object has no author to report
+/// to beyond the refusal the command layer already turned them into.
+impl From<&ShapedText> for TextBlock {
+    fn from(shaped: &ShapedText) -> Self {
+        Self::new(
+            shaped.width,
+            shaped.height,
+            shaped
+                .runs
+                .iter()
+                .map(|run| rustim_mobject::TextRun {
+                    font: run.font.clone(),
+                    size: run.size,
+                    glyphs: run.glyphs.clone(),
+                })
+                .collect(),
+        )
     }
 }
 
