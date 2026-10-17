@@ -1418,6 +1418,53 @@ impl SceneContext {
             return crate::templates::matrix(&mut self.tree, typesetter.as_mut(), args)
                 .map(CommandOutcome::Applied);
         }
+        if let Command::ExplainChart {
+            categories,
+            values,
+            value_range,
+            step,
+            width,
+            height,
+            show_values,
+            color,
+            position,
+            caption,
+            caption_size,
+            label,
+        } = cmd
+        {
+            // The category labels and the value-axis ticks are mandatory, so
+            // the whole template needs text rather than only its optional
+            // caption. `templates::chart` makes the same check as its first
+            // act; this one keeps the refusal beside the capability query a
+            // host reads from `hello`.
+            if !self.supports_text() {
+                return Err(CommandError::Unsupported {
+                    feature: "text".to_owned(),
+                });
+            }
+            let Some(typesetter) = self.typesetter.as_mut() else {
+                return Err(CommandError::Unsupported {
+                    feature: "text".to_owned(),
+                });
+            };
+            let args = crate::templates::Chart {
+                categories,
+                values,
+                value_range: *value_range,
+                step: *step,
+                width: *width,
+                height: *height,
+                show_values: *show_values,
+                color: *color,
+                position: *position,
+                caption: caption.as_deref(),
+                caption_size: *caption_size,
+                label: label.as_deref(),
+            };
+            return crate::templates::chart(&mut self.tree, typesetter.as_mut(), args)
+                .map(CommandOutcome::Applied);
+        }
         if let Command::Highlight {
             target,
             dim,
@@ -4344,6 +4391,351 @@ mod tests {
             before,
             "a refused matrix left pieces behind"
         );
+    }
+
+    // ---- explain.chart ----------------------------------------------------
+
+    /// A bare chart command: every optional slot defaulted.
+    fn explain_chart(categories: &[&str], values: Vec<f64>) -> Command {
+        Command::ExplainChart {
+            categories: categories.iter().map(|c| (*c).to_owned()).collect(),
+            values,
+            value_range: None,
+            step: None,
+            width: None,
+            height: None,
+            show_values: None,
+            color: None,
+            position: None,
+            caption: None,
+            caption_size: None,
+            label: None,
+        }
+    }
+
+    /// The default spelling: three bars on a zero baseline, an automatically
+    /// chosen window and step, one value label per bar, and the value axis's
+    /// own numbers.
+    #[test]
+    fn a_bare_chart_places_bars_on_a_zero_baseline() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.chart","categories":["一","二","三"],"values":[2,4,3]}"#,
+        )
+        .expect("a wire chart");
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &cmd);
+
+        // Group, two axes, three bars, three value labels, five tick labels
+        // (0..4 at the automatically chosen step of 1), three category labels.
+        assert_eq!(diff.created.len(), 17, "{:?}", diff.created);
+        let group = diff.created[0];
+        assert_eq!(ctx.tree.get(group).unwrap().kind, NodeKind::Group);
+        assert_eq!(
+            ctx.tree.get(diff.created[1]).unwrap().kind,
+            NodeKind::NumberLine
+        );
+        assert_eq!(
+            ctx.tree.get(diff.created[1]).unwrap().label.as_deref(),
+            Some("数值轴")
+        );
+        assert_eq!(ctx.tree.get(diff.created[2]).unwrap().kind, NodeKind::Line);
+        assert_eq!(
+            ctx.tree.get(diff.created[2]).unwrap().label.as_deref(),
+            Some("类别轴")
+        );
+
+        // The value window is [0, 4.2] — the tallest value plus 5% headroom and
+        // zero always included — and the automatic step is 1. The category axis
+        // runs along the zero baseline, 2 units below the frame's centre.
+        let range = [0.0, 4.2];
+        let scale =
+            rustim_mobject::shapes::AxesScale::new((0.0, 3.0), 7.0, (range[0], range[1]), 4.0);
+        let baseline = scale.to_world(0.0, 0.0).y;
+        assert!((baseline + 2.0).abs() < 1e-12, "{baseline}");
+        let axis = ctx.tree.world_bounds(diff.created[2]).unwrap();
+        assert!((axis.center().y - baseline).abs() < 1e-12, "{axis:?}");
+        assert!((axis.x0 + 3.5).abs() < 1e-12, "{axis:?}");
+        assert!((axis.x1 - 3.5).abs() < 1e-12, "{axis:?}");
+
+        // One bar per category, centred on its band, rising from the baseline,
+        // and labelled by its category.
+        let bars = &diff.created[3..6];
+        for (index, (id, (label, value))) in bars
+            .iter()
+            .zip([("一", 2.0), ("二", 4.0), ("三", 3.0)])
+            .enumerate()
+        {
+            let m = ctx.tree.get(*id).unwrap();
+            assert_eq!(m.kind, NodeKind::Square);
+            assert_eq!(m.label.as_deref(), Some(label));
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            let x = scale.to_world(index as f64 + 0.5, 0.0).x;
+            let top = scale.to_world(0.0, value).y;
+            assert!((bounds.center().x - x).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.y0 - baseline).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.y1 - top).abs() < 1e-12, "{bounds:?}");
+            assert!(
+                (bounds.width() - 7.0 / 3.0 * 0.7).abs() < 1e-12,
+                "a bar fills 70% of its band: {bounds:?}"
+            );
+        }
+
+        // A value label sits above its bar, one small gap plus its own half
+        // height clear of the bar's top.
+        let values = &diff.created[6..9];
+        for (index, (id, (text, value))) in values
+            .iter()
+            .zip([("2", 2.0), ("4", 4.0), ("3", 3.0)])
+            .enumerate()
+        {
+            assert_eq!(ctx.tree.get(*id).unwrap().label.as_deref(), Some(text));
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            let expected = scale.to_world(0.0, value).y + 0.12 + bounds.height() / 2.0;
+            assert!((bounds.center().y - expected).abs() < 1e-12, "{bounds:?}");
+            assert!(
+                (bounds.center().x - scale.to_world(index as f64 + 0.5, 0.0).x).abs() < 1e-12,
+                "{bounds:?}"
+            );
+        }
+
+        // The value axis's own labels, right-aligned one tick and one gap clear
+        // of the shaft, including the zero at the baseline.
+        let ticks = &diff.created[9..14];
+        for (id, text) in ticks.iter().zip(["0", "1", "2", "3", "4"]) {
+            let m = ctx.tree.get(*id).unwrap();
+            assert_eq!(m.kind, NodeKind::Text);
+            assert_eq!(m.label.as_deref(), Some(text));
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            assert!(
+                (bounds.x1 - (-3.5 - 0.15 - 0.12)).abs() < 1e-12,
+                "a tick label's right edge clears the shaft: {bounds:?}"
+            );
+        }
+        let zero = ctx.tree.world_bounds(ticks[0]).unwrap();
+        assert!((zero.center().y - baseline).abs() < 1e-12, "{zero:?}");
+
+        // Category labels hang one gap below the frame, carry no label of their
+        // own (the bar beside them already does) and stay in their band.
+        let categories = &diff.created[14..17];
+        for (index, id) in categories.iter().enumerate() {
+            let m = ctx.tree.get(*id).unwrap();
+            assert_eq!(m.kind, NodeKind::Text);
+            assert_eq!(m.label, None);
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            assert!(
+                (bounds.center().x - scale.to_world(index as f64 + 0.5, 0.0).x).abs() < 1e-12,
+                "{bounds:?}"
+            );
+            assert!((bounds.y1 - (-2.0 - 0.35)).abs() < 1e-12, "{bounds:?}");
+        }
+
+        // The group declares the union of its pieces, tick labels included.
+        let declared = ctx.tree.get(group).unwrap().local_bounds.unwrap();
+        assert!((declared.y0 + 3.35).abs() < 1e-12, "{declared:?}");
+        assert!(
+            (declared.x0 - (-3.5 - 0.15 - 0.12 - 1.0)).abs() < 1e-12,
+            "{declared:?}"
+        );
+        assert!((declared.x1 - 3.5).abs() < 1e-12, "{declared:?}");
+    }
+
+    /// An explicit window, a negative bar, no value labels, and every optional
+    /// slot filled.
+    #[test]
+    fn a_chart_hangs_a_negative_bar_below_the_baseline() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.chart","categories":["收入","支出"],"values":[3,-1],"value_range":[-2,4],"step":2,"show_values":false,"position":[1,0.5],"caption":"盈亏","label":"图表"}"#,
+        )
+        .expect("a wire chart");
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &cmd);
+
+        // Group, two axes, two bars, four tick labels (-2, 0, 2, 4), two
+        // category labels and the caption: `show_values` is off.
+        assert_eq!(diff.created.len(), 12, "{:?}", diff.created);
+        assert_eq!(
+            ctx.tree.get(diff.created[0]).unwrap().label.as_deref(),
+            Some("图表")
+        );
+
+        let scale = rustim_mobject::shapes::AxesScale::new((0.0, 2.0), 7.0, (-2.0, 4.0), 4.0);
+        let baseline = scale.to_world(0.0, 0.0).y + 0.5;
+        for (index, (id, value)) in diff.created[3..5].iter().zip([3.0, -1.0]).enumerate() {
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            let x = scale.to_world(index as f64 + 0.5, 0.0).x + 1.0;
+            let top = scale.to_world(0.0, value).y + 0.5;
+            assert!((bounds.center().x - x).abs() < 1e-12, "{bounds:?}");
+            assert!(
+                (bounds.center().y - (top + baseline) / 2.0).abs() < 1e-12,
+                "{bounds:?}"
+            );
+            // One bar climbs from the baseline and one hangs below it.
+            assert!(
+                (bounds.y0.min(baseline) - top.min(baseline)).abs() < 1e-12,
+                "{bounds:?}"
+            );
+            assert!(
+                (bounds.y1.max(baseline) - top.max(baseline)).abs() < 1e-12,
+                "{bounds:?}"
+            );
+        }
+
+        // No bar carries a value label when `show_values` is off — but the value
+        // axis still labels its own ticks, so "3" and "-1" must be absent while
+        // "2" and "4" are present.
+        let labels: Vec<_> = diff
+            .created
+            .iter()
+            .filter_map(|id| ctx.tree.get(*id).and_then(|m| m.label.clone()))
+            .collect();
+        assert!(!labels.iter().any(|label| label == "3"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "-1"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "2"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "4"), "{labels:?}");
+
+        // Category labels hang under the frame, and the caption under them,
+        // both moved by `position`. The fake shaper's block is one unit tall,
+        // so a label's centre is the baseline it was placed at plus or minus
+        // half a unit.
+        let category = &diff.created[9..11];
+        for (index, id) in category.iter().enumerate() {
+            let m = ctx.tree.get(*id).unwrap();
+            assert_eq!(m.kind, NodeKind::Text);
+            assert_eq!(m.label, None);
+            let bounds = ctx.tree.world_bounds(*id).unwrap();
+            let x = scale.to_world(index as f64 + 0.5, 0.0).x + 1.0;
+            assert!((bounds.center().x - x).abs() < 1e-12, "{bounds:?}");
+            assert!(
+                (bounds.center().y - (-2.85 + 0.5)).abs() < 1e-12,
+                "{bounds:?}"
+            );
+        }
+        let caption = ctx.tree.world_bounds(diff.created[11]).unwrap();
+        assert_eq!(ctx.tree.get(diff.created[11]).unwrap().label, None);
+        assert!(
+            (caption.center().y - (-4.2 + 0.5)).abs() < 1e-12,
+            "{caption:?}"
+        );
+    }
+
+    /// Every refusal names its own field, and none of them leaves a node behind.
+    #[test]
+    fn a_chart_refuses_before_creating_anything() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let before = ctx.tree.len();
+        for (json, field) in [
+            (
+                r#"{"action":"explain.chart","categories":[],"values":[]}"#,
+                "categories",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":[" "],"values":[1.0]}"#,
+                "categories",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":["a"],"values":[1.0,2.0]}"#,
+                "values",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":["a","b"],"values":[0,0]}"#,
+                "values",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":["a"],"values":[1.0],"value_range":[1,5]}"#,
+                "value_range",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":["a"],"values":[1.0],"value_range":[-5,-1]}"#,
+                "value_range",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":["a"],"values":[7.0],"value_range":[0,5]}"#,
+                "value_range",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":["a"],"values":[1.0],"step":0.001}"#,
+                "step",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":["a"],"values":[1.0],"step":100.0}"#,
+                "step",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":["a"],"values":[1.0],"caption":" "}"#,
+                "caption",
+            ),
+            (
+                r#"{"action":"explain.chart","categories":["a"],"values":[1.0],"caption_size":-2.0}"#,
+                "caption_size",
+            ),
+        ] {
+            let cmd: Command = serde_json::from_str(json).expect("a wire chart");
+            assert!(
+                matches!(
+                    ctx.handle(&cmd),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == field
+                ),
+                "{json} refused as the wrong field"
+            );
+            assert_eq!(ctx.tree.len(), before, "{json} left nodes behind");
+        }
+
+        // The caps and the non-finite spellings have no JSON spelling of their
+        // own here, so these are built directly.
+        let names: Vec<String> = (0..33).map(|i| format!("c{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(matches!(
+            ctx.handle(&explain_chart(&refs, vec![1.0; 33])),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "categories"
+        ));
+        for bad in [f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                ctx.handle(&explain_chart(&["a"], vec![bad])),
+                Err(CommandError::OutOfRange { ref property, .. }) if property == "values"
+            ));
+        }
+        let mut off_world = explain_chart(&["a"], vec![1.0]);
+        if let Command::ExplainChart { position, .. } = &mut off_world {
+            *position = Some([0.0, f64::INFINITY]);
+        }
+        assert!(matches!(
+            ctx.handle(&off_world),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "position"
+        ));
+        assert_eq!(ctx.tree.len(), before);
+    }
+
+    /// A chart is labelled entirely by text, so a build with no typesetter
+    /// refuses it rather than drawing naked bars.
+    #[test]
+    fn a_chart_needs_a_text_typesetter() {
+        let mut ctx = scene();
+        let before = ctx.tree.len();
+        assert!(matches!(
+            ctx.handle(&explain_chart(&["a"], vec![1.0])),
+            Err(CommandError::Unsupported { ref feature }) if feature == "text"
+        ));
+        assert_eq!(ctx.tree.len(), before);
+    }
+
+    /// A typesetter that fails after the axes and some bars are in the tree
+    /// rolls the whole chart back.
+    #[test]
+    fn a_failed_label_rolls_the_chart_back() {
+        let mut ctx = with_typesetter(FakeTypesetter {
+            refuse: Some(TypesetError::failed("assets/fonts is missing")),
+            ..FakeTypesetter::both()
+        });
+        let before = ctx.tree.len();
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.chart","categories":["a","b"],"values":[1.0,2.0],"caption":"图"}"#,
+        )
+        .expect("a wire chart");
+        assert!(matches!(
+            ctx.handle(&cmd),
+            Err(CommandError::Typeset { .. })
+        ));
+        assert_eq!(ctx.tree.len(), before, "a refused chart left pieces behind");
     }
 
     fn camera_cmd(center: Option<[f64; 2]>, zoom: Option<f64>, duration: Option<f64>) -> Command {

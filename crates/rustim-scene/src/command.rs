@@ -495,6 +495,74 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// Show a bar chart: one bar per category, a labelled value axis, category
+    /// labels and a caption.
+    ///
+    /// The fifth `explain.*` template. `categories` and `values` are parallel
+    /// lists — at least one entry, at most 32, every category non-blank, every
+    /// value finite, and at least one value non-zero (a chart of nothing has no
+    /// bar to explain). The bars are **vertical** and share one baseline at
+    /// value `0`; a negative value draws its bar downward, so a chart with
+    /// positive and negative values needs no second command.
+    ///
+    /// `value_range` is the data window on the value axis and **must contain
+    /// zero** — a bar chart whose baseline is outside its own axis truncates
+    /// every bar and lies about the ratios, so that spelling is refused rather
+    /// than drawn. Without one the window is the extent of the values plus a
+    /// small headroom, zero always included. `step` is the data distance between
+    /// value-axis ticks; absent, a "nice" step (`1`, `2`, `5` × a power of ten)
+    /// is chosen for about five labels.
+    ///
+    /// `width`/`height` are the frame's geometric size in world units (defaults
+    /// 7 and 4, the proportions `explain.plot` uses) and `show_values` (default
+    /// `true`) places each bar's own value above it (below it, for a negative
+    /// bar), formatted exactly as a tick label. `color` paints the bars; the two
+    /// axes, every label and the caption stay foreground, because `color` names
+    /// the data.
+    ///
+    /// **The frame is centred on `position`** — the category labels hang below
+    /// it — so `position` means "the centre of the chart" as it does in every
+    /// other template.
+    ///
+    /// The reply's `created` is `[group, value axis, category axis, bar…, value
+    /// label…, value-axis tick label…, category label…, caption?]`: one bar per
+    /// category in the order given, then one value label per bar when
+    /// `show_values` is on, then the value axis's own numbers, then the category
+    /// labels. Each bar is labelled by its category, so a chart can be
+    /// addressed bar by category name; the value labels are labelled by their
+    /// own text, the same rule `explain.plot`'s tick labels follow, and repeated
+    /// categories or repeated values answer `ambiguous_label`. The category
+    /// labels carry no label of their own, since the bar beside them already
+    /// does.
+    ///
+    /// Every label is typeset, so the whole template needs a text typesetter;
+    /// without one it refuses with [`CommandError::Unsupported`] under `text`
+    /// before anything is inserted. Answered by [`crate::SceneContext::handle`].
+    #[serde(rename = "explain.chart")]
+    ExplainChart {
+        categories: Vec<String>,
+        values: Vec<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value_range: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show_values: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<[u8; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Dim everything but an object for a moment, then bring it back.
     ///
     /// The attention helper a spoken explanation needs and `point_at` does not
@@ -835,6 +903,7 @@ pub const ACTIONS: &[&str] = &[
     "camera",
     "checkpoint",
     "events",
+    "explain.chart",
     "explain.equation",
     "explain.geometry",
     "explain.matrix",
@@ -878,6 +947,7 @@ impl Command {
             Self::Fit { .. } => "fit",
             Self::PointAt { .. } => "point_at",
             Self::Annotate { .. } => "annotate",
+            Self::ExplainChart { .. } => "explain.chart",
             Self::ExplainEquation { .. } => "explain.equation",
             Self::ExplainGeometry { .. } => "explain.geometry",
             Self::ExplainMatrix { .. } => "explain.matrix",
@@ -2153,6 +2223,11 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // Answered by `SceneContext::handle`: a template compiles a formula
             // and typesets a caption, and `apply` may not read fonts.
         }
+        Command::ExplainChart { .. } => {
+            // Answered by `SceneContext::handle`: the axis ticks, the category
+            // labels and the value labels are all typeset, and `apply` may not
+            // read fonts.
+        }
         Command::ExplainPlot { .. } => {
             // Answered by `SceneContext::handle` for the same reason: the tick
             // labels are typeset, and `apply` may not read fonts.
@@ -3038,6 +3113,11 @@ mod tests {
             // is `1.0`, which is why the fixture says so.
             r#"{"action":"explain.matrix","rows":[[1.0,2.0],[3.0,4.0]],"column_labels":["列一","列二"],"row_labels":["行一","行二"],"brackets":"bars","lhs":"A =","cell_size":0.4,"color":[100,181,246],"position":[0.0,0.5],"caption":"行列式","caption_size":0.5,"label":"矩阵"}"#.to_owned(),
             r#"{"action":"explain.matrix","rows":[["a","b"],["c","d"]]}"#.to_owned(),
+            // The fourth template: a full chart, then the minimal spelling.
+            // `categories` and `values` are parallel arrays, and `show_values`
+            // is a plain switch — an absent one must not come back as `false`.
+            r#"{"action":"explain.chart","categories":["一","二","三"],"values":[3.0,5.0,2.0],"value_range":[0.0,6.0],"step":2.0,"width":7.0,"height":4.0,"show_values":true,"color":[100,181,246],"position":[0.0,0.5],"caption":"各季度销量","caption_size":0.5,"label":"柱状图"}"#.to_owned(),
+            r#"{"action":"explain.chart","categories":["甲","乙"],"values":[1.0,-2.0]}"#.to_owned(),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for json in cases {
@@ -3124,6 +3204,20 @@ mod tests {
                 position: None,
                 scale: None,
                 color: None,
+                caption: None,
+                caption_size: None,
+                label: None,
+            },
+            Command::ExplainChart {
+                categories: vec!["一".to_owned(), "二".to_owned()],
+                values: vec![1.0, -2.0],
+                value_range: None,
+                step: None,
+                width: None,
+                height: None,
+                show_values: None,
+                color: None,
+                position: None,
                 caption: None,
                 caption_size: None,
                 label: None,

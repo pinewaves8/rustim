@@ -47,6 +47,8 @@
 //!
 //! [`SceneTree::world_bounds`]: rustim_mobject::SceneTree::world_bounds
 
+use std::f64::consts::FRAC_PI_2;
+
 use rustim_math::{Affine2, Rect};
 use rustim_mobject::shapes::{AxesScale, DEFAULT_THICKNESS, ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree, TextBlock};
@@ -1768,14 +1770,440 @@ fn round_bracket(centre_x: f64, semi_width: f64, semi_height: f64, left: bool) -
         .collect()
 }
 
+// ---- explain.chart ------------------------------------------------------
+
+/// The most bars one chart may have.
+///
+/// The same posture as the other templates' caps: a command from a model must
+/// not be able to allocate hundreds of text nodes. Thirty-two bars is already
+/// more than a 720p frame can label legibly, and it leaves every bar a band of
+/// roughly a fifth of a world unit at the default width.
+const MAX_CATEGORIES: usize = 32;
+
+/// The geometric size of the chart frame, in world units — `explain.plot`'s
+/// proportions, so a lecture can swap one for the other without re-laying out
+/// the slide.
+const CHART_WIDTH: f64 = 7.0;
+const CHART_HEIGHT: f64 = 4.0;
+
+/// How much of its band a bar occupies. The rest is the gap that separates one
+/// bar from the next; at `1.0` the bars would touch and read as one shape.
+const CHART_BAR_FRACTION: f64 = 0.7;
+
+/// The headroom added past the tallest (or lowest) bar when the value window is
+/// chosen by the template: a fraction of the window's span, so a long bar does
+/// not end flush against the frame and a value label has somewhere to sit.
+const CHART_HEADROOM: f64 = 0.05;
+
+/// The number of value-axis labels an automatically chosen step aims for.
+const CHART_TARGET_TICKS: f64 = 5.0;
+
+/// The stand-off between a bar and its own value label, and between the frame
+/// and the category labels.
+const CHART_LABEL_GAP: f64 = 0.12;
+
+/// The two axes' names. Scenery, like a matrix's brackets: `--inspect` names
+/// them so a reader knows which axis is which without hearing a size.
+const VALUE_AXIS_LABEL: &str = "数值轴";
+const CATEGORY_AXIS_LABEL: &str = "类别轴";
+
+/// The slots `explain.chart` fills.
+pub(crate) struct Chart<'a> {
+    pub categories: &'a [String],
+    pub values: &'a [f64],
+    /// The value window; must contain zero.
+    pub value_range: Option<[f64; 2]>,
+    /// Data units between value-axis ticks; absent chooses a "nice" step.
+    pub step: Option<f64>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    /// Whether each bar carries its own value as a label.
+    pub show_values: Option<bool>,
+    /// The bars' colour; the axes and every label stay foreground.
+    pub color: Option<[u8; 3]>,
+    pub position: Option<[f64; 2]>,
+    pub caption: Option<&'a str>,
+    pub caption_size: Option<f64>,
+    pub label: Option<&'a str>,
+}
+
+/// A vertical bar chart: one bar per category, a labelled value axis and a
+/// baseline at zero.
+///
+/// The template exists because a model asked to "show the sales by quarter"
+/// should not have to work out the band widths, where the category labels go,
+/// or that a bar chart's baseline must stay at zero. It fills the slots and the
+/// engine makes those decisions.
+///
+/// The bars share one baseline at value `0`: a positive value rises from it and
+/// a negative value hangs below it, so one chart can show a gain and a loss.
+/// The value window always contains zero — a caller-supplied one that does not
+/// is refused, because a truncated baseline makes every bar's height a lie
+/// about its ratio.
+///
+/// Pieces, in `created` order: the value axis (`NumberLine` turned a quarter
+/// turn so its ticks and labels read upward), the category axis (a stroked
+/// `Line` along the baseline), one bar per category, one value label per bar
+/// when `show_values` is on, the value axis's tick labels, the category labels,
+/// then the caption. Each bar is labelled by its category; the category label
+/// below the axis deliberately carries no label of its own, since a reader who
+/// reaches the bar is already told its name.
+pub(crate) fn chart(
+    tree: &mut SceneTree,
+    typesetter: &mut dyn Typesetter,
+    args: Chart<'_>,
+) -> Result<StateDiff, CommandError> {
+    let categories = args.categories;
+    let values = args.values;
+    if categories.is_empty() {
+        return Err(CommandError::OutOfRange {
+            property: "categories".to_owned(),
+            detail: "a chart needs at least one category".to_owned(),
+        });
+    }
+    if categories.len() > MAX_CATEGORIES {
+        return Err(CommandError::OutOfRange {
+            property: "categories".to_owned(),
+            detail: format!(
+                "{} categories exceed the {MAX_CATEGORIES}-category cap",
+                categories.len()
+            ),
+        });
+    }
+    if let Some(index) = categories.iter().position(|c| c.trim().is_empty()) {
+        return Err(CommandError::OutOfRange {
+            property: "categories".to_owned(),
+            detail: format!("category {index} is blank"),
+        });
+    }
+    if values.len() != categories.len() {
+        return Err(CommandError::OutOfRange {
+            property: "values".to_owned(),
+            detail: format!(
+                "{} values for {} categories",
+                values.len(),
+                categories.len()
+            ),
+        });
+    }
+    if let Some(value) = values.iter().copied().find(|v| !v.is_finite()) {
+        return Err(CommandError::OutOfRange {
+            property: "values".to_owned(),
+            detail: format!("{value} is not a finite value"),
+        });
+    }
+    if values.iter().all(|v| *v == 0.0) {
+        return Err(CommandError::OutOfRange {
+            property: "values".to_owned(),
+            detail: "every value is zero, so no bar would be visible".to_owned(),
+        });
+    }
+    let width = positive(args.width, CHART_WIDTH, "width")?;
+    let height = positive(args.height, CHART_HEIGHT, "height")?;
+    // The value window: the caller's, or the values' own extent with zero
+    // always included and a little headroom past the extremes.
+    let (low, high) = values
+        .iter()
+        .fold((0.0_f64, 0.0_f64), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let (mut default_lo, mut default_hi) = (low, high);
+    let span = default_hi - default_lo;
+    let pad = span * CHART_HEADROOM;
+    if default_hi > 0.0 {
+        default_hi += pad;
+    }
+    if default_lo < 0.0 {
+        default_lo -= pad;
+    }
+    let value_range = finite_range(args.value_range, [default_lo, default_hi], "value_range")?;
+    if value_range[0] > 0.0 || value_range[1] < 0.0 {
+        return Err(CommandError::OutOfRange {
+            property: "value_range".to_owned(),
+            detail: format!(
+                "[{}, {}] does not contain zero, and a bar chart's baseline is zero",
+                value_range[0], value_range[1]
+            ),
+        });
+    }
+    if let Some((index, value)) = values
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, v)| *v < value_range[0] || *v > value_range[1])
+    {
+        return Err(CommandError::OutOfRange {
+            property: "value_range".to_owned(),
+            detail: format!(
+                "value {value} at category {index} is outside [{}, {}]",
+                value_range[0], value_range[1]
+            ),
+        });
+    }
+    let step = positive(
+        Some(
+            args.step
+                .unwrap_or_else(|| nice_step(value_range[1] - value_range[0])),
+        ),
+        1.0,
+        "step",
+    )?;
+    let ticks = axis_labels(value_range, step).ok_or_else(|| CommandError::OutOfRange {
+        property: "step".to_owned(),
+        detail: format!(
+            "value_range [{}, {}] needs more than {MAX_LABELS} labels at step {step}; use a larger step",
+            value_range[0], value_range[1]
+        ),
+    })?;
+    if ticks.len() < 2 {
+        return Err(CommandError::OutOfRange {
+            property: "step".to_owned(),
+            detail: format!(
+                "step {step} leaves {} label on [{}, {}]; use a smaller step",
+                ticks.len(),
+                value_range[0],
+                value_range[1]
+            ),
+        });
+    }
+    if let Some(size) = args.caption_size
+        && (!size.is_finite() || size <= 0.0)
+    {
+        return Err(CommandError::OutOfRange {
+            property: "caption_size".to_owned(),
+            detail: format!("{size} is not a finite, positive size"),
+        });
+    }
+    let caption = match args.caption {
+        Some(text) if text.trim().is_empty() => {
+            return Err(CommandError::OutOfRange {
+                property: "caption".to_owned(),
+                detail: "a caption needs something to say".to_owned(),
+            });
+        }
+        Some(text) => Some(text),
+        None => None,
+    };
+    // The category labels and the value-axis ticks are not optional — a chart
+    // with no category labels is a picture, not an explanation — so the whole
+    // template needs a text typesetter, caption or not.
+    if !typesetter.supports_text() {
+        return Err(CommandError::Unsupported {
+            feature: "text".to_owned(),
+        });
+    }
+
+    let count = categories.len();
+    let scale = AxesScale::new(
+        (0.0, count as f64),
+        width,
+        (value_range[0], value_range[1]),
+        height,
+    );
+    let left = -width / 2.0;
+    let baseline = scale.to_world(0.0, 0.0).y;
+    let band = width / count as f64;
+    let bar_width = band * CHART_BAR_FRACTION;
+    let show_values = args.show_values.unwrap_or(true);
+    let label_spec = TextSpec {
+        size: Some(TICK_LABEL_SIZE),
+        max_width: None,
+    };
+
+    let mut build = Build::open(tree, args.label, args.position, "position")?;
+    let result = (|| -> Result<(), CommandError> {
+        // The value axis: a number line turned a quarter turn, so a data unit
+        // runs up the frame and its ticks stand off to the left. Its data range
+        // is the value window, which is what puts a tick and a label at every
+        // round number a reader needs.
+        let mut axis = rustim_mobject::shapes::build(
+            ShapeKind::NumberLine,
+            &ShapeParams {
+                width: Some(height),
+                range: Some(value_range),
+                step: Some(step),
+                tick_size: Some(AXES_TICK_SIZE),
+                ..ShapeParams::default()
+            },
+        );
+        axis.label = Some(VALUE_AXIS_LABEL.to_owned());
+        // `NumberLine` is centred on its own length, so the turn about its
+        // centre puts zero at the world origin and the data range across
+        // `[-height/2, height/2]`; the translation then puts its shaft on the
+        // frame's left edge. `+π/2` is the direction that puts the high end at
+        // the top (`-π/2` would stand every value on its head).
+        axis.transform = Affine2::translate((left, 0.0)) * Affine2::rotate(FRAC_PI_2);
+        build.node(axis);
+
+        let mut line = rustim_mobject::shapes::build(
+            ShapeKind::Line,
+            &ShapeParams {
+                width: Some(width),
+                position: Some([left, baseline]),
+                ..ShapeParams::default()
+            },
+        );
+        line.label = Some(CATEGORY_AXIS_LABEL.to_owned());
+        build.node(line);
+
+        for (index, (&value, category)) in values.iter().zip(categories).enumerate() {
+            let x = scale.to_world(index as f64 + 0.5, 0.0).x;
+            let top = scale.to_world(0.0, value).y;
+            // A zero value still gets a bar — a hairline on the baseline —
+            // rather than no node, so every category is addressable and a
+            // lecture can animate it from there.
+            let bar_height = (top - baseline).abs().max(DEFAULT_THICKNESS);
+            build.piece(
+                ShapeKind::Square,
+                ShapeParams {
+                    width: Some(bar_width),
+                    height: Some(bar_height),
+                    color: args.color,
+                    position: Some([x, (top + baseline) / 2.0]),
+                    label: Some(category.clone()),
+                    ..ShapeParams::default()
+                },
+            );
+        }
+
+        if show_values {
+            for (index, &value) in values.iter().enumerate() {
+                let text = tick_text(value);
+                let block = typesetter
+                    .text(&text, &label_spec)
+                    .map_err(|error| typeset_error(error, "values"))?;
+                let half = block.local_bounds().map_or(0.0, |rect| rect.height() / 2.0);
+                let x = scale.to_world(index as f64 + 0.5, 0.0).x;
+                let edge = scale.to_world(0.0, value).y;
+                // A negative bar carries its value underneath, so the label
+                // never sits between the bar and its baseline.
+                let y = if value < 0.0 {
+                    edge - CHART_LABEL_GAP - half
+                } else {
+                    edge + CHART_LABEL_GAP + half
+                };
+                build.text(&text, block, &label_spec, [x, y], None, Some(text.clone()));
+            }
+        }
+
+        // The value axis's own numbers, right-aligned one tick-length and one
+        // gap clear of the shaft. The zero label is kept: unlike a cartesian
+        // plot's origin, the baseline is the number a bar chart is read against.
+        for &value in &ticks {
+            let text = tick_text(value);
+            let block = typesetter
+                .text(&text, &label_spec)
+                .map_err(|error| typeset_error(error, "value_range"))?;
+            let half = block.local_bounds().map_or(0.0, |rect| rect.width() / 2.0);
+            let x = left - AXES_TICK_SIZE - CHART_LABEL_GAP - half;
+            let y = scale.to_world(0.0, value).y;
+            build.text(&text, block, &label_spec, [x, y], None, Some(text.clone()));
+        }
+        // Category labels wrap at their own band, so a long word cannot run
+        // into its neighbour; each label's measured height keeps a wrapped one
+        // clear of the axis.
+        let category_spec = TextSpec {
+            size: Some(TICK_LABEL_SIZE),
+            max_width: Some(band),
+        };
+        for (index, category) in categories.iter().enumerate() {
+            let block = typesetter
+                .text(category, &category_spec)
+                .map_err(|error| typeset_error(error, "categories"))?;
+            let half = block.local_bounds().map_or(0.0, |rect| rect.height() / 2.0);
+            let x = scale.to_world(index as f64 + 0.5, 0.0).x;
+            build.text(
+                category,
+                block,
+                &category_spec,
+                [x, -height / 2.0 - DEFAULT_GAP - half],
+                None,
+                None,
+            );
+        }
+
+        if let Some(caption) = caption {
+            let spec = TextSpec {
+                size: args.caption_size,
+                max_width: None,
+            };
+            let block = typesetter
+                .text(caption, &spec)
+                .map_err(|error| typeset_error(error, "caption"))?;
+            let caption_half = block.local_bounds().map_or(0.0, |rect| rect.height() / 2.0);
+            let bottom = build
+                .created
+                .iter()
+                .filter_map(|id| build.tree.world_bounds(*id))
+                .map(|rect| rect.y0 - build.origin[1])
+                .fold(f64::INFINITY, f64::min);
+            let y = if bottom.is_finite() {
+                bottom - DEFAULT_GAP - caption_half
+            } else {
+                -height / 2.0 - DEFAULT_GAP - caption_half
+            };
+            build.text(caption, block, &spec, [0.0, y], None, None);
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => Ok(build.finish()),
+        Err(error) => {
+            build.rollback();
+            Err(error)
+        }
+    }
+}
+
+/// A "nice" tick step: `1`, `2`, `5` or `10` times a power of ten, chosen so
+/// the window gets about [`CHART_TARGET_TICKS`] labels.
+///
+/// The thresholds are the usual ones (`1.5`, `3`, `7`): a raw step of `2.2`
+/// rounds down to `2` rather than up to `5`, because six labels are a better
+/// axis than three. A window with no span at all — refused before this is
+/// called — answers `1.0` rather than producing an infinite step.
+fn nice_step(span: f64) -> f64 {
+    let raw = span / CHART_TARGET_TICKS;
+    if !(raw.is_finite() && raw > 0.0) {
+        return 1.0;
+    }
+    let magnitude = 10f64.powf(raw.log10().floor());
+    let normalized = raw / magnitude;
+    let nice = if normalized <= 1.5 {
+        1.0
+    } else if normalized <= 3.0 {
+        2.0
+    } else if normalized <= 7.0 {
+        5.0
+    } else {
+        10.0
+    };
+    nice * magnitude
+}
+
 #[cfg(test)]
 mod tests {
-    //! The pure half of `explain.plot`: Horner, the sampling runs and the tick
-    //! text. The command-level tests in `context.rs` cover the group, the
-    //! placement and the refusals; these cover the arithmetic those tests would
-    //! otherwise exercise only through a whole scene.
+    //! The pure half of `explain.plot` and `explain.chart`: Horner, the
+    //! sampling runs, the tick text and the "nice" step. The command-level
+    //! tests in `context.rs` cover the group, the placement and the refusals;
+    //! these cover the arithmetic those tests would otherwise exercise only
+    //! through a whole scene.
 
     use super::*;
+
+    #[test]
+    fn a_nice_step_rounds_to_one_two_five_or_ten() {
+        // A window of 4.2 wants a step of 1: five labels (`0`…`4`) is a better
+        // axis than the three a step of 5 would leave.
+        assert_eq!(nice_step(4.2), 1.0);
+        // 11 wants 2, not 5 — the same argument one power of ten up.
+        assert_eq!(nice_step(11.0), 2.0);
+        assert_eq!(nice_step(1.0), 0.2);
+        assert_eq!(nice_step(100.0), 20.0);
+        // The template refuses a zero span before it gets here; the guard is
+        // for a direct caller, and it must not divide by zero.
+        assert_eq!(nice_step(0.0), 1.0);
+        assert_eq!(nice_step(f64::NAN), 1.0);
+    }
 
     #[test]
     fn horner_evaluates_a_polynomial_lowest_degree_first() {

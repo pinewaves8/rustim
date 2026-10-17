@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (29 actions, 12 shapes, 11 animations, 10
+//!    the build actually has (30 actions, 12 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -155,7 +155,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 29, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 30, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -749,6 +749,75 @@ fn the_matrix_template_groups_its_cells_and_addresses_each_by_its_text() {
         .expect("a tree");
     assert!(
         !tree.nodes.iter().any(|node| node.name == "残缺的矩阵"),
+        "a refused template left its group behind"
+    );
+
+    finish(client, &png);
+}
+
+/// The fifth `explain.*` template: a bar chart whose bars are named objects.
+///
+/// The pieces only the real binary can prove are that the host's shaper draws
+/// both the category labels and the value axis's numbers, that a bar is
+/// addressable by its category, that a negative value hangs below the baseline
+/// without needing a second command, and that a window without zero is refused
+/// rather than drawn with a truncated baseline.
+#[test]
+fn the_chart_template_addresses_each_bar_by_its_category() {
+    let (mut client, png) = client("chart");
+
+    // Group, two axes, three bars, three value labels, four value-axis ticks
+    // (-4, -2, 0, 2 on the automatic window and step) and three category
+    // labels, plus the caption.
+    let created = expect_diff(
+        &mut client,
+        r#"{"action":"explain.chart","categories":["一","二","三"],"values":[3.0,-5.0,2.0],"caption":"各季度销量","label":"柱状图"}"#,
+    )
+    .created;
+    assert_eq!(created.len(), 17, "{:?}", created);
+
+    let group = created[0];
+    let tree = client
+        .send_raw(&format!(r#"{{"action":"query","target":{}}}"#, group.raw()))
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert_eq!(tree.root, group);
+    assert_eq!(tree.nodes[0].name, "柱状图", "the label names the group");
+    assert!(
+        tree.nodes[0].bounds.is_some(),
+        "the group declares the union of its pieces"
+    );
+    let names: Vec<&str> = tree.nodes.iter().map(|node| node.name.as_str()).collect();
+    for name in ["数值轴", "类别轴", "一", "二", "三", "-5"] {
+        assert!(names.contains(&name), "missing {name}: {names:?}");
+    }
+
+    // A bar is addressable by its category, and the label resolves to the bar
+    // rather than to the category label underneath it (which carries none).
+    let diff = expect_diff(
+        &mut client,
+        r#"{"action":"set","target":"二","property":{"name":"opacity","value":0.5}}"#,
+    );
+    assert_eq!(diff.modified, vec![created[4]], "the second bar");
+
+    // A window that excludes zero is refused under `value_range`, and the
+    // refused group does not survive.
+    let error = client
+        .send_raw(
+            r#"{"action":"explain.chart","categories":["a"],"values":[3.0],"value_range":[1.0,5.0],"label":"错图"}"#,
+        )
+        .expect("a refusal is a reply")
+        .error
+        .expect("a truncated baseline is refused");
+    assert!(format!("{error}").contains("value_range"), "{error}");
+    let tree = client
+        .send_raw(r#"{"action":"query"}"#)
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert!(
+        !tree.nodes.iter().any(|node| node.name == "错图"),
         "a refused template left its group behind"
     );
 

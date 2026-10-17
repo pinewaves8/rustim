@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **879 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **886 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -373,7 +373,7 @@ last property.
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it), `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) and `templates` (the `explain.*` thick tools: one group, addressable pieces, a declared box and an atomic rollback) | Real |
-| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the remaining two templates, the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; the first four templates live one crate up) |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the remaining template, the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; the first five templates live one crate up) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -2103,7 +2103,7 @@ two-piece count. `ACTIONS` 26 → 27. **All eight goldens are unchanged**, and t
 846 → 856.
 
 Deferred, and named so they are not rediscovered as gaps: labels that *follow* their subject, the
-remaining two `explain.*` templates (`chart`, `algorithm`), the linter
+remaining `explain.*` template (`algorithm`), the linter
 (out of frame, overlap, size, contrast, pacing) and `ScenePlan`. Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
 arrow is a static node placed once; re-placing it is a `point_at` again, and following would need a
 per-frame constraint the tree does not have), and spotlight-beyond-opacity (a true mask over the
@@ -3035,6 +3035,33 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   and a conformance case through the real binary that reads back the bracket and cell names, asserts
   the duplicate-cell `ambiguous_label`, and proves a ragged row leaves no group behind;
   **all eight goldens unchanged**, count 870 → 879.
+- **Phase 2's ninth slice — the fifth template, `explain.chart` — is done**, and it is the first
+  template that draws a *measured* picture: a bar chart's bars are only meaningful against the scale
+  the axes declare, so the template owns the window, the step, the baseline and every label's
+  position. Four decisions are load-bearing. **The baseline is always zero, and a window without zero
+  is refused**: a bar chart drawn against a truncated axis distorts every ratio at once while looking
+  perfectly healthy, which is the one class of wrong picture a reader cannot catch — so
+  `value_range` excluding zero is an `OutOfRange` under `value_range`, and an explicit window must
+  also contain every value. **Negative values grow downward and zero still gets a node**: bars run
+  from the zero baseline to their scaled value, a zero gets a `DEFAULT_THICKNESS` hairline rather
+  than being skipped, so every category is always addressable and animatable. **The value axis is a
+  `NumberLine` turned a quarter turn** (ticks outward, `+π/2` so values rise and ticks stand to the
+  left), which means the axis is the same shape and `kind` an `add` produces, and its numbers are
+  drawn by the template right-aligned outside the shaft — zero included, because a bar chart is read
+  against its baseline. **A bar is labelled by its category and a label by its own text**, so
+  `set target "二"` moves the second bar while a repeated tick or value is `ambiguous_label`; the
+  category labels deliberately carry no label, so the bar is the unambiguous address under each
+  column. The automatic step is a `nice_step` of `1/2/5 × 10ⁿ` chosen for about five labels, and the
+  step is then validated the same way an explicit one is (at least two labels, no more than
+  `MAX_LABELS`). `created = [group, value axis, category axis, bar…, value label…, value-axis tick
+  label…, category label…, caption?]`, and `ACTIONS` 29 → 30. Evidence: one unit test over
+  `nice_step`, five context tests (the bare three-category chart with its baseline, bar geometry and
+  label rows, a negative bar with an explicit window and position, eleven by-field refusals plus
+  three constructed ones with the tree unchanged, no-typesetter refusal, and a late-typesetter
+  rollback), two round-trip fixtures, and a conformance case through the real binary that reads back
+  the axis names, the category names and a negative value's label, asserts a bar is addressable by
+  its category, and proves a window without zero leaves no group behind; **all eight goldens
+  unchanged**, count 879 → 886.
 
 ## AI integration
 
@@ -3060,7 +3087,7 @@ the AI surface" below.
 session. It does not touch the tree; it answers with a `capabilities` document — the protocol version,
 the engine's version string, and the exact action / shape / animation / property / rate names this
 build accepts, plus its limits and two advisory profiles. The lists are **derived from serde over the
-same enums the parser uses** — `actions` from `Command::action_name` (27 verbs), `PROPERTY_NAMES`,
+same enums the parser uses** — `actions` from `Command::action_name` (30 verbs), `PROPERTY_NAMES`,
 `AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` for the nouns — so an advertised name is
 accepted by construction, and a conformance test feeds every advertised word back through the binary
 (see `crates/rustim-app/tests/conformance.rs`). A new variant that misses its `ALL`/name table fails a
