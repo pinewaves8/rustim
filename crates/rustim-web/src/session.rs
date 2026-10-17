@@ -47,9 +47,58 @@ pub fn scene_names() -> &'static [&'static str] {
     NAMES
 }
 
+/// The one formula the `formula` page shows.
+///
+/// Typst math, not LaTeX — `frac(1, 2)`, not `\frac{1}{2}` — and chosen for
+/// **structure**: a superscript and a fraction are what a MathML-aware reader
+/// needs to hear as structure rather than as one long sentence. Deliberately no
+/// CJK: the embedded font set a browser build ships has the math faces and not
+/// the bundled CJK face (see [`rustim_text::formula::FormulaCompiler::from_embedded`]).
+#[cfg(feature = "formula")]
+const FORMULA_BODY: &str = "x^2 + frac(1, 2)";
+
+/// The label the semantic tree speaks for it.
+#[cfg(feature = "formula")]
+const FORMULA_LABEL: &str = "公式";
+
+#[cfg(feature = "formula")]
+struct FormulaScene {
+    /// Taken in `construct`; the compiler is the expensive part and lives only
+    /// until the mobjects exist.
+    formula: Option<rustim_text::formula::Formula>,
+}
+
+#[cfg(feature = "formula")]
+impl Scene for FormulaScene {
+    fn construct(&mut self, ctx: &mut SceneContext) {
+        let Some(formula) = self.formula.take() else {
+            return;
+        };
+        let ids = formula.insert(&mut ctx.tree);
+        if let Some(root) = ctx.tree.get_mut(ids.root) {
+            root.label = Some(FORMULA_LABEL.to_owned());
+        }
+    }
+}
+
 fn make_scene(name: &str) -> Result<Box<dyn Scene>, String> {
     match name {
         "pythagorean" => Ok(Box::new(rustim_scenes::Pythagorean)),
+        #[cfg(feature = "formula")]
+        "formula" => {
+            // Compiled here rather than in `construct` so a fragment Typst
+            // refuses is an error the host can display before it has a canvas,
+            // instead of a scene that silently constructs nothing. This is the
+            // embedded-only constructor: a wasm build has no font directory.
+            let mut compiler = rustim_text::formula::FormulaCompiler::from_embedded()
+                .map_err(|e| format!("the formula compiler could not load its fonts: {e}"))?;
+            let formula = compiler
+                .compile(FORMULA_BODY)
+                .map_err(|e| format!("`{FORMULA_BODY}` does not compile: {e}"))?;
+            Ok(Box::new(FormulaScene {
+                formula: Some(formula),
+            }))
+        }
         other => Err(format!(
             "unknown scene `{other}`; this build knows: {}",
             scene_names().join(", ")

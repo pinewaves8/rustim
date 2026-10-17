@@ -105,3 +105,26 @@ lto = "thin"
 codegen-units = 1
 # Optimised, but keep line info so release-mode profiles are still readable.
 debug = 1
+
+# The browser artifacts (`tools/build-web.sh`). Everything release does, minus
+# what a download should not pay for: the line tables it keeps for a debuggable
+# native binary are pure weight in a `.wasm`, and `wasm-bindgen` re-exports every
+# name that survives.
+#
+# `opt-level = "z"` and fat LTO were measured on the plain artifact and *lost*:
+# 3 316 720 bytes raw / 734 319 gzip, against 1 774 906 / 629 375 for release's
+# own `opt-level = 3` + thin LTO — size optimisers do less inlining and more
+# out-of-line calls. On the formula artifact the order reverses, because Typst's
+# cold paths are most of the binary and fat LTO is what folds them: 33 968 987 /
+# 14 353 728 against 37 187 372 / 16 049 644. So there are two profiles, one per
+# artifact, and `tools/build-web.sh` picks the pair by hand. See `CLAUDE.md`,
+# "Web (WASM)", for the current numbers.
+[profile.web]
+inherits = "release"
+debug = 0
+strip = "symbols"
+
+[profile.web-formula]
+inherits = "web"
+opt-level = "z"
+lto = true

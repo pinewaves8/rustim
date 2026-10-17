@@ -3,14 +3,18 @@
 // Everything else is Rust. This file exists so `index.html` has no logic worth
 // reviewing, and so the acceptance script has a stable handle (`window.rustim`).
 
-import init, { WebApp } from './pkg/rustim_web.js';
+// The formula page is a *second artifact* — `pkg-formula` carries Typst and is
+// roughly an order of magnitude larger — so the page says which module to load
+// rather than a URL parameter deciding it at run time.
+const pkg = document.body.dataset.pkg || 'pkg';
+const { default: init, WebApp } = await import(`./${pkg}/rustim_web.js`);
 
 const params = new URLSearchParams(location.search);
 // `?paused=1` is the acceptance script's mode: draw virtual time zero, then
 // call `advance(10)` and screenshot the result. A human opening the page sees
 // the animation play instead.
 const paused = params.get('paused') === '1';
-const scene = params.get('scene') || 'pythagorean';
+const scene = params.get('scene') || document.body.dataset.scene || 'pythagorean';
 
 await init();
 const app = new WebApp('canvas', scene, !paused);

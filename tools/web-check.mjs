@@ -305,6 +305,43 @@ try {
     exitCode = 1;
   }
   console.log(`apply  created ${created}, ${figuresAfter} figures in the overlay, refusal ok`);
+
+  // The second artifact. Typst is linked only into `pkg-formula`, and this is
+  // the only place its wasm build is actually *run* rather than compiled.
+  await cdp.send('Page.navigate', { url: `${origin}/formula.html?paused=1` });
+  let onFormula = false;
+  for (let attempt = 0; attempt < 600 && !onFormula; attempt += 1) {
+    await sleep(100);
+    try {
+      onFormula = await cdp.evaluate(
+        'location.pathname.endsWith("formula.html") && typeof window.rustim !== "undefined"',
+      );
+    } catch {
+      // The execution context is being replaced by the navigation; ask again.
+    }
+  }
+  if (!onFormula) throw new Error('the formula page never became ready');
+
+  const math = await cdp.evaluate(
+    'window.rustim.advance(1.0), document.querySelector("#a11y [role=math] math")?.outerHTML.slice(0, 200)',
+  );
+  if (!math || !math.includes('<mfrac')) {
+    console.error(`web-check: no structural <math> in the overlay: ${math ?? '(absent)'}`);
+    exitCode = 1;
+  } else {
+    console.log(`math   ${math}`);
+  }
+
+  const { nodes: formulaAx } = await cdp.send('Accessibility.getFullAXTree');
+  const mathNode = formulaAx
+    .filter((node) => !node.ignored)
+    .find((node) => node.role?.value === 'math' && node.name?.value === '公式');
+  if (!mathNode) {
+    console.error('web-check: Chrome exposes no math node named 公式');
+    exitCode = 1;
+  } else {
+    console.log('ax     math  公式');
+  }
 } catch (error) {
   console.error(`web-check: ${error.message}`);
   exitCode = 2;

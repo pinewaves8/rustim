@@ -186,6 +186,44 @@ fn apply_answers_like_the_desktop_feed() {
     assert_eq!(after["seq"], 5);
 }
 
+/// The formula page's scene, under the feature that creates it.
+///
+/// Typst is the one dependency this crate carries optionally, so a build
+/// without the feature must not claim the scene — and a build with it must
+/// hand the DOM layer a real `<math>` element, not a flattened sentence.
+#[cfg(feature = "formula")]
+#[test]
+fn the_formula_scene_carries_its_mathml() {
+    use rustim_scene::a11y::SemanticRole;
+
+    assert!(scene_names().contains(&"formula"));
+    let session = Session::new(WIDTH, HEIGHT, "formula").expect("the formula compiles");
+    let tree = session.semantic();
+
+    let formula = tree
+        .nodes
+        .iter()
+        .find(|n| n.name == "公式")
+        .expect("the formula is labelled");
+    assert_eq!(formula.role, SemanticRole::Math);
+    let mathml = formula.mathml.as_deref().expect("the structure was kept");
+    assert!(mathml.starts_with("<math>"), "{mathml}");
+    // Only structure: the geometry has no way to say "a fraction" or "a
+    // superscript", which is why the second compile exists at all.
+    assert!(mathml.contains("<mfrac>"), "{mathml}");
+    assert!(mathml.contains("<msup>"), "{mathml}");
+
+    // The projection keeps the string unchanged; the browser is what turns it
+    // into elements.
+    let aria = aria::project(&tree);
+    let node = aria
+        .iter()
+        .find(|n| n.name == "公式")
+        .expect("the formula is projected");
+    assert_eq!(node.role, "math");
+    assert_eq!(node.mathml.as_deref(), Some(mathml));
+}
+
 /// A build knows exactly the scenes it can construct, and says so otherwise.
 #[test]
 fn an_unknown_scene_is_a_value_not_a_panic() {

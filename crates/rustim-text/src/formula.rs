@@ -539,6 +539,19 @@ pub struct FormulaCompiler {
 /// every size the glyph is used at; the size is applied afterwards, as an affine.
 type GlyphKey = (usize, u32, u16);
 
+/// The fonts compiled into `typst-assets`, which travel with the binary.
+///
+/// Shared by both constructors so the embedded half cannot differ between a
+/// desktop build and a browser build — a formula that compiled in one and not
+/// the other would be a host-dependent language.
+fn embedded_fonts() -> Vec<Font> {
+    let mut fonts = Vec::new();
+    for data in typst_assets::fonts() {
+        fonts.extend(Font::iter(Bytes::new(data)));
+    }
+    fonts
+}
+
 impl FormulaCompiler {
     /// Load the fonts and build the library.
     ///
@@ -556,9 +569,7 @@ impl FormulaCompiler {
         // cannot be typeset at all without it, which is why `typst-assets` is
         // pinned with its `fonts` feature in the root manifest — the feature is
         // off by default and `typst_assets::fonts()` then returns nothing.
-        for data in typst_assets::fonts() {
-            fonts.extend(Font::iter(Bytes::new(data)));
-        }
+        fonts.extend(embedded_fonts());
 
         let dir = Path::new(BUNDLED_DIR);
         for path in bundled_font_paths(dir)? {
@@ -573,7 +584,33 @@ impl FormulaCompiler {
             )));
         }
 
-        Ok(Self {
+        Ok(Self::with_fonts(fonts))
+    }
+
+    /// Load the embedded fonts only — no filesystem, so this is the wasm entry.
+    ///
+    /// [`new`](Self::new) reads [`BUNDLED_DIR`] and reports its absence on
+    /// purpose: a desktop install that lost the directory would otherwise render
+    /// Chinese as a run of `.notdef` with no error anywhere. A browser has no
+    /// directory at all, and `typst-assets` already carries the math faces a
+    /// formula needs, so this constructor takes exactly the half that travels in
+    /// the binary. A **CJK formula on the web** therefore needs fonts this
+    /// constructor does not have; that is the recorded font-subsetting cost, not
+    /// something a different constructor would fix.
+    pub fn from_embedded() -> Result<Self, FormulaError> {
+        let fonts = embedded_fonts();
+        if fonts.is_empty() {
+            return Err(FormulaError::Fonts(io::Error::new(
+                io::ErrorKind::NotFound,
+                "typst-assets was built without its `fonts` feature",
+            )));
+        }
+        Ok(Self::with_fonts(fonts))
+    }
+
+    /// The expensive half, shared by both constructors.
+    fn with_fonts(fonts: Vec<Font>) -> Self {
+        Self {
             library: LazyHash::new(Library::default()),
             html_library: LazyHash::new(
                 Library::builder()
@@ -584,7 +621,7 @@ impl FormulaCompiler {
             fonts,
             outlines: HashMap::new(),
             font_size_pt: DEFAULT_FONT_SIZE_PT,
-        })
+        }
     }
 
     /// Typeset at a different size. Manim's `MathTex(..., font_size=n)`.

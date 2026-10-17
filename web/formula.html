@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rustim — 公式</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<!--
+  The second artifact. `pkg-formula` is the same crate built with the `formula`
+  feature, which links Typst; the plain page is not asked to pay for it. The
+  semantic overlay carries the formula's MathML, so a MathML-aware reader walks
+  its structure — a fraction and a superscript — instead of hearing a sentence.
+-->
+<body data-pkg="pkg-formula" data-scene="formula">
+  <div class="stage">
+    <canvas id="canvas" width="1280" height="720" aria-hidden="true"></canvas>
+    <div id="a11y"></div>
+  </div>
+
+  <form id="command" autocomplete="off">
+    <label for="line">命令（一行一条 JSON，回车发送）</label>
+    <textarea id="line" rows="2" spellcheck="false"></textarea>
+    <button type="submit">发送</button>
+  </form>
+  <pre id="reply" aria-live="polite"></pre>
+
+  <script type="module" src="demo.js"></script>
+</body>
+</html>
