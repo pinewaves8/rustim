@@ -1,0 +1,29 @@
+[package]
+name = "rustim-daemon"
+description = "The WebSocket/JSON-RPC host: named sessions, attach/reconnect and event fan-out."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustim-anim.workspace = true
+rustim-math.workspace = true
+rustim-mobject.workspace = true
+rustim-scene.workspace = true
+rustim-scenes.workspace = true
+rustim-text.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+# The transport. `tokio` here is the *runtime* — the daemon is the first thing in
+# the workspace that is not a synchronous loop, because a socket listener serves
+# many clients and a session must keep ticking while nobody is sending anything.
+# `tokio-tungstenite` is the WebSocket upgrade over that listener; the wire
+# protocol on top is ours (`rpc.rs`), not a library's.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal"] }
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[dev-dependencies]
+# The integration suite is a real client: it dials the real listener.
+tokio = { version = "1", features = ["full"] }

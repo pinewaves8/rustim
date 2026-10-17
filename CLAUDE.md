@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **745 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **780 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -73,7 +73,10 @@ drag and a wheel dispatched through Chrome's input pipeline move the camera exac
 shared gesture code does — see "Web (WASM)". The **conformance suite** at
 `crates/rustim-app/tests/conformance.rs` drives the real binary only through `rustim-client`, so the
 protocol's framing promises are checked by a client that has no access to engine internals — see
-"External drivers and the AI surface". The count is not
+"External drivers and the AI surface". The **daemon** is verified over real loopback WebSockets:
+`crates/rustim-daemon/tests/daemon.rs` dials a real listener with twelve clients and asserts
+sessions, reconnects, refusal vocabulary, transport error codes, clocks and the multi-client event
+fan-out — see "The daemon". The count is not
 decoration — every one of those claims is re-run by the commands below, and the P2 rows in the
 roadmap say which step last moved it.
 
@@ -143,6 +146,9 @@ cargo run -p rustim-app -- --script sessions/intro.jsonl --reply  # drive it wit
 cargo run -p rustim-app -- --script - --reply --png out.png       # ...from stdin, answering each
 #   a script that sent {"action":"events","enabled":true} gets {"event":…} lines beside the replies
 cargo run -p rustim-app -- --script crates/rustim-app/tests/fixtures/script/session.jsonl --inspect
+cargo run -p rustim-daemon           # ws://127.0.0.1:7300, blank scene, auto clock
+cargo run -p rustim-daemon -- --scene pythagorean --clock manual --no-typeset
+#   a client attaches over WebSocket/JSON-RPC; see 驱动协议v1.md §1.2 and 使用说明.md §4.5
 cargo test --workspace               # unit tests across all crates
 cargo test -p rustim-math ease_in_out       # a single test by name
 cargo test -p rustim-math --test manim_parity   # replay the checked-in Manim fixtures
@@ -155,6 +161,8 @@ cargo test -p rustim-app --test export          # the export loop, the sinks and
 cargo test -p rustim-app --test formula         # formula structure reaches --inspect, via the binary
 cargo test -p rustim-app --test conformance     # the protocol, driven only through rustim-client
 cargo test -p rustim-client          # the client's framing rules, over in-memory streams
+cargo test -p rustim-daemon          # sessions, RPC envelope, and real loopback WebSockets
+cargo test -p rustim-daemon --test daemon   # ...only the socket-level integration suite
 cargo test -p rustim-export --test compare_cli  # the visual-regression CLI's exit codes
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo test -p rustim-web             # the browser session core, natively (no Chrome, no wasm)
@@ -361,12 +369,16 @@ last property.
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
 | `rustim-app` | The winit event loop, softbuffer presentation, keyboard and pointer input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, `typeset` (the desktop `Typesetter`: parley text, Typst formulas, installed on every `SceneContext` the binary builds), the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
 | `rustim-web` | The browser host: `Session` (scene + context + renderer + draw list, target-independent and testable natively), `aria` (the semantic tree → flat ARIA projection), `pointer` (DOM wheel/pointer units and signs → `rustim-math::gesture`, pure and natively tested), `typeset` (the formula-only `Typesetter`, `from_embedded`, under the `formula` feature), `web` (the wasm shell: canvas, rAF loop, pointer/wheel listeners, DOM/ARIA overlay), the command bridge and the optional `formula` scene | Real (Chrome-verified) |
+| `rustim-daemon` | The long-running WebSocket host: `rpc` (the JSON-RPC envelope, method vocabulary and error codes), `session` (`Hub`, `SessionHandle`, `AttachSpec`, `ClockMode` — one thread and one `current_thread` runtime per session), `typeset` (the `Typesetter`: parley text and Typst formulas, built lazily), `server` (accept loop, per-connection dispatch, event fan-out), and the `rustim-daemon` binary (`--listen`, `--scene`, `--clock`, `--no-typeset`) | Real (loopback-verified) |
 | `rustim-client` | The **client half** of the command protocol: `read_reply` (one reply line, the presence rule enforced) and `StdioClient` (spawn, `send`, `send_raw`, `write_raw`, `hello`, `close`, seq checking). No engine logic, no rendering, no platform code — it spawns a process, which is a host's job, so it is **not** one of the six wasm kernel crates | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead. `rustim-web` sits
 beside `rustim-app`, not under it: both are hosts of the same kernel, and neither depends on the
-other. `rustim-client` is not a host and not a kernel crate: it is the workspace's own *external*
+other. `rustim-daemon` is a third host on the same shelf — it depends on `rustim-scene`,
+`rustim-scenes` and `rustim-text`, never on `rustim-app` or `rustim-web`, and it names no
+rasteriser of its own — it never renders, so it emits no `frame_ready`. `rustim-client` is not a
+host and not a kernel crate: it is the workspace's own *external*
 consumer of `rustim-scene`'s protocol, existing so that the conformance suite cannot lean on
 anything a driver outside the workspace lacks.
 
@@ -2437,7 +2449,9 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   linter, daemon/MCP) are in `贾维斯集成方案.md`; the wire itself is `驱动协议v1.md`, and
   `使用说明.md` §4 documents the handshake for a user. Deliberately not done here: label addressing
   already existed (step 22b), and no second transport, no MCP surface, no checkpointing — those are
-  later phases and the documents say so.
+  later phases and the documents say so. Three of those have since landed — checkpointing/undo,
+  the `hello` teaching profile, and the WebSocket/JSON-RPC transport (`rustim-daemon`) — see the
+  Phase 1 bullets below; MCP is still planned.
 - **Phase 1's first slice — wire-level `text` / `formula` / `group` — is done.** `add` now accepts
   the three kinds that made a scripted lecture impossible: a sentence, a Typst formula and a group
   that adopts existing nodes by `Target`, all through the ordinary command feed. The structural
@@ -2576,6 +2590,24 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   `a_subscribed_script_receives_beat_events_and_a_frame_ready` over the real binary. **All eight
   goldens are unchanged** — an event is a notification, not a draw op — and the count moved
   734 → 745.
+- **Phase 1's seventh slice — `rustim-daemon` — is done**, and it is the transport the event stream
+  was built for. A new crate, not a mode of `rustim-app`: `rpc` (the JSON-RPC envelope and its eight
+  error codes), `session` (`Hub`, `SessionHandle`, `AttachSpec`, `ClockMode`; one OS thread and one
+  `current_thread` runtime per session, because `SceneContext` is not `Send`), `typeset` (a third
+  `Typesetter`, parley + Typst built lazily and failures cached), `server` (accept loop,
+  per-connection dispatch and event forwarder) and a binary with `--listen` / `--scene` / `--clock` /
+  `--no-typeset`. The design — why thread-per-session, why the attach handshake waits for
+  `construct`, why `advance` writes the clock watch before its reply, why the subscription is session
+  state, why a kernel refusal stays a `result` — is in "The daemon". Evidence: **12 socket-level
+  integration tests** in `crates/rustim-daemon/tests/daemon.rs` over a real loopback WebSocket
+  (create-and-drive, not attached `-32001`, reconnect seeing prior objects and a constraint mismatch
+  refused, kernel refusal as `result` with the id normalised to `raw()`, four transport error codes,
+  manual vs auto clocks, one event stream for two clients, `close` for everyone, notification applied
+  but unanswered, independent sessions, `hello` matching `--no-typeset`, text typeset over the
+  socket), 18 unit tests over the envelope/session/typesetter and 4 over the binary's flags. **All
+  eight goldens are unchanged** — the daemon draws nothing — and the count moved 745 → 780.
+  Deliberately deferred: authentication (loopback is the boundary), persistence and resumable
+  sessions, audio scheduling for `narrate`, a target-scoped stop, and any rendering/`frame_ready`.
 
 ## AI integration
 
@@ -2856,8 +2888,11 @@ feature to add:
   a mismatch is refused with both numbers. An assistant adapted to one build can therefore be told
   by another build, before it sends anything, whether it will be understood.
 
-The transports are deliberately not part of the kernel. `--script - --reply` (newline-delimited
-JSON over stdio) is the one implemented today, and `rustim-client` is its client half: `read_reply`
+The transports are deliberately not part of the kernel, and **two are implemented**:
+`--script - --reply` (newline-delimited JSON over stdio, one client, one process lifetime) and
+`rustim-daemon` (WebSocket/JSON-RPC, many sessions, reconnects and event push — see "The daemon").
+Both end at the same `SceneContext::handle`; a second transport is a wrapper around this protocol,
+never a second dialect of it. `rustim-client` is the stdio transport's client half: `read_reply`
 enforces the one-presence rule, `send_raw` enforces `seq`, `hello` is one call, and `close` returns
 the exit status. The conformance suite in `crates/rustim-app/tests/conformance.rs` is written against
 that crate only — it spawns the real binary, never reaching into `rustim-app`'s modules — so a passing
@@ -2865,13 +2900,93 @@ test is evidence that an outside driver can do the same. It asserts the advertis
 accepted by the binary (every shape, every animation kind with its required fields, every rate),
 that ids and labels agree across `add`/`set`/`query`, that a foreign protocol is refused readably and
 the feed continues, that blank lines are skipped and counted, and that two clients replay one log to
-one tree. A planned WebSocket/JSON-RPC transport (`rustim-daemon`, for the Jarvis UI) and an MCP
-tool surface (`rustim-mcp`) are **not implemented** and must map onto the same `SceneContext::handle`
-— a second transport is a wrapper around this protocol, never a second dialect of it.
-The teaching-tier tools (`rustim-director`), the two tool tiers, events and the daemon/MCP
-transports are roadmap items in `贾维斯集成方案.md`; nothing in this repository currently claims
-them. (Checkpoint/undo/seek, `pause`/`resume`/`tempo` and the list commands **are** implemented —
-see "AI integration".)
+one tree. The daemon's socket-level suite is the same claim in the other transport's terms:
+`crates/rustim-daemon/tests/daemon.rs` attaches two clients to one session and asserts each sees the
+same events, and a reconnect sees the objects the dropped socket created. An MCP tool surface
+(`rustim-mcp`) is **not implemented** and must map onto the same `SceneContext::handle`. The
+teaching-tier tools (`rustim-director`) and the two tool tiers are roadmap items in
+`贾维斯集成方案.md`; nothing in this repository currently claims them.
+(Checkpoint/undo/seek, `pause`/`resume`/`tempo`, the list commands, the event stream and the daemon
+transport **are** implemented — see "AI integration".)
+
+### The daemon: many sessions over a socket
+
+`rustim-daemon` is the transport for an assistant that lives in another process and must survive its
+own reconnect. It is a **host**, not a second engine: the same `SceneContext::handle`, the same serde
+commands and replies, the same `SemanticTree`. New here are the envelope, the sessions and the event
+push — everything a client sends is still a protocol command.
+
+**Thread per session, because `SceneContext` is not `Send`.** `Box<dyn Scene>`, `Box<dyn Animation>`
+and `Box<dyn Typesetter>` carry no `Send` bound, and adding one would change every implementor's
+signature for a property only one host needs. So each session owns an OS thread that runs a
+`current_thread` tokio runtime (`Runtime::block_on` has no `Send` bound). The network reactor spawns
+the thread, hands it channels, and thereafter sees only `Arc<SessionHandle>` and plain data — an
+`mpsc` of requests, a `broadcast` of events, a `watch` of the clock.
+
+**`attach` waits for `construct`.** The session thread builds the scene, its `SceneContext`, and the
+`DaemonTypesetter` (when enabled), calls `construct`, and only then signals a oneshot the caller is
+awaiting. So the first command a client sends meets a constructed scene, and `attach` can return the
+session id and its constraints without racing the setup. A scene whose `construct` is slow delays its
+own attach and nobody else's.
+
+**The clock is either automatic or manual, never both.** `auto` sessions tick `STEP = 1/60` with
+`MissedTickBehavior::Skip` — a descheduled process must not replay sixty steps and make the state
+depend on machine load — and the first, immediately-ready tick is consumed so clock 0 is the state
+`construct` left. `manual` sessions move only on `advance`, which steps the scene on the same
+`1/60` grid (the browser acceptance uses the identical grid) and caps a request at
+`MAX_ADVANCE_SECONDS = 600`. `advance` on an auto session is a refusal, not a second clock.
+
+**The watch is updated before the reply, not after.** `advance` answers with the clock it produced,
+and the caller reads the watch the instant the oneshot resolves; reporting the clock on the way out
+of `service` — after the reply — returned the value from *before* the call. The integration suite
+caught it (`clock: 0` for a 0.5 s advance), which is why the `now` sender is passed into `service`
+and the Advance arm writes it before `reply.send(())`.
+
+**Events are notifications, and the subscription is session state.** `publish` drains the kernel's
+event log unconditionally and broadcasts only what `ctx.wants_event(kind)` admits, so a session
+nobody subscribed to still lets the kernel's bounded log drop rather than letting the cap do it. Each
+connection owns a forwarder task that turns events into `{"jsonrpc":"2.0","method":"event",…}` frames
+with no `id`; a `Lagged` receiver skips rather than stalls, because one slow client must not slow the
+timeline. Because subscription lives on the session, every attached client sees the same stream —
+that is what makes a display and an agent share a lecture — and events between two attaches are not
+replayed: `query` is how a newcomer resyncs. The daemon emits no `frame_ready`, because it renders
+nothing.
+
+**The envelope is thin and the protocol underneath is untouched.** `rpc::parse` enforces JSON-RPC
+2.0: string `method`, an object `params` (the array form is refused), and an `id` that is a number, a
+string or absent/null. An action method is recognised against `rustim_scene::command::ACTIONS`, and
+`command_text` re-inserts `"action": method` and hands the text to the **protocol's own parser** — the
+daemon has no second dialect and no second validator. The result of a kernel refusal is a `result`
+carrying `{"seq":n,"error":{…}}`, exactly as stdio would; JSON-RPC `error` is reserved for transport
+failures (`-32700` parse, `-32600` invalid request, `-32601` method not found, `-32602` invalid
+params, `-32603` internal, `-32001` not attached, `-32002` no such session, `-32003` not a manual
+clock). A notification (no `id`) is applied and never answered, but it still consumes a protocol
+`seq`.
+
+**Replies and events share one writer, not one order.** A WebSocket sink cannot be written from two
+places, so every outbound frame goes through a per-connection `mpsc` into one writer task. Frames are
+ordered within that channel; a reply and the event the same command produced are *not* ordered
+against each other, because the actor hands the outcome back and broadcasts on separate channels.
+Clients correlate replies by JSON-RPC `id` and events by the event's `clock` — the stdio feed remains
+the transport with a line order, and this one is explicitly not.
+
+**Session policy.** `attach` without an id creates `s1`, `s2`, … (monotonic, never reused); with an id
+it joins, which is reconnect. Joining an unknown id is `NO_SUCH_SESSION`, never a silent new session:
+a client that thinks it rejoined must not be handed an empty stage. A rejoin may restate `scene`,
+`clock`, `width`, `height` and `motion`; a disagreement is refused with both values named.
+`detach` keeps the session running and only stops that connection's attachment and events; `close`
+ends it for everyone, and another attached client's next use gets `NO_SUCH_SESSION` (its `ping` says
+`alive: false` first). The binary's flags (`--listen`, `--scene`, `--clock`, `--no-typeset`) are
+defaults for a newly created session, not policies — a client may choose another scene or clock in
+its own `attach`.
+
+**What it deliberately is not.** It does not render (no `frame_ready`), does not authenticate
+(loopback binding is the boundary; exposing the port without an authenticating proxy lets anyone who
+can reach it drive the engine), does not persist (the session dies with the process; the command log
+is the artifact to replay), and does not emit audio (`narrate` queues lines on the session clock;
+speaking them is the client's business). The typesetter is built lazily per session and caches a
+failure, so `--no-typeset` is honest in `hello` and a missing font directory costs one report rather
+than one per `add`.
 
 ### The feed: a session is a file of commands
 
