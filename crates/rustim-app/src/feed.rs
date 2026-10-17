@@ -252,6 +252,7 @@ pub fn animation_kinds() -> String {
         AnimationKind::Uncreate,
         AnimationKind::Group,
         AnimationKind::Succession,
+        AnimationKind::Transform,
     ];
     names
         .iter()
@@ -495,7 +496,7 @@ mod tests {
     fn the_documented_animation_kinds_are_the_ones_the_wire_takes() {
         assert_eq!(
             animation_kinds(),
-            "fade_in, fade_out, move_to, rotate, scale, create, uncreate, group, succession"
+            "fade_in, fade_out, move_to, rotate, scale, create, uncreate, group, succession, transform"
         );
         for name in animation_kinds().split(", ") {
             let json = format!(r#"{{"action":"play","animation":{{"target":0,"type":"{name}"}}}}"#);
@@ -526,6 +527,7 @@ mod tests {
             "uncreate" => AnimationKind::Uncreate,
             "group" => AnimationKind::Group,
             "succession" => AnimationKind::Succession,
+            "transform" => AnimationKind::Transform,
             _ => AnimationKind::Scale,
         }
     }

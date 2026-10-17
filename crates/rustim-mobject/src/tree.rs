@@ -382,7 +382,29 @@ impl SceneTree {
         true
     }
 
-    fn is_ancestor_of(&self, maybe_ancestor: NodeId, node: NodeId) -> bool {
+    /// Put `parent`'s children into `order`, in both the structural list and the
+    /// draw-order bucket.
+    ///
+    /// Children not named in `order` keep their relative order at the end rather
+    /// than disappearing: this is called by a morph to restore Manim's interleaved
+    /// padding order (`rustim_anim::TransformGroup`), and a caller that miscomputes
+    /// the list must not be able to lose a node.
+    pub fn reorder_children(&mut self, parent: NodeId, order: &[NodeId]) {
+        let rank = |id: NodeId| order.iter().position(|&o| o == id);
+        let Some(p) = self.nodes.get_mut(parent) else {
+            return;
+        };
+        p.children
+            .sort_by_key(|&id| (rank(id).is_none(), rank(id), id.raw()));
+        let reordered = p.children.clone();
+        if let Some(list) = self.order.get_mut(&Some(parent)) {
+            list.clear();
+            list.extend(reordered);
+        }
+    }
+
+    /// Whether `maybe_ancestor` is `node` itself or an ancestor of it.
+    pub fn is_ancestor_of(&self, maybe_ancestor: NodeId, node: NodeId) -> bool {
         let mut cur = Some(node);
         while let Some(id) = cur {
             if id == maybe_ancestor {
@@ -548,6 +570,92 @@ impl SceneTree {
         self.nodes.clear();
         self.order.clear();
         self.camera = Camera::default();
+    }
+
+    /// A detached, recursive copy of the subtree rooted at `id`.
+    ///
+    /// Manim's `Transform` aligns against a *copy* of the target
+    /// (`animation/transform.py:200-212`), which is what lets the donor be a live
+    /// scene object without being mutated. A `Mobject` alone cannot be that copy
+    /// here: its children are ids into one tree, and an id means nothing in
+    /// another tree (or after the original is deleted). So the copy carries the
+    /// structure itself.
+    pub fn snapshot(&self, id: NodeId) -> Option<Subtree> {
+        let m = self.get(id)?;
+        Some(Subtree {
+            mobject: m.clone(),
+            children: m
+                .children
+                .iter()
+                .filter_map(|&child| self.snapshot(child))
+                .collect(),
+        })
+    }
+
+    /// Insert a detached subtree under `parent` at `index`, assigning fresh ids.
+    ///
+    /// Returns the new root's id, or `None` if `parent` is unknown. The children
+    /// are inserted recursively and in order, so the subtree's structure survives
+    /// a round trip through [`SceneTree::snapshot`] — the property
+    /// `rustim_anim::TransformGroup` builds its padding on.
+    pub fn insert_subtree(
+        &mut self,
+        parent: NodeId,
+        index: usize,
+        subtree: &Subtree,
+    ) -> Option<NodeId> {
+        self.get(parent)?;
+        // The donor's `children` list names ids in the donor's tree. Clearing it
+        // is not tidying: `insert` copies the whole mobject, so a stale list here
+        // would make the new node claim children that belong to someone else.
+        let mut m = subtree.mobject.clone();
+        m.children.clear();
+        m.parent = None;
+        let id = self.insert(m);
+        if !self.reparent(id, parent) {
+            self.remove(id);
+            return None;
+        }
+        if let Some(p) = self.get_mut(parent) {
+            p.children.retain(|&c| c != id);
+            let at = index.min(p.children.len());
+            p.children.insert(at, id);
+        }
+        if let Some(list) = self.order.get_mut(&Some(parent)) {
+            list.retain(|&c| c != id);
+            let at = index.min(list.len());
+            list.insert(at, id);
+        }
+        for (i, child) in subtree.children.iter().enumerate() {
+            self.insert_subtree(id, i, child)?;
+        }
+        Some(id)
+    }
+}
+
+/// A detached copy of a `Mobject` and its descendants.
+///
+/// Produced by [`SceneTree::snapshot`], consumed by
+/// [`SceneTree::insert_subtree`]. It is the value a morph needs in order to align
+/// against a live group without holding a borrow into the tree — and the only
+/// thing that lets a *target* subtree be a donor rather than a scene object.
+#[derive(Debug, Clone)]
+pub struct Subtree {
+    pub mobject: Mobject,
+    pub children: Vec<Subtree>,
+}
+
+impl Subtree {
+    /// Fade the whole family to transparent — Manim's `copy().fade(1)`.
+    ///
+    /// Recursive because opacity does not inherit in this engine: a group node
+    /// with `opacity = 0` still draws its children, so every descendant has to be
+    /// faded too or a "transparent placeholder" appears at full strength.
+    pub fn fade(&mut self) {
+        self.mobject.opacity = 0.0;
+        for child in &mut self.children {
+            child.fade();
+        }
     }
 }
 

@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **447 tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **468 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
@@ -272,8 +272,8 @@ last property.
 |---|---|---|
 | `rustim-math` | Points, `Affine2`, rate functions, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
-| `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`), stable `NodeId`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
-| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `CameraMove`, `Wait` | Real |
+| `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
+| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `TransformGroup` (family morph), `CameraMove`, `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
@@ -548,6 +548,48 @@ layout itself, so `succession`'s default (lag 1.0) makes two one-second members 
 animation. The refusals say which field is wrong: a `target` on a group, no members, an empty member
 list, a non-finite or negative `lag_ratio`, and any member's own refusal (a missing target, an
 unknown node, a bad duration) is reported under the *member's* id.
+
+### Family morphs: transforming a subtree
+
+`Transform` morphs one node's own point array and stops there. That covers every shape in
+`rustim-mobject`, and it says nothing about a group: a group has no points, it has children, and the
+thing a viewer calls "the morph" is the pairwise morph of those children. `rustim-anim::family`
+(`TransformGroup`) is that recursion, and it is the port of `Mobject.align_data`
+(`mobject/mobject.py:3107-3142`).
+
+Three rules are kept:
+
+- **The shorter side is padded with faded copies of its own children**
+  (`add_n_more_submobjects`, `:3209-3232`). The copies are **interleaved proportionally**, not
+  appended: the split is Manim's exact `(j · n) // m` arithmetic, so two children becoming five
+  order as `[c0, c0', c0'', c1, c1']` with split factors `[3, 2]`. Each copy is `.fade(1)`: opacity
+  zero throughout the subtree, because **opacity does not inherit in the draw walk** — a transparent
+  parent with opaque children would draw the children anyway.
+- **Pairs are aligned recursively by index**, each pair running its own alignment including its own
+  padding.
+- **`align_points` reconciles each pair's own arrays**, which is a no-op for groups (both empty) and
+  the whole story for leaves.
+
+Where the mutation happens is where this engine differs from Manim, and the trait forces it. Manim
+aligns *in place* inside `begin`; here `Animation::begin` is handed `&SceneTree`, deliberately, and
+an animation that starts must not restructure the scene. So `begin` builds an immutable **plan** and
+the first `interpolate` materialises it: `SceneTree::snapshot` reads the donor into a detached
+`Subtree`, `insert_subtree` inserts the padded copies with fresh `NodeId`s, and `reorder_children`
+puts each parent back into Manim's interleaved order (insertion can only append, so without the
+reorder the copies land on top of the siblings they overlap). Nothing observes the difference:
+`interpolate(0)` is the first frame either way, and reduced motion drives the same path once. The
+copies **stay in the tree** afterwards — that is Manim's outcome too — so a one-child group morphed
+into a two-child one really does contain two nodes at the end.
+
+The donor is read once and never written, and the source keeps its own `NodeId`, kind and label —
+the same limit `Transform` has: nothing in the engine knows a square became a circle, so a caller
+that cares has to relabel (see "Accessibility" for what `--inspect` showed when one did not).
+
+On the wire it is `{"type":"transform","target":A,"into":B}`, with `into` a node id that must
+already exist (the field sits between `about_point` and `animations` in declaration order). Two morphs
+the engine refuses by staying still — a shape into a group (`null_point_align` is not ported) and a
+node into itself or its own ancestor — are refused by `animation_for` with a `CommandError` instead,
+because a host told a beat played healthy should not find it did nothing.
 
 ### Reduced motion
 
@@ -984,12 +1026,30 @@ away the scale an earlier member applied. The rule that survives both: **a posit
 the state the object has when the animation starts**, and only `begin` knows the second half.
 
 **`serde` writes struct fields in declaration order, so a hand-written round-trip fixture must match
-it.** `AnimationSpec` declares `target, type, duration, to, angle, factor, about_point, animations,
-lag_ratio`; writing the nested-succession case as `{"type":"succession","animations":[...],
+it.** `AnimationSpec` declares `target, type, duration, to, angle, factor, about_point, into,
+animations, lag_ratio`; writing the nested-succession case as `{"type":"succession","animations":[...],
 "duration":2.0}` parses fine and then serialises back with `duration` first, so the byte-for-byte
 round-trip test fails on a command the engine understood. The fixture is not wrong about JSON — JSON
 objects are unordered — it is wrong about the protocol's canonical spelling, which is the thing the
 test exists to pin.
+
+**A faded padding copy has to be a real node in the tree, because opacity does not inherit.** Manim's
+`add_n_more_submobjects` pads the shorter side with `.copy().fade(1)` — copies of a group's own
+children, transparent, morphing into the extra targets. Here the draw walk folds each node's own
+`opacity` into its paint and does *not* multiply a parent's into its children, so "a transparent
+parent" draws nothing only if it has no geometry; the padding has to fade **recursively**
+(`Subtree::fade`), and the copies have to be inserted as nodes with fresh `NodeId`s. The alternative
+— a temporary `Mobject` value aligned against the target and thrown away — was rejected because the
+source must keep its child count and its later alignment must see those children, which is exactly
+what Manim's mutation of `self.submobjects` buys.
+
+**`begin` is read-only, so an in-place alignment has to be split into plan and materialise.** Manim's
+`align_data` mutates the source inside `begin`; this trait hands `begin` a `&SceneTree` on purpose, so
+`TransformGroup::begin` computes an immutable `NodePlan` and the first `interpolate` inserts the
+padding copies (it is the first call with `&mut SceneTree`). Two consequences to keep in mind when
+touching it: nothing may assume the child count in `begin` equals the one on the next frame, and the
+plan must be built from `SceneTree::snapshot` rather than from live nodes, because the donor has to
+be read without holding a borrow while the source is written.
 
 **Typst's frame is y-down; its text runs are y-up, and the two are composed, not cancelled.**
 `Frame::items()` gives `(Point, FrameItem)` in frame space (y down, `Abs` = points), while a text
@@ -1452,6 +1512,19 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   that started it — a circle scaled ×1.5 and moved to (1, 0.5) now reports radius 1.5 and the right
   bounds. **No golden moved**, because no compiled scene calls either route on a transformed object;
   the eight baselines are unchanged.
+- **P3's group↔group transforms are done** — `TransformGroup`, the morph a group needs and the leaf
+  `Transform` cannot give: children are paired by index after the shorter side gains faded padding
+  copies, exactly as `align_data` does. `begin` plans, the first `interpolate` materialises (the
+  trait's `begin` is read-only — see "Family morphs"), and the donor is a live node read into a
+  `Subtree` and never written, so `{"type":"transform","target":A,"into":B}` leaves `B` in the scene.
+  Evidence: eleven `family.rs` tests (whole-family motion, midpoint, the 1→2 and 2→5 padding orders,
+  faded copies starting at zero, an excess child fading out, leaf↔leaf, nested grandchildren, the
+  donor untouched, and the three no-op pairs), eight command tests covering the mapping and the four
+  refusals, the round-trip JSON case, and two `--script` runs (`--inspect` shows the source wearing
+  the donor's measured size while keeping its own name; a missing `into` is refused under
+  `"into"`). **No golden moved**: no compiled scene morphs a family yet, so the eight baselines are
+  unchanged. Deferred: `null_point_align` (a shape ↔ group morph, refused rather than approximated),
+  and per-child `path_arc`.
 - **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration

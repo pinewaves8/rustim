@@ -26,4 +26,4 @@ pub mod tree;
 pub use kind::NodeKind;
 pub use shapes::{ShapeKind, ShapeParams, build};
 pub use style::{DirtyFlags, Style};
-pub use tree::{Mobject, NodeId, SceneTree};
+pub use tree::{Mobject, NodeId, SceneTree, Subtree};

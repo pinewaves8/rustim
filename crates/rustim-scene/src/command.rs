@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use rustim_anim::{
-    Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Succession, Uncreate,
+    Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Succession,
+    TransformGroup, Uncreate,
 };
 use rustim_math::{Affine2, Camera, Point, Viewport};
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
@@ -133,6 +134,13 @@ pub struct AnimationSpec {
     /// centre, which is what Manim's `Rotate` defaults to as well.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub about_point: Option<[f64; 2]>,
+    /// The node a `transform` morphs its target into.
+    ///
+    /// A `NodeId` rather than an inline `Mobject`, because the target is already
+    /// in the scene and a host should address it rather than restate it. The
+    /// animation reads it once in `begin` and never writes to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub into: Option<NodeId>,
     /// A `group`'s or `succession`'s member animations, each a spec of its own.
     ///
     /// Nested rather than flat because a group is a tree: a member may itself be a
@@ -161,6 +169,9 @@ pub enum AnimationKind {
     Create,
     /// Erase the path from its end and remove the object.
     Uncreate,
+    /// Morph the target into the node named by `into` — the whole subtree, not
+    /// just the node's own points.
+    Transform,
     /// Play the `animations` list in parallel, staggered by `lag_ratio`.
     Group,
     /// Play the `animations` list one after another, as one animation.
@@ -483,6 +494,13 @@ pub fn camera_duration(duration: Option<f64>) -> Result<Option<f64>, CommandErro
 ///   nothing can reach it again and a negative one mirrors it, neither of which is
 ///   what "scale it" means to say. The same posture as [`Property::Scale`], which
 ///   refuses the same values.
+/// * `Transform` with no `into`, an `into` that is not in the tree
+///   ([`CommandError::NoSuchNode`]), the target itself, an ancestor-or-descendant
+///   pair, or a shape on one side and a group on the other — the last two would
+///   otherwise be silent no-ops: `TransformGroup` has no error channel, and a
+///   command that plays an empty beat must not answer as though it moved
+///   something. Two *leaves* and two *groups* are both fine; the group case is
+///   the one that pads child lists.
 /// * a negative or non-finite `duration` — [`CommandError::OutOfRange`]. `0.0` is
 ///   accepted: Manim refuses only `run_time < 0` (`animation/animation.py:175-181`)
 ///   and an instant snap is legitimate — `AnimationScheduler::update` already
@@ -580,6 +598,46 @@ pub fn animation_for(
         }
         AnimationKind::Create => Box::new(Create::new(target).with_duration(duration)),
         AnimationKind::Uncreate => Box::new(Uncreate::new(target).with_duration(duration)),
+        AnimationKind::Transform => {
+            let Some(into) = spec.into else {
+                return Err(CommandError::OutOfRange {
+                    property: "into".into(),
+                    detail: "a transform morphs into another node; it needs `into`".into(),
+                });
+            };
+            if into == target {
+                return Err(CommandError::OutOfRange {
+                    property: "into".into(),
+                    detail: "an object cannot be morphed into itself".into(),
+                });
+            }
+            if tree.get(into).is_none() {
+                return Err(CommandError::NoSuchNode { target: into });
+            }
+            // The engine refuses both of these by staying still (it has no error
+            // channel), so the refusal has to be here — before a beat a host is
+            // told played healthy turns out to have done nothing.
+            if tree.is_ancestor_of(target, into) || tree.is_ancestor_of(into, target) {
+                return Err(CommandError::OutOfRange {
+                    property: "into".into(),
+                    detail: "an object cannot be morphed into its own ancestor or descendant"
+                        .into(),
+                });
+            }
+            let target_is_group = !tree.child_ids(target).is_empty();
+            let into_is_group = !tree.child_ids(into).is_empty();
+            if target_is_group != into_is_group {
+                return Err(CommandError::OutOfRange {
+                    property: "into".into(),
+                    detail: if target_is_group {
+                        "a group can only be morphed into another group, not a shape".into()
+                    } else {
+                        "a shape can only be morphed into another shape, not a group".into()
+                    },
+                });
+            }
+            Box::new(TransformGroup::new(target, into).with_duration(duration))
+        }
     })
 }
 
@@ -843,6 +901,12 @@ mod tests {
             ),
             r#"{"action":"play","animation":{"type":"succession","duration":2.0,"animations":[{"target":4294967296,"type":"create"},{"target":4294967296,"type":"fade_out","duration":0.5}]}}"#
                 .to_owned(),
+            // A morph names its donor by id. The field sits between `about_point`
+            // and `animations` in declaration order, which is the order serde
+            // writes — a host diffing a replayed log depends on it.
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"transform","duration":0.8,"into":{id}}}}}"#
+            ),
             // The camera command, in its full and partial spellings. The full
             // one exercises every optional field at once; the partial one is what
             // a host sends to "zoom in", and it has to survive without gaining
@@ -1093,6 +1157,7 @@ mod tests {
                     angle: None,
                     factor: None,
                     about_point: None,
+                    into: None,
                     animations: None,
                     lag_ratio: None,
                 },
@@ -1124,6 +1189,7 @@ mod tests {
             angle: None,
             factor: None,
             about_point: None,
+            into: None,
             animations: None,
             lag_ratio: None,
         }
@@ -1258,7 +1324,8 @@ mod tests {
     /// a scene calling the constructor agree without either restating 1.0.
     #[test]
     fn an_omitted_duration_is_manims_default() {
-        let (tree, id) = scene_with_a_blank();
+        let (mut tree, id) = scene_with_a_blank();
+        let donor = tree.insert(Mobject::new(rustim_mobject::shapes::circle(1.0)));
         assert_eq!(DEFAULT_ANIMATION_RUN_TIME, 1.0);
         // Every single-node kind, so a new one cannot quietly acquire a *second*
         // default. `group` and `succession` are absent on purpose: their default
@@ -1271,12 +1338,14 @@ mod tests {
             AnimationKind::Scale,
             AnimationKind::Create,
             AnimationKind::Uncreate,
+            AnimationKind::Transform,
         ] {
             let mut what = spec(id, kind);
             match kind {
                 AnimationKind::MoveTo => what.to = Some([0.0, 0.0]),
                 AnimationKind::Rotate => what.angle = Some(1.0),
                 AnimationKind::Scale => what.factor = Some(1.5),
+                AnimationKind::Transform => what.into = Some(donor),
                 _ => {}
             }
             assert_eq!(
@@ -1481,6 +1550,7 @@ mod tests {
             angle: None,
             factor: None,
             about_point: None,
+            into: None,
             animations: Some(members),
             lag_ratio: None,
         }
@@ -1604,6 +1674,165 @@ mod tests {
             animation_for(&tree, &what),
             Err(CommandError::NoSuchNode { target }) if target == ghost
         ));
+    }
+
+    // ---- the P3 transform kind --------------------------------------------
+
+    /// A group node with `n` square children, which is the shape a host building
+    /// a family sends: one `add`, then `add`s into it.
+    fn group_of(tree: &mut SceneTree, n: usize) -> NodeId {
+        let group = tree.insert(Mobject::new(vec![]));
+        for i in 0..n {
+            let child = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+            tree.get_mut(child)
+                .unwrap()
+                .set_transform(Affine2::translate((i as f64, 0.0)));
+            assert!(tree.reparent(child, group));
+        }
+        group
+    }
+
+    /// The command morphs the children, not just the source's own (empty) array:
+    /// that is the whole difference between `transform` and the engine's leaf
+    /// `Transform`, and a mapping that built the wrong one would pass every
+    /// duration assertion.
+    #[test]
+    fn a_transform_command_morphs_the_whole_family() {
+        let mut tree = SceneTree::new();
+        let source = group_of(&mut tree, 1);
+        let donor = group_of(&mut tree, 2);
+        let donor_points: Vec<_> = tree
+            .child_ids(donor)
+            .iter()
+            .map(|&id| tree.get(id).unwrap().points.clone())
+            .collect();
+
+        let mut what = spec(source, AnimationKind::Transform);
+        what.into = Some(donor);
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        let ids = tree.child_ids(source).to_vec();
+        assert_eq!(ids.len(), 2, "the shorter side gains a faded copy");
+        assert_eq!(tree.get(ids[0]).unwrap().points, donor_points[0]);
+        assert_eq!(tree.get(ids[1]).unwrap().points, donor_points[1]);
+        assert_eq!(tree.get(ids[1]).unwrap().opacity, 1.0);
+    }
+
+    /// The donor is read, never claimed: a host that morphed `a` into `b` still
+    /// has `b`, unchanged and reachable.
+    #[test]
+    fn a_transform_command_leaves_the_donor_alone() {
+        let mut tree = SceneTree::new();
+        let source = group_of(&mut tree, 1);
+        let donor = group_of(&mut tree, 1);
+        let donor_child = tree.child_ids(donor)[0];
+        let before = tree.get(donor_child).unwrap().points.clone();
+
+        let mut what = spec(source, AnimationKind::Transform);
+        what.into = Some(donor);
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+
+        assert_eq!(tree.get(donor_child).unwrap().points, before);
+        assert!(tree.get(donor).is_some());
+    }
+
+    #[test]
+    fn a_transform_command_needs_into() {
+        let (tree, id) = scene_with_a_blank();
+        assert!(matches!(
+            animation_for(&tree, &spec(id, AnimationKind::Transform)),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "into"
+        ));
+    }
+
+    #[test]
+    fn a_transform_command_refuses_an_unknown_donor() {
+        let (mut tree, id) = scene_with_a_blank();
+        let ghost = tree.insert(Mobject::new(vec![]));
+        tree.remove(ghost);
+        let mut what = spec(id, AnimationKind::Transform);
+        what.into = Some(ghost);
+        assert!(matches!(
+            animation_for(&tree, &what),
+            Err(CommandError::NoSuchNode { target }) if target == ghost
+        ));
+    }
+
+    /// The engine stays still for these three pairs (it has no error channel), so
+    /// the refusal is the command layer's job — otherwise a host is told a beat
+    /// played when nothing happened.
+    #[test]
+    fn a_transform_command_refuses_itself_and_its_own_relatives() {
+        let mut tree = SceneTree::new();
+        let parent = group_of(&mut tree, 1);
+        let child = tree.child_ids(parent)[0];
+
+        let mut itself = spec(parent, AnimationKind::Transform);
+        itself.into = Some(parent);
+        assert!(matches!(
+            animation_for(&tree, &itself),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "into"
+        ));
+
+        let mut downward = spec(parent, AnimationKind::Transform);
+        downward.into = Some(child);
+        assert!(matches!(
+            animation_for(&tree, &downward),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "into"
+        ));
+
+        let mut upward = spec(child, AnimationKind::Transform);
+        upward.into = Some(parent);
+        assert!(matches!(
+            animation_for(&tree, &upward),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "into"
+        ));
+    }
+
+    /// A shape and a group have no honest pairing here (`null_point_align` is not
+    /// ported), so both directions are refused by name.
+    #[test]
+    fn a_transform_command_refuses_a_shape_into_a_group() {
+        let mut tree = SceneTree::new();
+        let shape = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        let group = group_of(&mut tree, 1);
+
+        let mut into_group = spec(shape, AnimationKind::Transform);
+        into_group.into = Some(group);
+        let Err(CommandError::OutOfRange { detail, .. }) = animation_for(&tree, &into_group) else {
+            panic!("a shape into a group must be refused");
+        };
+        assert!(detail.contains("shape"), "{detail}");
+
+        let mut into_shape = spec(group, AnimationKind::Transform);
+        into_shape.into = Some(shape);
+        let Err(CommandError::OutOfRange { detail, .. }) = animation_for(&tree, &into_shape) else {
+            panic!("a group into a shape must be refused");
+        };
+        assert!(detail.contains("group"), "{detail}");
+    }
+
+    /// Leaves morph too: `transform` is not group-only, and a shape-to-shape pair
+    /// is the case the engine's leaf `Transform` already covers one level down.
+    #[test]
+    fn a_transform_command_morphs_two_shapes() {
+        let (mut tree, id) = scene_with_a_blank();
+        let circle = tree.insert(Mobject::new(rustim_mobject::shapes::circle(1.0)));
+        let mut what = spec(id, AnimationKind::Transform);
+        what.into = Some(circle);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        assert_eq!(
+            tree.get(id).unwrap().points,
+            tree.get(circle).unwrap().points
+        );
     }
 
     #[test]

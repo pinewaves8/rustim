@@ -850,7 +850,7 @@ impl Animation for Wait {
 /// Written in Manim's own order rather than as `a + (b - a) * t`. The two differ
 /// in the last bits, and reproducing Manim's *rounding path* rather than only its
 /// formula is this project's rule for anything it ports.
-fn lerp_scalar(a: f64, b: f64, t: f64) -> f64 {
+pub(crate) fn lerp_scalar(a: f64, b: f64, t: f64) -> f64 {
     (1.0 - t) * a + t * b
 }
 
@@ -876,7 +876,7 @@ fn to_parent_space(parent: Affine2, p: Point) -> Option<Point> {
 ///
 /// `kurbo` has no `lerp` for `Affine`, and building one out of `as_coeffs` keeps
 /// the six coefficients in the same layout the renderer already expects.
-fn lerp_affine(a: Affine2, b: Affine2, t: f64) -> Affine2 {
+pub(crate) fn lerp_affine(a: Affine2, b: Affine2, t: f64) -> Affine2 {
     let (a, b) = (a.as_coeffs(), b.as_coeffs());
     let mut out = [0.0; 6];
     for i in 0..6 {

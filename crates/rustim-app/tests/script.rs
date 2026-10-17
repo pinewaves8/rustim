@@ -606,6 +606,82 @@ fn a_script_can_add_the_coordinate_system_kinds() {
     );
 }
 
+/// A morph reaches the wire, and the *inspect* tree is where it is visible: the
+/// donor keeps its own id and the source ends with the donor's geometry, measured
+/// rather than declared.
+///
+/// The source still calls itself a square — the engine has no way to know a
+/// square became a circle, which is the documented limit of `Transform` — so the
+/// assertion is on the measured bounds, the quantity a reader is told.
+#[test]
+fn a_transform_command_morphs_a_shape_on_the_wire() {
+    let script = scratch(
+        "transform",
+        concat!(
+            r#"{"action":"add","type":"circle","params":{"radius":2.0,"label":"圆"}}"#,
+            "\n",
+            r#"{"action":"add","type":"square","params":{"width":1.0,"label":"方"}}"#,
+            "\n",
+            // 4294967297 and 4294967298 are the ids this session's first two adds
+            // are given, which `--reply` would also hand back.
+            r#"{"action":"play","animation":{"target":4294967298,"type":"transform","into":4294967297,"duration":0.5}}"#,
+            "\n",
+        ),
+    );
+    let ran = run(&["--script", script.to_str().unwrap(), "--inspect"]);
+    ran.ok("--script … --inspect");
+    let tree: serde_json::Value =
+        serde_json::from_str(&ran.stdout).expect("--inspect must emit JSON");
+    let node = |id: u64| {
+        tree["nodes"]
+            .as_array()
+            .expect("nodes must be an array")
+            .iter()
+            .find(|n| n["id"].as_u64() == Some(id))
+            .unwrap_or_else(|| panic!("node {id} missing from the tree"))
+    };
+
+    let donor = node(4294967297);
+    let source = node(4294967298);
+    assert!(
+        source["bounds"] == donor["bounds"],
+        "the source did not take the donor's measured size:\n{}",
+        serde_json::to_string_pretty(&tree).unwrap_or_default()
+    );
+    assert_eq!(source["name"], "方", "the source keeps its own identity");
+    assert!(
+        source["description"] != donor["description"],
+        "the kind is unchanged, so the sentence is still a square's"
+    );
+}
+
+/// A morph with nowhere to go is refused by name, not played as a no-op.
+#[test]
+fn a_transform_command_needs_into_on_the_wire() {
+    let script = scratch(
+        "transform-no-into",
+        concat!(
+            r#"{"action":"add","type":"square","params":{"width":1.0}}"#,
+            "\n",
+            r#"{"action":"play","animation":{"target":4294967297,"type":"transform"}}"#,
+            "\n",
+        ),
+    );
+    let ran = run(&[
+        "--script",
+        script.to_str().unwrap(),
+        "--reply",
+        "--png",
+        out_path("transform-no-into").to_str().unwrap(),
+    ]);
+    ran.ok("--script with a refused transform");
+    let replies = ran.replies();
+    let refusal = replies[1].error.as_ref().expect("the refusal");
+    let wire = serde_json::to_value(refusal).expect("a refusal serialises");
+    assert_eq!(wire["error"], "out_of_range");
+    assert_eq!(wire["property"], "into");
+}
+
 /// A script path that cannot be read is an `exit(2)`, not a silent no-op.
 ///
 /// The one failure here that is not a per-line refusal: there is no line to
