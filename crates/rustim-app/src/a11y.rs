@@ -510,11 +510,12 @@ impl A11y {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustim_anim::Motion;
     use rustim_math::Viewport;
     use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 
     fn ctx() -> SceneContext {
-        let mut ctx = SceneContext::new(Viewport::default());
+        let mut ctx = SceneContext::new(Viewport::default(), Motion::Full);
         ctx.add(rustim_mobject::shapes::build(
             ShapeKind::Square,
             &ShapeParams {
@@ -603,7 +604,7 @@ mod tests {
         // The trap from the module docs: a `Role::Label` node's name is read
         // from `value`, so setting only `label` makes text objects silent on
         // macOS and Windows both.
-        let mut ctx = SceneContext::new(Viewport::default());
+        let mut ctx = SceneContext::new(Viewport::default(), Motion::Full);
         let mut m = rustim_mobject::shapes::build(ShapeKind::Square, &ShapeParams::default());
         m.kind = rustim_mobject::NodeKind::Text;
         m.label = Some("斜边".into());

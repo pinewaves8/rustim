@@ -1,6 +1,6 @@
 //! The scene trait and the context a scene is handed.
 
-use rustim_anim::{Animation, AnimationScheduler, Sequence, Wait};
+use rustim_anim::{Animation, AnimationScheduler, Motion, Sequence, Wait};
 use rustim_math::Viewport;
 use rustim_mobject::{NodeId, SceneTree};
 use rustim_render::{DrawList, DrawOp};
@@ -61,11 +61,26 @@ pub trait Scene {
 /// the same scene run in a window, in the exporter, and (later) in a browser.
 pub struct SceneContext {
     pub tree: SceneTree,
+    /// The animations playing *now*. Public like the rest of the context, with one
+    /// caveat worth naming: driving this directly bypasses [`Motion`], because the
+    /// preference is consulted where a *beat* is handed over
+    /// ([`rustim_anim::Sequence::start_next`]). Nothing in the workspace does that —
+    /// a scene scripts beats through [`SceneContext::play`] — but an animation added
+    /// here by hand plays at full motion whatever the user asked for.
     pub animations: AnimationScheduler,
     pub viewport: Viewport,
+    /// How much of the motion to play, for the whole run.
+    ///
+    /// Fixed at construction rather than set afterwards, because a scene is allowed
+    /// to consult it while scripting (`construct` may skip a flourish it knows will
+    /// not be animated) and a context with a mode that arrives *after* `construct`
+    /// would let the two disagree. See [`Motion`] for what `Reduced` does to a beat
+    /// — the rule is in `rustim_anim::Sequence::start_next`, the one place a beat
+    /// reaches the clock.
+    pub motion: Motion,
     /// The scripted beats not yet started — deliberately private.
     ///
-    /// The three fields above are public because a scene may read and write them
+    /// The fields above are public because a scene may read and write them
     /// directly; this one is not, because a queue advanced in any order other than
     /// "the scheduler drained, so start the next beat" is a *silently different
     /// timeline*, and the only way to keep that from happening is to be the only
@@ -74,11 +89,17 @@ pub struct SceneContext {
 }
 
 impl SceneContext {
-    pub fn new(viewport: Viewport) -> Self {
+    /// A context for a run at the given motion.
+    ///
+    /// `motion` is a parameter rather than a default because the host always knows
+    /// it — the flag or the platform preference — and a scene must never be able to
+    /// observe the wrong one.
+    pub fn new(viewport: Viewport, motion: Motion) -> Self {
         Self {
             tree: SceneTree::new(),
             animations: AnimationScheduler::new(),
             viewport,
+            motion,
             playback: Sequence::new(),
         }
     }
@@ -151,9 +172,16 @@ impl SceneContext {
     /// boundary: no still frame can see it, which is why
     /// `rustim-anim/src/sequence.rs`'s `beats_play_in_order_and_not_at_once` pins
     /// the frame *grid* rather than the picture.
+    ///
+    /// `self.motion` rides along to [`rustim_anim::Sequence::start_next`], and that
+    /// is the **whole** of reduced motion's presence in this layer: a reduced beat
+    /// lands on its end state and holds its own length, so nothing downstream —
+    /// not this method, not [`SceneContext::is_playing`], not a scene reacting to
+    /// the timeline having drained — needs to know the mode to stay correct.
     pub fn advance(&mut self, dt: f64) {
         if self.animations.is_empty() {
-            self.playback.start_next(&mut self.animations);
+            self.playback
+                .start_next(&mut self.animations, &mut self.tree, self.motion);
         }
         self.animations.update(dt, &mut self.tree);
     }
@@ -286,7 +314,7 @@ impl SceneContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustim_anim::{FadeIn, MoveTo, Wait, rate};
+    use rustim_anim::{FadeIn, Motion, MoveTo, Wait, rate};
     use rustim_math::Affine2;
     use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 
@@ -295,7 +323,13 @@ mod tests {
     const DT: f64 = 1.0 / 60.0;
 
     fn scene() -> SceneContext {
-        SceneContext::new(Viewport::default())
+        scene_at(Motion::Full)
+    }
+
+    /// A context in a chosen motion mode. Nothing but the timeline reads it, so a
+    /// reduced scene is otherwise the same scene — which is the point of the mode.
+    fn scene_at(motion: Motion) -> SceneContext {
+        SceneContext::new(Viewport::default(), motion)
     }
 
     /// A shape that is invisible until something fades it in.
@@ -569,6 +603,91 @@ mod tests {
         tick(&mut ctx, 60);
         assert_eq!(opacity(&ctx, id), 1.0);
         assert!(!ctx.is_playing());
+    }
+
+    /// A reduced beat is not interpolated: it is *already* at its end state on the
+    /// first frame, and stays there while its own length runs out.
+    ///
+    /// The interesting half of this is what it says about the frames after the
+    /// first: an implementation that snapped the beat and forgot the hold would
+    /// pass every assertion up to `!ctx.is_playing()` and get the beat's length
+    /// wrong by the whole duration — a script that finishes early under reduced
+    /// motion, which no still frame can see.
+    #[test]
+    fn reduced_motion_snaps_a_beat_instead_of_interpolating_it() {
+        let mut ctx = scene_at(Motion::Reduced);
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(0.5));
+
+        tick(&mut ctx, 1);
+        assert_eq!(
+            opacity(&ctx, id),
+            1.0,
+            "a reduced beat lands on its end state, not a slice of the way there"
+        );
+
+        // Still holding: 20 more frames is a third of a second, inside the beat.
+        tick(&mut ctx, 20);
+        assert_eq!(opacity(&ctx, id), 1.0);
+        assert!(ctx.is_playing(), "the beat's length is unchanged");
+    }
+
+    /// The scene's *length* is a property of the script, not of the motion mode.
+    ///
+    /// Two beats of half a second each, run to exhaustion both ways at the same
+    /// `dt`. Reduced motion removes frames; it must not remove time — otherwise
+    /// every beat boundary in a reduced scene is earlier than the corresponding one
+    /// in a full scene, and anything a scene does at a boundary (a relabel, an
+    /// announcement, a next scene) drifts with the mode.
+    #[test]
+    fn reduced_motion_does_not_change_how_long_the_script_takes() {
+        fn frames_to_drain(motion: Motion) -> usize {
+            let mut ctx = scene_at(motion);
+            let id = invisible_square(&mut ctx);
+            ctx.play(FadeIn::new(id).with_duration(0.5));
+            ctx.wait(0.25);
+            ctx.play(FadeIn::new(id).with_duration(0.5));
+
+            let mut frames = 0;
+            while ctx.is_playing() {
+                ctx.advance(DT);
+                frames += 1;
+                assert!(frames < 1000, "the script never drained");
+            }
+            frames
+        }
+
+        assert_eq!(
+            frames_to_drain(Motion::Full),
+            frames_to_drain(Motion::Reduced),
+            "reduced motion changes the journey, not the length of the script"
+        );
+    }
+
+    /// A beat an AI sends is reduced like any other, because `Command::Play` queues
+    /// through the same funnel (`play_all`) rather than driving the scheduler.
+    ///
+    /// This is the test that would fail if the command path ever gained a private
+    /// route to `ctx.animations`: a preference that a *host* can bypass is not a
+    /// preference, and the model-facing surface is the one place where bypassing it
+    /// would be easy to do by accident.
+    #[test]
+    fn a_play_command_is_reduced_too() {
+        let mut ctx = scene_at(Motion::Reduced);
+        let id = invisible_square(&mut ctx);
+        let cmd = Command::Play {
+            animation: command::AnimationSpec {
+                target: id,
+                kind: command::AnimationKind::FadeIn,
+                duration: Some(0.5),
+                to: None,
+            },
+        };
+        ctx.handle(&cmd).unwrap();
+
+        tick(&mut ctx, 1);
+        assert_eq!(opacity(&ctx, id), 1.0);
+        assert!(ctx.is_playing(), "and still holds the beat's own length");
     }
 
     /// **The two halves of `Command::Play` join here:** the wire mapping is

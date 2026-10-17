@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **269 unit tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **279 unit tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all six golden scenes match their checked-in
@@ -92,6 +92,7 @@ cargo run -p rustim-app -- --frames 300    # run 300 frames then exit
 cargo run -p rustim-app -- --scene primitives  # ...a named scene; `--help` lists them
 cargo run -p rustim-app -- --scene text --png out.png   # CJK + Latin glyph runs
 cargo run -p rustim-app -- --scene formula --png out.png  # Typst → per-glyph outlines
+cargo run -p rustim-app -- --motion reduced  # ignore the platform "reduce motion" preference
 cargo test --workspace               # unit tests across all crates
 cargo test -p rustim-math ease_in_out       # a single test by name
 cargo test -p rustim-math --test manim_parity   # replay the checked-in Manim fixtures
@@ -182,7 +183,12 @@ it at a coarser resolution; the degenerate spelling is not an acceptable "equiva
 
 **Golden images (`rustim-app`).** `crates/rustim-app/tests/goldens.rs` runs the real binary over
 every scene the `--scene` registry offers and compares the render, pixel by pixel, against
-`crates/rustim-app/tests/goldens/<scene>/<os>-<arch>.png`. Three properties carry the suite:
+`crates/rustim-app/tests/goldens/<scene>/<os>-<arch>.png`. Four properties carry the suite:
+
+- **Every baseline render passes `--motion full` explicitly.** What the motion mode does to a still
+  frame is worth asserting (there is a test for it) but the baseline itself must not depend on the
+  machine's desktop settings — the same reason the `text` scene ships its font rather than asking the
+  system for one.
 
 - **Baselines are per platform *and per arch*.** `vello_cpu` rasterises in f32 and NEON and SSE/AVX
   do not round identically (§10.2(3)), so one shared image would fail everywhere it was not made.
@@ -289,6 +295,44 @@ semantics, so a beat reimplements nothing. What is not ported is `AnimationGroup
 Manim expresses sequence by *composing* animations into one whose `alpha` sweeps a rescaled internal
 timeline (`animation/composition.py:198-236`), which is a different feature (`lag_ratio` staggering)
 and would rescale the durations of the beats this engine plays at face value.
+
+### Reduced motion
+
+`rustim_anim::Motion` is `Full` or `Reduced`, and it is consulted in **exactly one place**:
+`Sequence::start_next`, where a beat is handed to the clock. There is no `is_motion()` on `Animation`
+and no per-animation opt-out, because at the granularity a preference can honestly act on, motion and
+a pause are the same shape — write your end state, then occupy time.
+
+> A reduced beat is not interpolated: every animation in it is begun and driven to `ease(1.0)` once,
+> and a single `Wait` of the beat's nominal length — `max(duration)` over its members, the same total
+> the scheduler would have used (`scene.py:1184-1186`) — takes its place on the clock.
+
+Four things follow, and each is why this is one branch and not a feature:
+
+- **The rhythm is untouched.** Every beat boundary lands at the same virtual time in both modes, so
+  `is_playing`, the `ANIMATION_DONE` announcement, and a scene reacting to its timeline having drained
+  (`TransformScene`'s relabel) are all correct with no change at all.
+- **`Wait` needs no special case**, which is the same statement as "a pause is a beat with nothing to
+  snap".
+- **The settled picture is identical**, because a finished animation *is* its end state — Manim's own
+  reading (`Animation.finish` forces `interpolate(1)`, `animation/animation.py:216-227`). Measured, not
+  assumed: all six scenes render **byte-identical** stills at `--motion full` and `--motion reduced`,
+  and `--inspect` prints the identical semantic tree, labels and measured sizes included. The suite
+  asserts the transform scene's identity (`reduced_motion_leaves_the_settled_frame_identical`,
+  `max == 0` — not the golden tolerance).
+- **It is cheaper**: one frame of state per beat instead of N.
+
+`Motion` is passed into `SceneContext::new` rather than set afterwards, so a scene that consults it
+while scripting cannot see a mode that arrives after `construct`. The host reads the preference: the
+`--motion full|reduced` flag, else `rustim_app::motion::from_platform()` — which is **best effort and
+Linux only**. It runs `gsettings get org.gnome.desktop.interface enable-animations` (the GNOME-family
+schemas, which UKUI here honours; KDE is not read and the XDG portal has no such key) and returns
+`Full` for everything else: a missing command, a missing schema, an unparsable answer. macOS
+(`NSWorkspace.accessibilityDisplayShouldReduceMotion`) and Windows
+(`SPI_GETCLIENTAREAANIMATION`) are named in that module and deliberately unread, so those two
+platforms have the flag and not the preference. That mapping lives in `rustim-app` and not in the
+kernel for the same reason `accesskit` does: `rustim-anim` compiles to wasm and a crate that spawns a
+process does not.
 
 ### The two structural changes relative to Manim
 
@@ -692,21 +736,19 @@ weeks later.
 | 5 | Formulas: Typst → per-glyph outlines via `skrifa::OutlinePen`, never `typst-render` | done — see "P1 step 5", `rustim-text::formula`, the `formula` scene |
 
 P1's deferred edges, deliberately: MathML flattening (a formula is now a glyph tree with per-symbol
-spans, so this is unblocked but unwritten), self-voicing TTS for
-P5, and **reduced motion is unshipped in both forms** — nothing in the workspace reads a platform
-"reduce motion" preference, and there is no explicit switch either (no `--reduced-motion` flag; the
-binary's only flags are `--frames`/`--png`/`--inspect`/`--scene`). Do not go looking for a
-`ReducedMotion` type: the sole motion-related accessibility control that exists today is
-`rustim-app::announce`'s throttle. The CPU cost is **fill-area bound, not
+spans, so this is unblocked but unwritten) and self-voicing TTS for P5. Reduced motion was the third,
+and **P2 step 4 landed it** — one form of it, still: the platform preference is read on Linux only,
+so macOS and Windows honour `--motion reduced` and not the system setting (see "Reduced motion" in
+the timeline section for what is read and why the rest is not). The CPU cost is
+**fill-area bound, not
 shape-count bound** (4 large filled polygons at 720p already cost p50 2.25 ms of a 16.7 ms budget), so
 damage-rectangle invalidation is likely worth more than any micro-optimisation.
 
 The accessibility layer's own deferred edges, so they are not rediscovered as gaps: the
 macOS/Windows backends are **compile-checked only** (this machine has no accessible bus, so nothing
 beyond Linux compiles-and-hopes has been observed), a full-snapshot push per frame is fine at this
-scale but is not the shape a 500-node scene wants, and reduced motion is unshipped entirely (see
-above), so `MoveTo` animates at full speed for every user whatever their platform preference is set
-to.
+scale but is not the shape a 500-node scene wants, and there is no runtime toggle for motion — the
+mode is fixed at `SceneContext::new` and a desktop-settings change while running is not observed.
 
 ### P1 step 5: formulas — Typst in, per-glyph outlines out
 
@@ -860,6 +902,16 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   *group* is one animation whose alpha sweeps a rescaled child timeline — sequential playback here is
   a driver concept, and a beat's duration means what it says), and interrupting a running beat (a
   command can only append; "stop that and do this instead" is a different, explicit command).
+  **Step 4, reduced motion, is done**, and step 3 is what made it small: `play` / `play_all` / `wait`
+  are now the only route a beat takes to the scheduler, so there is exactly one place to consult the
+  preference — `Sequence::start_next`, which is handed a `Motion`. The rule, the four consequences,
+  and the Linux-only platform probe are in "Reduced motion" above; the two claims that used to live
+  in this file ("unshipped in both forms", "`MoveTo` animates at full speed for every user") are both
+  now false and the corresponding sentences have been rewritten. The step's own evidence is that the
+  six goldens passed **unchanged** while every scene's still and every scene's `--inspect` tree came
+  out identical under the two modes — the journey moved and the picture and the rhythm did not. Its
+  deferred edges: the macOS/Windows probes, a runtime toggle, and re-reading the preference while
+  running.
 - **P3+** — camera (pan/zoom/focus); video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration

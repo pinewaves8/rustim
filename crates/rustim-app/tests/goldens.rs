@@ -90,21 +90,36 @@ fn artifacts_dir() -> PathBuf {
 }
 
 /// Render one scene to a file and return where it landed.
+///
+/// **`--motion full` is passed explicitly, and it is not decoration.** Without it
+/// the motion mode comes from the machine's desktop settings, which would make a
+/// baseline depend on something the suite does not control — the same reason the
+/// `text` scene ships its font rather than asking the system for one. That
+/// `--motion reduced` renders the same bytes is a property to *assert*
+/// (`reduced_motion_leaves_the_settled_frame_identical`), not one to rely on for
+/// what a baseline means.
 fn render(scene: &str) -> PathBuf {
-    let out = artifacts_dir().join(format!("{scene}-{}.png", platform()));
+    render_at(scene, "full")
+}
+
+/// Render one scene at a chosen motion mode.
+fn render_at(scene: &str, motion: &str) -> PathBuf {
+    let out = artifacts_dir().join(format!("{scene}-{motion}-{}.png", platform()));
     std::fs::create_dir_all(out.parent().expect("artifacts dir has a parent"))
         .expect("create artifacts dir");
 
     let output = Command::new(BIN)
         .arg("--scene")
         .arg(scene)
+        .arg("--motion")
+        .arg(motion)
         .arg("--png")
         .arg(&out)
         .output()
         .expect("run rustim-app");
     assert!(
         output.status.success(),
-        "`rustim-app --scene {scene} --png` failed with {}:\n{}{}",
+        "`rustim-app --scene {scene} --motion {motion} --png` failed with {}:\n{}{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -213,6 +228,45 @@ fn formula_matches_its_baseline() {
 #[test]
 fn transform_matches_its_baseline() {
     check("transform");
+}
+
+/// **Reduced motion changes the journey, not the picture.**
+///
+/// Under `--motion reduced` a beat is not interpolated: it lands on its end state
+/// and holds for its own length (`rustim_anim::Sequence::start_next`). The still
+/// is taken after `STILL_SECONDS` of virtual time, long after the script drains
+/// either way — and a *finished* animation is its end state, which is what makes
+/// this an identity rather than a resemblance.
+///
+/// So the assertion is `max == 0`, stronger than the golden suite's tolerance:
+/// not one channel of one pixel may differ. The scene is `transform` because it is
+/// the only one whose beats move geometry through a real morph; a fade's end state
+/// is a scalar and would agree for trivial reasons.
+#[test]
+fn reduced_motion_leaves_the_settled_frame_identical() {
+    let full = render_at("transform", "full");
+    let reduced = render_at("transform", "reduced");
+
+    let tolerance = Tolerance::default();
+    let diff = compare_png_files(&full, &reduced, &tolerance).unwrap_or_else(|e| {
+        panic!(
+            "comparing {} against {}: {e}",
+            full.display(),
+            reduced.display()
+        )
+    });
+    assert_eq!(
+        diff.max,
+        0,
+        "the settled frame moved under reduced motion — that means some \
+         animation's `interpolate(1.0)` is not the state a full run ends on, \
+         which is a bug in that animation rather than in the mode.\n{}",
+        diff.report(&tolerance),
+    );
+    assert!(
+        diff.diff_bbox.is_none(),
+        "no pixel may differ at all, not merely none by more than the tolerance"
+    );
 }
 
 /// The scene list here and the scene registry in the binary must not drift.

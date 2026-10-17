@@ -28,7 +28,9 @@
 
 use std::collections::VecDeque;
 
-use crate::{Animation, AnimationScheduler};
+use rustim_mobject::SceneTree;
+
+use crate::{Animation, AnimationScheduler, Motion, Wait};
 
 /// A script of beats.
 ///
@@ -86,13 +88,75 @@ impl Sequence {
     /// Move the next beat into `sched`, and report whether there was one.
     ///
     /// This is the only way a beat ever reaches the scheduler, which is what makes
-    /// "one beat at a time" a property of the type rather than of every caller.
-    pub fn start_next(&mut self, sched: &mut AnimationScheduler) -> bool {
-        let Some(beat) = self.steps.pop_front() else {
+    /// both "one beat at a time" and the reduced-motion policy properties of the
+    /// type rather than of every caller.
+    ///
+    /// # `motion`
+    ///
+    /// [`Motion::Full`] is the ordinary path: the beat's animations are handed over
+    /// and the scheduler interpolates them across the beat's length.
+    ///
+    /// [`Motion::Reduced`] is the whole feature, and it is short: the beat is
+    /// **not** handed over at all. Every animation in it is begun and then driven
+    /// to its end state once, and a single [`Wait`] of the beat's nominal length —
+    /// `max(duration)` over its members, the same total the scheduler would have
+    /// used (`scene/scene.py:1184-1186`) — takes its place on the clock. So the
+    /// *rhythm* is untouched: every beat boundary lands at the same virtual time as
+    /// it would have, the picture simply arrives immediately instead of sliding
+    /// into place. That is also why `is_playing` and everything built on it
+    /// (`ANIMATION_DONE`, a scene waiting for its timeline to settle) needs no
+    /// change here.
+    ///
+    /// Three details are deliberate rather than incidental:
+    ///
+    /// * **All the `begin`s run before any `interpolate`**, matching
+    ///   `AnimationScheduler::update`'s own order (`lib.rs`). No animation this
+    ///   workspace ships could tell the difference — each is written so that its
+    ///   `interpolate(1.0)` does not depend on what `begin` captured, which is
+    ///   precisely what makes the endpoints exact — but the scheduler's contract is
+    ///   "the whole beat is begun, then the whole beat is advanced", and an
+    ///   animation whose end state *did* depend on where it started (a relative
+    ///   `Shift`) must not behave one way at full motion and another way here.
+    /// * **The end state is `ease(1.0)`, not a hardcoded `1.0`.** They agree for
+    ///   every rate function this workspace ships, but `rate_func` is an arbitrary
+    ///   function, and going through `ease` means this path cannot drift from the
+    ///   scheduler's.
+    /// * **A pause needs nothing.** [`Wait`] writes nothing, so a `Wait` beat is
+    ///   snapped to nothing and held for exactly its duration — the same picture
+    ///   and the same timing it has at full motion. A scene written with explicit
+    ///   `wait(..)` calls therefore degrades correctly, which is why there is no
+    ///   per-animation "is this motion?" flag to consult.
+    ///
+    /// A beat whose members are all zero-length adds no hold at all: `update`
+    /// advances the clock on every call whether or not anything is running
+    /// (`lib.rs`), so it still costs exactly the one frame the scheduler spends on
+    /// a zero-duration animation.
+    pub fn start_next(
+        &mut self,
+        sched: &mut AnimationScheduler,
+        tree: &mut SceneTree,
+        motion: Motion,
+    ) -> bool {
+        let Some(mut beat) = self.steps.pop_front() else {
             return false;
         };
-        for anim in beat {
-            sched.add_boxed(anim);
+        if !motion.is_reduced() {
+            for anim in beat {
+                sched.add_boxed(anim);
+            }
+            return true;
+        }
+        let mut hold = 0.0_f64;
+        for anim in &mut beat {
+            hold = hold.max(anim.duration());
+            anim.begin(tree);
+        }
+        for anim in &mut beat {
+            let alpha = anim.ease(1.0);
+            anim.interpolate(alpha, tree);
+        }
+        if hold > 0.0 {
+            sched.add_boxed(Box::new(Wait::new(hold)));
         }
         true
     }
@@ -196,12 +260,17 @@ mod tests {
     /// alpha of exactly `dt / duration`, and puts beat *k+1*'s first frame
     /// immediately after beat *k*'s last.
     fn play(seq: &mut Sequence, clock: &Clock) -> u64 {
+        play_with(seq, clock, Motion::Full)
+    }
+
+    /// The same driver at a chosen motion, so a test can run one script twice.
+    fn play_with(seq: &mut Sequence, clock: &Clock, motion: Motion) -> u64 {
         let mut sched = AnimationScheduler::new();
         let mut tree = SceneTree::new();
         let mut frames = 0;
         while !seq.is_empty() || !sched.is_empty() {
             if sched.is_empty() {
-                seq.start_next(&mut sched);
+                seq.start_next(&mut sched, &mut tree, motion);
             }
             sched.update(DT, &mut tree);
             clock.tick();
@@ -340,7 +409,11 @@ mod tests {
         assert_eq!(seq.len(), 0);
 
         let mut sched = AnimationScheduler::new();
-        assert!(!seq.start_next(&mut sched), "nothing to start");
+        let mut tree = SceneTree::new();
+        assert!(
+            !seq.start_next(&mut sched, &mut tree, Motion::Full),
+            "nothing to start"
+        );
         assert!(sched.is_empty(), "and the scheduler stays empty");
 
         // The real beat still plays, and — the point of the test — it starts on the
@@ -362,13 +435,125 @@ mod tests {
         let (a, _) = recorder(&clock, 0.5);
         let mut seq = Sequence::new();
         let mut sched = AnimationScheduler::new();
+        let mut tree = SceneTree::new();
         seq.push([a]);
 
-        assert!(seq.start_next(&mut sched));
+        assert!(seq.start_next(&mut sched, &mut tree, Motion::Full));
         assert_eq!(sched.len(), 1);
         assert!(seq.is_empty());
-        assert!(!seq.start_next(&mut sched), "the script is exhausted");
+        assert!(
+            !seq.start_next(&mut sched, &mut tree, Motion::Full),
+            "the script is exhausted"
+        );
         assert_eq!(sched.len(), 1, "and nothing was added");
+    }
+
+    /// A reduced beat is driven to its end state in one call, not interpolated.
+    ///
+    /// The difference from full motion is not the last alpha — both end at `1.0` —
+    /// but the number of them: 30 frames of a fade against one, here.
+    #[test]
+    fn a_reduced_beat_lands_on_its_end_state_in_one_call() {
+        let clock = Clock::default();
+        let (short, seen_short) = recorder(&clock, 0.5);
+        let (long, seen_long) = recorder(&clock, 1.0);
+
+        let mut seq = Sequence::new();
+        seq.push([short, long]);
+        play_with(&mut seq, &clock, Motion::Reduced);
+
+        assert_eq!(
+            seen_short.alphas(),
+            vec![1.0],
+            "a reduced beat writes its end state once"
+        );
+        assert_eq!(
+            seen_long.alphas(),
+            vec![1.0],
+            "and every member of it does, whatever its own duration"
+        );
+    }
+
+    /// The hold is the beat's nominal length — `max(duration)`, not the first
+    /// member's and not the sum of them.
+    ///
+    /// Both alternatives are wrong in a way no still frame can see: too short and
+    /// the next beat starts early (a scene that is *faster* under reduced motion),
+    /// too long and the script drags. The bounds are generous — 40 and 70 frames
+    /// against a 60-frame beat — because the exact frame a cumulative `1/60` sum
+    /// crosses a round number is not something this test should be asserting.
+    #[test]
+    fn a_reduced_beat_still_occupies_its_nominal_length() {
+        let clock = Clock::default();
+        let (short, _) = recorder(&clock, 0.5);
+        let (long, _) = recorder(&clock, 1.0);
+
+        let mut seq = Sequence::new();
+        seq.push([short, long]);
+
+        let mut sched = AnimationScheduler::new();
+        let mut tree = SceneTree::new();
+        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
+
+        for _ in 0..40 {
+            sched.update(DT, &mut tree);
+            clock.tick();
+        }
+        assert!(
+            !sched.is_empty(),
+            "the beat ended with its *shortest* member, not its longest"
+        );
+
+        for _ in 0..30 {
+            sched.update(DT, &mut tree);
+            clock.tick();
+        }
+        assert!(
+            sched.is_empty(),
+            "the beat outlasted its nominal length (the sum, not the max?)"
+        );
+    }
+
+    /// **The invariant the whole feature rests on**: reduced motion changes the
+    /// frames, not the script.
+    ///
+    /// One script — a pause, then a beat of two animations — run both ways. The
+    /// pause is untouched (it is a hold with nothing to snap), so the second beat
+    /// starts on the same frame, and the run takes the same number of frames. What
+    /// differs is only what happens in between: 30 interpolated frames against one
+    /// snap.
+    #[test]
+    fn reduced_motion_changes_the_frames_and_not_the_rhythm() {
+        /// `(frames taken, the frame the second beat first wrote on, its alphas)`
+        fn run(motion: Motion) -> (u64, u64, Vec<f64>) {
+            let clock = Clock::default();
+            let (a, seen_a) = recorder(&clock, 0.5);
+            let (b, _) = recorder(&clock, 0.25);
+            let mut seq = Sequence::new();
+            seq.push([Wait::new(1.0)]);
+            seq.push([a, b]);
+            let frames = play_with(&mut seq, &clock, motion);
+            let seen = seen_a.0.borrow();
+            (frames, seen[0].0, seen_a.alphas())
+        }
+
+        let (full_frames, full_start, full_alphas) = run(Motion::Full);
+        let (reduced_frames, reduced_start, reduced_alphas) = run(Motion::Reduced);
+
+        assert_eq!(
+            full_start, reduced_start,
+            "the pause must end — and the next beat begin — on the same frame"
+        );
+        assert_eq!(
+            full_frames, reduced_frames,
+            "reduced motion must change the journey, not the length of the script"
+        );
+        assert_eq!(*full_alphas.last().unwrap(), 1.0);
+        assert_eq!(reduced_alphas, vec![1.0]);
+        assert!(
+            full_alphas.len() > 1,
+            "the full run interpolates; {full_alphas:?}"
+        );
     }
 
     #[test]

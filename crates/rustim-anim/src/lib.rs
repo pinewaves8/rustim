@@ -13,6 +13,29 @@
 //! * [`Sequence`] — the beats still to come, one after another. This is Manim's
 //!   `construct()` body, written down as data because our loop cannot block.
 //!
+//! # Reduced motion, and why it is one branch
+//!
+//! [`Motion`] is consulted in exactly one place — [`Sequence::start_next`], where
+//! a beat is handed to the clock — and **not** by each animation. A reduced beat
+//! is not interpolated at all: every animation in it is driven to `alpha = 1.0`
+//! once, and the beat then occupies its nominal length, `max(duration)` over its
+//! members, the same total [`AnimationScheduler`] would have used
+//! (`scene/scene.py:1184-1186`).
+//!
+//! Two consequences are worth stating, because both are load-bearing:
+//!
+//! * **A pause needs no special case.** [`Wait`] is a hold that writes nothing, so
+//!   a script written with explicit waits degrades exactly as one written with
+//!   animations does — which is why there is no `is_motion()` on [`Animation`]: at
+//!   the granularity a preference can honestly act on, "motion" and "a pause" are
+//!   the same shape (write your end state, then occupy time), and the beat is the
+//!   unit.
+//! * **The rhythm is unchanged.** Every beat boundary lands at the same virtual
+//!   time in both modes, so a scene does not become a different scene — only the
+//!   frames in between go away. A completed animation *is* its end state, which is
+//!   Manim's own reading of it too: `Animation.finish` forces `interpolate(1)`
+//!   (`animation/animation.py:216-227`).
+//!
 //! # The tutorial's lifetime problem, resolved
 //!
 //! The tutorial sketches `Create<'a, T>` and `MoveTo<'a, T>` holding
@@ -35,6 +58,38 @@ use rustim_mobject::{NodeId, SceneTree};
 pub use ops::{FadeIn, MoveTo, Transform, Wait};
 pub use rustim_math::rate::{self, RateFunc};
 pub use sequence::Sequence;
+
+/// How much of a scene's motion to actually play.
+///
+/// The engine's answer to the platform "reduce motion" preference, and the two
+/// values are the whole vocabulary: a scene is either interpolated or it is not.
+/// It lives here, next to the timeline, because the timeline is the only thing
+/// that reads it — see the module doc for the rule and for why there is no
+/// per-animation opt-out. A host reads the preference (the platform APIs are in
+/// `rustim-app`'s `motion` module, since a preference is a platform question and
+/// this crate is part of the wasm kernel) and hands the answer to
+/// `SceneContext`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Motion {
+    /// Every frame is drawn: a beat is interpolated across its duration.
+    #[default]
+    Full,
+    /// A beat is not interpolated — it lands on its end state and holds for its
+    /// nominal length.
+    Reduced,
+}
+
+impl Motion {
+    /// True for [`Motion::Reduced`].
+    ///
+    /// A named question rather than a `matches!` at each use, because the call
+    /// site should read as the *policy* ("if motion is reduced, ...") and not as a
+    /// comparison against an enum variant — this is the one branch the whole
+    /// feature is.
+    pub fn is_reduced(self) -> bool {
+        matches!(self, Motion::Reduced)
+    }
+}
 
 /// A state change that plays out over a duration.
 pub trait Animation {
@@ -480,7 +535,7 @@ mod tests {
         // The order `SceneContext::advance` uses: start the next beat, then advance.
         while !seq.is_empty() || !sched.is_empty() {
             if sched.is_empty() {
-                seq.start_next(&mut sched);
+                seq.start_next(&mut sched, &mut tree, Motion::Full);
             }
             sched.update(1.0 / 60.0, &mut tree);
             frames += 1;

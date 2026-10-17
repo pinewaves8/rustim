@@ -25,6 +25,7 @@
 pub mod a11y;
 pub mod announce;
 pub mod input;
+pub mod motion;
 pub mod text;
 
 pub use a11y::{A11y, A11yCore, Request};

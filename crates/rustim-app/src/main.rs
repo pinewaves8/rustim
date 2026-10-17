@@ -25,6 +25,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::Instant;
 
+use rustim_anim::Motion;
 use rustim_app::a11y::{A11y, Request};
 use rustim_app::{AppEvent, Intent, input};
 use rustim_math::{Affine2, BezPath, Point, Viewport, bezier};
@@ -1354,6 +1355,7 @@ fn main() {
     let mut png: Option<String> = None;
     let mut inspect = false;
     let mut scene_name = DEFAULT_SCENE.to_string();
+    let mut motion: Option<Motion> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1369,6 +1371,24 @@ fn main() {
                 inspect = true;
                 i += 1;
             }
+            "--motion" => {
+                motion = match args.get(i + 1).map(String::as_str) {
+                    Some("full") => Some(Motion::Full),
+                    Some("reduced") => Some(Motion::Reduced),
+                    // A refusal rather than a default, unlike `--frames` and `--png`
+                    // above: a run that misspells the mode and silently gets the
+                    // other one is a run that measured the wrong thing, and this is
+                    // the one flag whose whole job is to be the right one.
+                    other => {
+                        eprintln!(
+                            "--motion takes `full` or `reduced`, not {}",
+                            other.map_or("nothing".to_string(), |v| format!("`{v}`"))
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                i += 2;
+            }
             "--scene" => {
                 if let Some(name) = args.get(i + 1) {
                     scene_name.clone_from(name);
@@ -1376,9 +1396,16 @@ fn main() {
                 i += 2;
             }
             "--help" | "-h" => {
-                println!("rustim-app [--frames N] [--png OUT.png | --inspect] [--scene NAME]");
+                println!(
+                    "rustim-app [--frames N] [--png OUT.png | --inspect] [--scene NAME] \
+                     [--motion full|reduced]"
+                );
                 println!("scenes: {}", scene_names());
                 println!("--inspect: print the accessibility tree as JSON to stdout");
+                println!(
+                    "--motion: play every frame, or land each beat on its end state \
+                     (default: this desktop's preference)"
+                );
                 return;
             }
             other => {
@@ -1402,6 +1429,12 @@ fn main() {
         ..Default::default()
     };
 
+    // The flag wins; without it the desktop is asked, best effort, once. Read here
+    // rather than in `SceneContext` because a preference is a platform question and
+    // the context lives in the wasm kernel — see `rustim_app::motion` for exactly
+    // which platforms answer and which do not.
+    let motion = motion.unwrap_or_else(rustim_app::motion::from_platform);
+
     // A bad scene name is a refusal, not a panic — same rule the command layer
     // follows, and this one is reachable from a shell so it has to read well.
     let Some(mut scene) = scene_by_name(&scene_name) else {
@@ -1419,7 +1452,7 @@ fn main() {
     // one: see `rustim_app::a11y`), and it is what a script or a future agent
     // surface reads instead of a window.
     if inspect {
-        let mut ctx = SceneContext::new(viewport);
+        let mut ctx = SceneContext::new(viewport, motion);
         scene.construct(&mut ctx);
         let mut list = DrawList::default();
         settle(&mut *scene, &mut ctx, &mut list);
@@ -1435,7 +1468,7 @@ fn main() {
     }
 
     if let Some(path) = png {
-        let mut ctx = SceneContext::new(viewport);
+        let mut ctx = SceneContext::new(viewport, motion);
         scene.construct(&mut ctx);
         let mut list = DrawList::default();
         settle(&mut *scene, &mut ctx, &mut list);
@@ -1454,7 +1487,7 @@ fn main() {
     let event_loop = builder.build().expect("event loop");
     let proxy = event_loop.create_proxy();
 
-    let mut ctx = SceneContext::new(viewport);
+    let mut ctx = SceneContext::new(viewport, motion);
     scene.construct(&mut ctx);
 
     let mut app = App {
