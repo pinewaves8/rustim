@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rustim — 勾股定理</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!--
+    The frame size is the canvas's width/height attributes: `rustim_web` reads
+    them and renders one pixel per pixel, so the picture is the same 1280x720
+    frame the desktop golden holds.
+
+    The canvas is aria-hidden because this demo's accessibility tree is the
+    DOM overlay the host builds (step 21d); a screen reader given both would
+    hear every figure twice.
+  -->
+  <div class="stage">
+    <canvas id="canvas" width="1280" height="720" aria-hidden="true"></canvas>
+    <!-- The DOM/ARIA projection of the scene. The host fills it; it is a
+         sibling of the canvas rather than its parent so the canvas's pixels
+         and the semantic nodes keep separate owners. -->
+    <div id="a11y"></div>
+  </div>
+
+  <form id="command" autocomplete="off">
+    <label for="line">命令（一行一条 JSON，回车发送）</label>
+    <textarea id="line" rows="2" spellcheck="false"></textarea>
+    <button type="submit">发送</button>
+  </form>
+  <pre id="reply" aria-live="polite"></pre>
+
+  <script type="module" src="demo.js"></script>
+</body>
+</html>

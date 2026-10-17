@@ -126,6 +126,17 @@ impl Session {
         self.present();
     }
 
+    /// Rebuild the draw list from the state as it stands and rasterise it.
+    ///
+    /// This is virtual time zero: the scene's `construct` has run and no frame
+    /// has been advanced. A host that starts paused shows this, and `advance`
+    /// then begins from exactly the state a fresh `Session` would have had, so
+    /// the first presented frame is not an extra clock step.
+    pub fn refresh(&mut self) {
+        self.scene.build_draw_list(&self.ctx, &mut self.list);
+        self.present();
+    }
+
     fn update(&mut self, dt: f64) {
         self.scene.update(dt, &mut self.ctx);
         // Through the scene, not straight through the context: a scene may have

@@ -1,0 +1,76 @@
+/* 3b1b's background, so the page and the frame agree about what black is. */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #121212;
+  color: #e0e0e0;
+  font: 14px/1.5 system-ui, sans-serif;
+}
+
+/* The canvas and its accessibility overlay share one positioned box, so the
+   overlay's absolutely-positioned nodes measure against the canvas. */
+.stage {
+  position: relative;
+  width: max-content;
+  max-width: 100%;
+  margin: 0 auto;
+}
+
+canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  image-rendering: auto;
+}
+
+#a11y {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+form,
+pre {
+  max-width: 1280px;
+  margin: 12px auto;
+  padding: 0 12px;
+  box-sizing: border-box;
+}
+
+label {
+  display: block;
+  margin-bottom: 4px;
+}
+
+textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: #1e1e1e;
+  color: #e0e0e0;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 6px;
+  font: 13px/1.4 ui-monospace, monospace;
+}
+
+button {
+  margin-top: 6px;
+  padding: 4px 14px;
+  background: #64b5f6;
+  color: #121212;
+  border: 0;
+  border-radius: 4px;
+  font: inherit;
+  cursor: pointer;
+}
+
+pre {
+  min-height: 1.5em;
+  margin-bottom: 24px;
+  font: 13px/1.4 ui-monospace, monospace;
+  color: #9e9e9e;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

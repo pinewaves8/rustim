@@ -26,5 +26,10 @@
 pub mod aria;
 pub mod session;
 
+#[cfg(target_arch = "wasm32")]
+mod web;
+
 pub use aria::AriaNode;
 pub use session::Session;
+#[cfg(target_arch = "wasm32")]
+pub use web::WebApp;
