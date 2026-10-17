@@ -77,7 +77,10 @@ drag and a wheel dispatched through Chrome's input pipeline move the camera exac
 shared gesture code does — see "Web (WASM)". The **conformance suite** at
 `crates/rustim-app/tests/conformance.rs` drives the real binary only through `rustim-client`, so the
 protocol's framing promises are checked by a client that has no access to engine internals — see
-"External drivers and the AI surface". The **daemon** is verified over real loopback WebSockets:
+"External drivers and the AI surface". A **Python runner** at `sdks/python/conformance.py` makes the
+same claim in a second language, with no shared code: it drives the real binary and asserts the
+handshake vocabulary, the primitive reply shapes, plan navigation and that two independent processes
+replaying one log arrive at the same `SemanticTree`. The **daemon** is verified over real loopback WebSockets:
 `crates/rustim-daemon/tests/daemon.rs` dials a real listener with twelve clients and asserts
 sessions, reconnects, refusal vocabulary, transport error codes, clocks and the multi-client event
 fan-out — see "The daemon". The **MCP adapter** is verified over a real stdio pipe:
@@ -171,6 +174,7 @@ cargo test -p rustim-app --test speech          # --speak refuses the headless f
 cargo test -p rustim-app --test export          # the export loop, the sinks and the .srt timings
 cargo test -p rustim-app --test formula         # formula structure reaches --inspect, via the binary
 cargo test -p rustim-app --test conformance     # the protocol, driven only through rustim-client
+python3 -I sdks/python/conformance.py           # ...and from Python, sharing no code with the engine
 cargo test -p rustim-client          # the client's framing rules, over in-memory streams
 cargo test -p rustim-daemon          # sessions, RPC envelope, and real loopback WebSockets
 cargo test -p rustim-daemon --test daemon   # ...only the socket-level integration suite
@@ -3278,6 +3282,27 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   back and forward, `plan_finished`, an out-of-range step, and a refused reload that leaves the
   running plan intact. `ACTIONS` 32 → 36. **All eight goldens unchanged** — a plan drives the
   timeline and draws nothing new — count 919 → 938.
+- **The second-language client and its conformance runner are done** (`sdks/python/`). This is a
+  deliverable of `贾维斯集成方案.md`'s repository map, not a Rust change: `rustim_client.py` is a
+  stdlib-only synchronous client of the stdio protocol, and `conformance.py` drives the real binary
+  through it. The client enforces the three framing promises a client can check locally — one reply
+  per command line, a blank line is a counted skip with no reply, `seq` equals the physical line —
+  and refuses a reply that is not JSON or carries zero/two presences, because a driver that treats a
+  malformed stream as a reply cannot tell a broken transport from an engine bug. An engine *refusal*
+  is not a framing error: it is returned to the caller as a value, exactly as `rustim-client` does.
+  The runner covers the handshake vocabulary (36 actions, 45 rates, both profiles, the teaching-tier
+  verbs among them), `add` → `query`-by-label → `set` → `play`'s empty diff → `check`'s report, the
+  three refusals (`no_such_label`, `unparseable`, a foreign protocol as `out_of_range` under
+  `protocol`) with the feed still answering afterwards, plan `status`/`next`/`goto` against a live
+  tree (including that a rewound object is `no_such_label`, not a stale id), and the switching
+  acceptance itself: **two independent processes replay one label-addressed log and their final
+  `SemanticTree`s are compared field for field**. Exit codes are 0 pass / 1 a check failed (naming
+  the command, the expected shape and the reply that arrived) / 2 the question could not be asked.
+  It needs no cargo, no package and no network. Evidence: three green checks from the real debug
+  binary, and the stderr feed summary matching the intentional refusals exactly (`3 of 10` and
+  `2 of 11`). **No Rust test count changes** (938) and **all eight goldens are unchanged** — the
+  slice reads a binary and renders nothing.
+  Deferred: `sdks/typescript/` (the same shape a third time) and any packaging thereof.
 
 ## AI integration
 
@@ -3577,10 +3602,23 @@ one tree. The daemon's socket-level suite is the same claim in the other transpo
 `crates/rustim-daemon/tests/daemon.rs` attaches two clients to one session and asserts each sees the
 same events, and a reconnect sees the objects the dropped socket created. The MCP adapter's own
 suite is the same claim a third time, and the tool surface adds no verb the protocol lacks — see
-"MCP". The teaching-tier tools (`rustim-director`) are roadmap items in `贾维斯集成方案.md`;
-nothing in this repository currently claims them.
+"MCP". The teaching tier is not a roadmap item any more: `rustim-director`'s layout and attention,
+the six `explain.*` templates, the linter and `ScenePlan` are all implemented and on the wire — see
+the roadmap bullets, "The teaching tier" and "Scene plans".
 (Checkpoint/undo/seek, `pause`/`resume`/`tempo`, the list commands, the event stream and the daemon
 transport **are** implemented — see "AI integration".)
+
+**`sdks/python/` is the second-language proof.** `rustim_client.py` implements the framing rules and
+nothing else — one line in, one reply out, `seq` equals the physical line, exactly one of the six
+presences — so it shares no code with the engine; `conformance.py` uses only the standard library to
+drive the real binary over `--script - --reply`, checks the handshake vocabulary (36 actions, 45
+rates, both profiles), the primitive reply shapes and their refusals, plan load/next/goto against a
+live tree, and has **two independent processes replay one label-addressed log** and compare their
+final `SemanticTree` field for field. It is not a replacement for `crates/rustim-app/tests/conformance.rs`
+(which is more exhaustive); it is the evidence that a client reading only `驱动协议v1.md` can be
+written in another language and get the same answers — the executable meaning of "switch clients
+freely". The `typescript/` sibling is still planned, and the untrusted-input rule applies to it and
+to any third-party client, not to this SDK (the user asked for it to be built).
 
 ### The daemon: many sessions over a socket
 
