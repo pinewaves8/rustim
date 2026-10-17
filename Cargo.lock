@@ -3134,6 +3134,7 @@ dependencies = [
  "accesskit_consumer",
  "accesskit_winit",
  "rustim-anim",
+ "rustim-client",
  "rustim-color",
  "rustim-export",
  "rustim-math",
@@ -3145,6 +3146,14 @@ dependencies = [
  "serde_json",
  "softbuffer",
  "winit",
+]
+
+[[package]]
+name = "rustim-client"
+version = "0.0.0"
+dependencies = [
+ "rustim-scene",
+ "serde_json",
 ]
 
 [[package]]

@@ -11,6 +11,7 @@ members = [
     "crates/rustim-export",
     "crates/rustim-scenes",
     "crates/rustim-web",
+    "crates/rustim-client",
     "crates/rustim-app",
 ]
 # Throwaway Phase-0 probes with their own target dirs; not part of the engine.
@@ -33,6 +34,7 @@ rustim-render = { path = "crates/rustim-render" }
 rustim-export = { path = "crates/rustim-export" }
 rustim-scenes = { path = "crates/rustim-scenes" }
 rustim-web = { path = "crates/rustim-web" }
+rustim-client = { path = "crates/rustim-client" }
 
 # Pinned to versions verified on 2026-10-16 (see 方案建议.md 3.6).
 kurbo = "0.13.1"
@@ -84,11 +86,12 @@ typst-assets = { version = "0.15.1", features = ["fonts"] }
 # without a second compiler.
 typst-html = "0.15.1"
 
-# A real dependency of exactly two crates. `rustim-scene` carries the wire
+# A real dependency of exactly three crates. `rustim-scene` carries the wire
 # protocol's text half, because `parse_command` and `reply_line` belong beside
 # the command types they read and write — a host (desktop, browser, a future
 # exporter) must not be able to answer in a dialect of its own; `rustim-app` is
-# the other, because `--inspect` emits JSON. Everything else uses it only in
+# the second, because `--inspect` emits JSON; `rustim-client` is the third, and
+# it is the *client* side of the same documents. Everything else uses it only in
 # tests: reading the Manim fixtures in `crates/rustim-math/tests/fixtures/` and
 # round-tripping the command layer. It sits in `rustim-scene`, one of the six
 # wasm kernel crates, without weakening that guard: serde_json is pure Rust and

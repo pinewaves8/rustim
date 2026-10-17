@@ -6,7 +6,7 @@ use rustim_mobject::{NodeId, SceneTree};
 use rustim_render::{DrawList, DrawOp};
 
 use crate::a11y;
-use crate::command::{self, Command, CommandError, CommandOutcome, StateDiff};
+use crate::command::{self, Capabilities, Command, CommandError, CommandOutcome, StateDiff};
 
 /// A scene: the user-facing entry point, mirroring Manim's `construct()`.
 ///
@@ -346,17 +346,18 @@ impl SceneContext {
 
     /// Apply a command from outside the engine.
     ///
-    /// [`Command::Play`], [`Command::Stop`], [`Command::Camera`],
-    /// [`Command::Motion`], [`Command::Narrate`] and [`Command::Query`] are
-    /// answered **here** rather than in `command::apply`: a play needs the
-    /// playback machine, a stop needs it *and* the scheduler, a camera
-    /// command needs the playback machine *or* the viewport's aspect ratio (for
-    /// `focus`), a motion command names a field on this context rather than in
-    /// the tree, a narration needs the virtual clock and its own track, a query
-    /// needs the viewport to project bounds — and `apply`'s documented purity —
-    /// "pure with respect to everything except `tree`: no clock, no I/O, no
-    /// renderer" — is what makes the rest of the protocol testable in isolation
-    /// and replayable.
+    /// [`Command::Hello`], [`Command::Play`], [`Command::Stop`],
+    /// [`Command::Camera`], [`Command::Motion`], [`Command::Narrate`] and
+    /// [`Command::Query`] are answered **here** rather than in `command::apply`:
+    /// a hello answers with capabilities rather than a diff — a shape `apply`
+    /// cannot return — a play needs the playback machine, a stop needs it *and*
+    /// the scheduler, a camera command needs the playback machine *or* the
+    /// viewport's aspect ratio (for `focus`), a motion command names a field on
+    /// this context rather than in the tree, a narration needs the virtual clock
+    /// and its own track, a query needs the viewport to project bounds — and
+    /// `apply`'s documented purity — "pure with respect to everything except
+    /// `tree`: no clock, no I/O, no renderer" — is what makes the rest of the
+    /// protocol testable in isolation and replayable.
     /// The wire→animation and wire→camera mappings still live in `command`, next
     /// to the wire types.
     ///
@@ -396,7 +397,29 @@ impl SceneContext {
     /// to that node's subtree and is refused when the node does not exist. The
     /// `live` field is `None` — the announcement text belongs to a host's
     /// accessibility layer, not to the kernel.
+    ///
+    /// A [`Command::Hello`] is the handshake: it answers with
+    /// [`CommandOutcome::Greeted`], i.e. [`Capabilities::current`] — the
+    /// vocabularies this build accepts, derived from the serde definitions
+    /// themselves. A `protocol` naming a version this build does not speak is
+    /// [`CommandError::OutOfRange`] under `protocol`, with both numbers in the
+    /// detail — refusing is what stops a client from believing its v2 field was
+    /// merely optional here, and the numbers are what it needs to fall back.
     pub fn handle(&mut self, cmd: &Command) -> Result<CommandOutcome, CommandError> {
+        if let Command::Hello { protocol } = cmd {
+            if let Some(client) = protocol
+                && *client != command::PROTOCOL_VERSION
+            {
+                return Err(CommandError::OutOfRange {
+                    property: "protocol".to_owned(),
+                    detail: format!(
+                        "client speaks {client}; this engine speaks {}",
+                        command::PROTOCOL_VERSION
+                    ),
+                });
+            }
+            return Ok(CommandOutcome::Greeted(Capabilities::current()));
+        }
         if let Command::Play { animation } = cmd {
             let anim = command::animation_for(&self.tree, animation)?;
             self.play_all([anim]);
@@ -601,6 +624,7 @@ mod tests {
         match ctx.handle(cmd).expect("a well-formed command") {
             CommandOutcome::Applied(diff) => diff,
             CommandOutcome::Queried(_) => panic!("a query is not a mutation"),
+            CommandOutcome::Greeted(_) => panic!("a greeting is not a mutation"),
         }
     }
 
@@ -636,6 +660,59 @@ mod tests {
 
     fn opacity(ctx: &SceneContext, id: NodeId) -> f64 {
         ctx.tree.get(id).unwrap().opacity
+    }
+
+    /// The handshake answers with the build's vocabulary, changes nothing, and
+    /// refuses a version it does not speak with both numbers in the detail.
+    ///
+    /// The refusal is the part a test is owed: a client that sent a v2 field
+    /// must learn that this build is not v2, and the only useful spelling is one
+    /// that names both sides — "out of range" alone would leave it guessing
+    /// whether to downgrade or upgrade.
+    #[test]
+    fn hello_answers_with_capabilities_and_refuses_a_foreign_version() {
+        let mut ctx = scene();
+        let before = ctx.tree.len();
+
+        match ctx
+            .handle(&Command::Hello {
+                protocol: Some(command::PROTOCOL_VERSION),
+            })
+            .expect("the current version is spoken")
+        {
+            CommandOutcome::Greeted(caps) => {
+                assert_eq!(caps.protocol, command::PROTOCOL_VERSION);
+                assert_eq!(caps.animations.len(), 10);
+                assert_eq!(caps.shapes.len(), 8);
+            }
+            other => panic!("expected a greeting, got {other:?}"),
+        }
+
+        // An absent version is "whatever you speak", not a refusal.
+        assert!(matches!(
+            ctx.handle(&Command::Hello { protocol: None })
+                .expect("absent protocol is spoken"),
+            CommandOutcome::Greeted(_)
+        ));
+        // A handshake is not a mutation, and these tests are the ones that would
+        // notice if a future implementation made it one.
+        assert_eq!(ctx.tree.len(), before);
+
+        let err = ctx
+            .handle(&Command::Hello {
+                protocol: Some(command::PROTOCOL_VERSION + 1),
+            })
+            .expect_err("a foreign version is refused");
+        assert_eq!(
+            err,
+            CommandError::OutOfRange {
+                property: "protocol".to_owned(),
+                detail: format!(
+                    "client speaks 2; this engine speaks {}",
+                    command::PROTOCOL_VERSION
+                ),
+            }
+        );
     }
 
     #[test]
@@ -1630,6 +1707,7 @@ mod tests {
         .map(|outcome| match outcome {
             CommandOutcome::Applied(diff) => diff,
             CommandOutcome::Queried(_) => panic!("narration is not a query"),
+            CommandOutcome::Greeted(_) => panic!("narration is not a greeting"),
         })
     }
 

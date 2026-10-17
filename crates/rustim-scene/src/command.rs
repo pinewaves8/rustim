@@ -9,8 +9,17 @@ use rustim_anim::{
 };
 use rustim_math::rate::Rate;
 use rustim_math::{Affine2, Camera, Point, Viewport};
-use rustim_mobject::shapes::{ShapeKind, ShapeParams};
+use rustim_mobject::shapes::{MAX_TICKS, ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree};
+
+/// The version of the wire protocol this build speaks.
+///
+/// Integer rather than a date or a semver string because its only job is a
+/// compatibility check: a client either speaks this number or is refused at
+/// `hello` with a reason it can print. Same-major additions are backward
+/// compatible (new commands, new optional fields, new capability names); a
+/// meaning change or a removal is a new number. See `驱动协议v1.md` §6.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// How long an animation runs when the command did not say.
 ///
@@ -38,6 +47,28 @@ const DEFAULT_ANIMATION_RUN_TIME: f64 = 1.0;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Command {
+    /// Open a session by stating the protocol version and asking what the build
+    /// can do.
+    ///
+    /// The first command a client should send, and the one that makes the
+    /// engine's vocabulary discoverable instead of guessed: a model that reads
+    /// [`Capabilities`] learns the shapes, animations, properties and easing
+    /// curves this build actually accepts, rather than one it saw in a prompt.
+    /// A version it does not speak is a refusal here, naming both numbers —
+    /// silently drawing a v2 command as if it were v1 would teach the client
+    /// that a field it needed was optional.
+    ///
+    /// `protocol` is optional so a minimal script can say `{"action":"hello"}`
+    /// without claiming a version. Absent means "whatever you speak"; present
+    /// and different is [`CommandError::OutOfRange`] under `protocol`.
+    ///
+    /// Answered by [`crate::SceneContext::handle`], because capabilities describe
+    /// the build and not the tree. A direct [`apply`] caller gets a no-op, the
+    /// same round trip every other host-answered command gives it.
+    Hello {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<u32>,
+    },
     /// Create a shape and return its new id.
     Add {
         #[serde(rename = "type")]
@@ -307,6 +338,26 @@ impl From<MotionMode> for rustim_anim::Motion {
     }
 }
 
+/// Every property name [`Command::Set`] accepts, in declaration order.
+///
+/// An array rather than a `Property::ALL` because `Property` carries a value —
+/// there is no value of `Property` that means "the name alone". These strings
+/// are the names `Property`'s serde tag produces, and
+/// [`Capabilities::properties`] is the reader; a unit test parses one command
+/// per name so the two cannot drift.
+pub const PROPERTY_NAMES: [&str; 10] = [
+    "opacity",
+    "stroke_width",
+    "stroke_opacity",
+    "stroke_color",
+    "fill_opacity",
+    "label",
+    "kind",
+    "position",
+    "scale",
+    "rotation",
+];
+
 /// A named, settable property.
 ///
 /// Named rather than a struct with every field optional, because that is what
@@ -456,6 +507,108 @@ pub enum AnimationKind {
     Succession,
 }
 
+impl AnimationKind {
+    /// Every animation kind the wire accepts, in declaration order.
+    ///
+    /// The single source of truth for [`Capabilities::animations`]. The names
+    /// are derived by serialising each variant, so an advertised name is one
+    /// [`AnimationSpec`] parses **by construction**; what the array adds is the
+    /// list. A variant added to the enum but not to this array would be
+    /// invisible to a client, and no compiler can count an array literal —
+    /// which is why the conformance suite asserts every name here is accepted
+    /// and the count is 10.
+    pub const ALL: [AnimationKind; 10] = [
+        Self::FadeIn,
+        Self::FadeOut,
+        Self::MoveTo,
+        Self::Rotate,
+        Self::Scale,
+        Self::Create,
+        Self::Uncreate,
+        Self::Transform,
+        Self::Group,
+        Self::Succession,
+    ];
+}
+
+/// Engine-enforced upper bounds, and **only** those.
+///
+/// A limit here is a number the engine really refuses past: `max_ticks` is
+/// [`MAX_TICKS`], the per-axis tick cap `number_line` and `axes` clamp to. It is
+/// not a performance guideline or a "recommended" value — a list a client
+/// cannot trust is worse than no list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    pub max_ticks: usize,
+}
+
+/// What this build of the engine can do, in the protocol's own vocabulary.
+///
+/// The answer to a [`Command::Hello`], and the reason a client never has to
+/// guess what a build supports: `shapes`, `animations`, `properties` and
+/// `rates` are the sets the parser in this crate actually accepts, derived from
+/// the same serde definitions, not a hand-copied excerpt of the documentation.
+/// A client is expected to check this rather than assume, which is what makes
+/// a build that drops or adds a vocabulary item a compatible change.
+///
+/// `engine` is an opaque string for humans and logs — a client must not parse
+/// it to decide what it can send. `profiles` names the tool tiers above the
+/// primitive layer; only `"primitive"` exists today (the teaching profile
+/// arrives with `rustim-director`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// The protocol version this reply describes — the same
+    /// [`PROTOCOL_VERSION`] the handshake checks.
+    pub protocol: u32,
+    /// Free-form build identity, e.g. `rustim/0.0.0`. Never parsed for
+    /// capability decisions.
+    pub engine: String,
+    pub shapes: Vec<String>,
+    pub animations: Vec<String>,
+    pub properties: Vec<String>,
+    pub rates: Vec<String>,
+    pub profiles: Vec<String>,
+    pub limits: Limits,
+}
+
+impl Capabilities {
+    /// The capabilities of the running build.
+    pub fn current() -> Self {
+        Self {
+            protocol: PROTOCOL_VERSION,
+            engine: format!("rustim/{}", env!("CARGO_PKG_VERSION")),
+            shapes: wire_names(&ShapeKind::ALL),
+            animations: wire_names(&AnimationKind::ALL),
+            properties: PROPERTY_NAMES.iter().map(|n| (*n).to_owned()).collect(),
+            rates: wire_names(&Rate::ALL),
+            profiles: vec!["primitive".to_owned()],
+            limits: Limits {
+                max_ticks: MAX_TICKS,
+            },
+        }
+    }
+}
+
+/// The wire spelling of each variant, straight out of its serde definition.
+///
+/// Serialising rather than restating is what keeps a capability list honest: a
+/// name advertised here is one the parser accepts, and a `rename_all` change
+/// moves both sides at once. The `expect`s cannot fire for a unit-variant enum —
+/// serialising one yields a JSON string — and a silent fallback would be a
+/// capability list with a hole in it, which is exactly the failure this
+/// function exists to prevent.
+fn wire_names<T: Serialize + Copy>(values: &[T]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| {
+            let json = serde_json::to_value(value).expect("a unit variant serialises");
+            json.as_str()
+                .expect("a unit variant serialises to a string")
+                .to_owned()
+        })
+        .collect()
+}
+
 /// Why a command was refused.
 ///
 /// A refusal is a value, not a panic. Every command here is reachable from a
@@ -564,13 +717,17 @@ impl StateDiff {
 ///
 /// `Applied` covers everything that mutated (including the host-answered
 /// commands whose diff is present and empty: `play`, `camera`, `motion`,
-/// `narrate`), and `Queried` carries the document a `query` asked for.
+/// `narrate`), `Queried` carries the document a `query` asked for, and
+/// `Greeted` carries the vocabulary description a `hello` asks for. None of
+/// the three is a tree change, so only `Applied` has a diff at all.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandOutcome {
     /// The command ran. The diff describes the tree change, which may be empty.
     Applied(StateDiff),
     /// The command read the tree and changed nothing.
     Queried(SemanticTree),
+    /// The command asked what the build can do.
+    Greeted(Capabilities),
 }
 
 impl CommandOutcome {
@@ -578,17 +735,17 @@ impl CommandOutcome {
     pub fn diff(&self) -> Option<&StateDiff> {
         match self {
             Self::Applied(diff) => Some(diff),
-            Self::Queried(_) => None,
+            Self::Queried(_) | Self::Greeted(_) => None,
         }
     }
 }
 
 /// What a host gets back for one line of a command feed.
 ///
-/// **Exactly one of `diff`, `tree` and `error` is present, and the presence is
-/// the discriminant.** The absent ones are omitted rather than written as
-/// `null`, the same rule the commands themselves follow — these are a model's
-/// output too.
+/// **Exactly one of `diff`, `tree`, `capabilities` and `error` is present, and
+/// the presence is the discriminant.** The absent ones are omitted rather than
+/// written as `null`, the same rule the commands themselves follow — these are a
+/// model's output too.
 ///
 /// A host that sent a `play` gets a `diff` that is present and *empty*: queueing
 /// a beat changes nothing in the tree, and saying so is more useful than saying
@@ -597,7 +754,8 @@ impl CommandOutcome {
 /// was just created, and without it nothing could be done to that object
 /// afterwards. A host that sent a `query` gets a `tree`, and no `diff`, because
 /// a read changes nothing and an empty diff would read as "a mutation that did
-/// nothing".
+/// nothing". A host that sent a `hello` gets `capabilities`: the vocabulary of
+/// this build, not the state of this session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandReply {
     /// The 1-based *physical* line the command came from, so a human reading a
@@ -608,6 +766,9 @@ pub struct CommandReply {
     /// The document a `query` asked for; see [`SemanticTree`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tree: Option<SemanticTree>,
+    /// What the build can do, for a `hello`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Capabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<CommandError>,
 }
@@ -619,6 +780,7 @@ impl CommandReply {
             seq,
             diff: Some(diff),
             tree: None,
+            capabilities: None,
             error: None,
         }
     }
@@ -629,6 +791,19 @@ impl CommandReply {
             seq,
             diff: None,
             tree: Some(tree),
+            capabilities: None,
+            error: None,
+        }
+    }
+
+    /// The reply to a `hello`: the build's vocabulary, and nothing about the
+    /// session.
+    pub fn greeted(seq: u64, capabilities: Capabilities) -> Self {
+        Self {
+            seq,
+            diff: None,
+            tree: None,
+            capabilities: Some(capabilities),
             error: None,
         }
     }
@@ -640,6 +815,7 @@ impl CommandReply {
             seq,
             diff: None,
             tree: None,
+            capabilities: None,
             error: Some(error),
         }
     }
@@ -674,6 +850,7 @@ pub fn reply_line(seq: u64, outcome: Result<CommandOutcome, CommandError>) -> St
     let reply = match outcome {
         Ok(CommandOutcome::Applied(diff)) => CommandReply::applied(seq, diff),
         Ok(CommandOutcome::Queried(tree)) => CommandReply::queried(seq, tree),
+        Ok(CommandOutcome::Greeted(capabilities)) => CommandReply::greeted(seq, capabilities),
         Err(error) => CommandReply::refused(seq, error),
     };
     // A reply is built from types that already round-trip, so this cannot fail
@@ -712,6 +889,13 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             };
             property.write(m)?;
             diff.modified.push(target);
+        }
+        Command::Hello { .. } => {
+            // Answered by `SceneContext::handle`: capabilities describe the
+            // build, not the tree, and `apply` has no way to return them — its
+            // result is a `StateDiff`. The arm keeps `apply` total over
+            // `Command`, so a direct caller replaying a session log does not
+            // meet a panic on the handshake its log happens to start with.
         }
         Command::Play { .. } => {
             // `SceneContext::handle` answers this one, because playing is the one
@@ -1406,6 +1590,13 @@ mod tests {
             // else. An implementation that serialised an empty object or a
             // `null` payload here would change what a relayed log says.
             r#"{"action":"stop"}"#.to_owned(),
+            // The handshake, in both spellings. An absent `protocol` is a client
+            // that does not claim a version, and it must not come back as a
+            // `null`; a *mismatched* version still parses — the refusal belongs
+            // to `handle`, where both numbers are known, not to the parser.
+            r#"{"action":"hello"}"#.to_owned(),
+            r#"{"action":"hello","protocol":1}"#.to_owned(),
+            r#"{"action":"hello","protocol":2}"#.to_owned(),
             // The label spelling of a target. The field is the same one; only
             // the JSON type differs, and it survives the round trip as a label —
             // a logged session stays readable, and replaying it resolves the
@@ -1439,6 +1630,9 @@ mod tests {
         let before = tree.len();
 
         for cmd in [
+            Command::Hello {
+                protocol: Some(PROTOCOL_VERSION),
+            },
             Command::Stop,
             Command::Motion {
                 mode: MotionMode::Reduced,
@@ -1500,6 +1694,88 @@ mod tests {
         );
         assert!(no.diff.is_none() && no.tree.is_none() && no.error.is_some());
         assert!(!serde_json::to_string(&no).unwrap().contains("null"));
+
+        let hello = CommandReply::greeted(10, Capabilities::current());
+        assert!(
+            hello.diff.is_none()
+                && hello.tree.is_none()
+                && hello.error.is_none()
+                && hello.capabilities.is_some()
+        );
+        assert!(!serde_json::to_string(&hello).unwrap().contains("null"));
+    }
+
+    /// The capability list is the vocabulary the *parser* accepts, not a copy of
+    /// the documentation, and this is the test that keeps that true: every
+    /// advertised name is fed back through the wire.
+    ///
+    /// The three shapes of drift it catches are a new enum variant missing from
+    /// its `ALL` array (the count assertions), a name that no longer parses
+    /// because a serde rename moved only one side (the parse loop), and a
+    /// property list that was hand-written and fell behind the enum — which is
+    /// why [`PROPERTY_NAMES`] has a value per name here rather than a single
+    /// generic spelling.
+    #[test]
+    fn capabilities_name_only_what_the_wire_accepts() {
+        let caps = Capabilities::current();
+        assert_eq!(caps.protocol, PROTOCOL_VERSION);
+        assert!(caps.engine.starts_with("rustim/"));
+        assert_eq!(caps.profiles, ["primitive".to_owned()]);
+        assert_eq!(caps.limits.max_ticks, MAX_TICKS);
+
+        assert_eq!(caps.shapes.len(), ShapeKind::ALL.len());
+        for name in &caps.shapes {
+            let json = format!(r#"{{"action":"add","type":"{name}"}}"#);
+            serde_json::from_str::<Command>(&json).unwrap_or_else(|e| panic!("{json}: {e}"));
+        }
+
+        assert_eq!(caps.animations.len(), AnimationKind::ALL.len());
+        for name in &caps.animations {
+            let json = format!(r#"{{"action":"play","animation":{{"target":1,"type":"{name}"}}}}"#);
+            serde_json::from_str::<Command>(&json).unwrap_or_else(|e| panic!("{json}: {e}"));
+        }
+
+        assert_eq!(caps.properties, PROPERTY_NAMES);
+        for name in &caps.properties {
+            // One real value per name: the tag's spelling is what is under test,
+            // and a value of the wrong JSON type would fail for a reason that has
+            // nothing to do with it.
+            let value = match name.as_str() {
+                "opacity" | "stroke_width" | "stroke_opacity" | "fill_opacity" | "scale"
+                | "rotation" => "1.0",
+                "stroke_color" => "[1,2,3]",
+                "label" => "\"方块\"",
+                "kind" => "\"square\"",
+                "position" => "[1.0,2.0]",
+                other => panic!("capability names a property this test cannot spell: {other}"),
+            };
+            let json = format!(
+                r#"{{"action":"set","target":1,"property":{{"name":"{name}","value":{value}}}}}"#
+            );
+            serde_json::from_str::<Command>(&json).unwrap_or_else(|e| panic!("{json}: {e}"));
+        }
+
+        assert_eq!(caps.rates.len(), Rate::ALL.len());
+        for name in &caps.rates {
+            let json = format!(
+                r#"{{"action":"play","animation":{{"target":1,"type":"fade_in","rate":"{name}"}}}}"#
+            );
+            serde_json::from_str::<Command>(&json).unwrap_or_else(|e| panic!("{json}: {e}"));
+        }
+    }
+
+    /// A greeting reply round-trips like every other document, and carries no
+    /// `diff` — a handshake that reported "nothing changed" would be a claim
+    /// about the session, not about the build.
+    #[test]
+    fn a_greeting_reply_round_trips_through_json() {
+        let reply = CommandReply::greeted(1, Capabilities::current());
+        let json = serde_json::to_string(&reply).unwrap();
+        let parsed: CommandReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, reply);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        assert!(parsed.diff.is_none() && parsed.tree.is_none());
+        assert_eq!(parsed.capabilities.unwrap().protocol, PROTOCOL_VERSION);
     }
 
     /// A query reply round-trips like every other document on this wire, so a
@@ -3071,10 +3347,10 @@ mod tests {
         );
     }
 
-    /// The presence of `diff`, `tree` or `error` is the discriminant; the others
-    /// are omitted, never written as null.
+    /// The presence of `diff`, `tree`, `capabilities` or `error` is the
+    /// discriminant; the others are omitted, never written as null.
     #[test]
-    fn a_reply_carries_exactly_one_of_diff_tree_and_error() {
+    fn a_reply_carries_exactly_one_of_diff_tree_capabilities_and_error() {
         let applied: serde_json::Value = serde_json::from_str(&reply_line(
             3,
             Ok(CommandOutcome::Applied(StateDiff::default())),
@@ -3102,6 +3378,21 @@ mod tests {
         assert!(queried.get("diff").is_none());
         assert!(queried.get("error").is_none());
         assert_eq!(queried["tree"]["nodes"].as_array().unwrap().len(), 1);
+
+        // A greeting is the fourth presence: the document it answers with is
+        // the build's vocabulary. It is neither a mutation nor a read of the
+        // tree, so both of those fields are absent.
+        let greeted: serde_json::Value = serde_json::from_str(&reply_line(
+            6,
+            Ok(CommandOutcome::Greeted(Capabilities::current())),
+        ))
+        .unwrap();
+        assert_eq!(greeted["seq"], 6);
+        assert!(greeted.get("capabilities").is_some());
+        assert!(greeted.get("diff").is_none());
+        assert!(greeted.get("tree").is_none());
+        assert!(greeted.get("error").is_none());
+        assert_eq!(greeted["capabilities"]["protocol"], PROTOCOL_VERSION);
 
         let refused: serde_json::Value = serde_json::from_str(&reply_line(
             5,

@@ -32,6 +32,27 @@ pub enum ShapeKind {
     Plot,
 }
 
+impl ShapeKind {
+    /// Every shape the command layer can build, in the order `--help` and the
+    /// capabilities reply should list them.
+    ///
+    /// Exists so a vocabulary that is assembled at runtime (the protocol's
+    /// `capabilities`, a host's tool schema) has one list to read rather than a
+    /// second copy of the enum that can drift. A shape added to the enum and to
+    /// [`build`] but not here fails the capabilities conformance test by
+    /// omission only if the test counts — it does.
+    pub const ALL: [ShapeKind; 8] = [
+        ShapeKind::Square,
+        ShapeKind::Circle,
+        ShapeKind::RightTriangle,
+        ShapeKind::Line,
+        ShapeKind::Arrow,
+        ShapeKind::NumberLine,
+        ShapeKind::Axes,
+        ShapeKind::Plot,
+    ];
+}
+
 /// Parameters for a shape. Every field is optional so a partial description —
 /// which is what a language model will usually produce — still yields a
 /// renderable object.

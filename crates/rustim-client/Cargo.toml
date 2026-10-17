@@ -1,0 +1,18 @@
+[package]
+name = "rustim-client"
+description = "A synchronous client for rustim's stdio JSONL command protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Deliberately only the protocol, not the engine: a client that linked the
+# renderer or the scene would be a second copy of the host. Everything here is
+# a `Command` in, a `CommandReply` out, which is exactly what an AI adapter
+# needs. No platform code, and no dependency on `rustim-app`.
+[dependencies]
+rustim-scene.workspace = true
+# `float_roundtrip` for the same reason every other crate names it (see the
+# workspace manifest): a reply carries computed floats, and a client that logs
+# one and compares it later must not meet a one-ULP difference.
+serde_json = { version = "1", features = ["float_roundtrip"] }

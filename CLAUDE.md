@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-A Cargo workspace at the repository root, plus four documents and one directory of throwaway probes.
+A Cargo workspace at the repository root, plus six documents and one directory of throwaway probes.
 
 **Read the design documents in this order:**
 
@@ -26,6 +26,20 @@ for engine work, and this file is the development reference. The two must be edi
 flag, a wire field or a key binding changes: a stale manual is a user-facing wrong answer, and nothing
 in CI reads it.
 
+The last two are the **external-driver documents**, and they are the normative pair for anything an
+AI assistant drives:
+
+5. `驱动协议v1.md` — the wire specification: transports, the `hello` handshake and version rules,
+   the command vocabulary, the reply shapes, the error vocabulary, conformance assertions, and what
+   is explicitly unimplemented.
+6. `贾维斯集成方案.md` — the architecture around that wire: why the engine and the assistant are
+   separate products, the five switching mechanisms, the tool tiers, the repository layout, and the
+   phased roadmap (Phase 0 is what has landed; the rest is planned).
+
+A change to a command, a reply field, a refusal or a version rule is a change to **`驱动协议v1.md`,
+`使用说明.md` and the conformance suite together**. "Confirmed by a doc" is not a test — the suite in
+`crates/rustim-app/tests/conformance.rs` is what makes the wire's promises executable.
+
 The tutorial's code blocks are **illustrative sketches, not compilable code**; the workspace does not
 follow its flat `src/` module layout. See "Where the workspace diverges from the tutorial" below.
 
@@ -40,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **631 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **649 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -53,7 +67,10 @@ builds both ways (with and without Typst) and was **run in Chrome 151**, where i
 desktop still's content bounding box with a maximum channel error of 1 on 16 pixels, Chrome's own
 accessibility tree holds the four named figures, a formula reaches it as `<math>` structure, and a
 drag and a wheel dispatched through Chrome's input pipeline move the camera exactly as the desktop's
-shared gesture code does — see "Web (WASM)". The count is not
+shared gesture code does — see "Web (WASM)". The **conformance suite** at
+`crates/rustim-app/tests/conformance.rs` drives the real binary only through `rustim-client`, so the
+protocol's framing promises are checked by a client that has no access to engine internals — see
+"External drivers and the AI surface". The count is not
 decoration — every one of those claims is re-run by the commands below, and the P2 rows in the
 roadmap say which step last moved it.
 
@@ -132,6 +149,8 @@ cargo test -p rustim-app --test captions        # the band is in the bottom of t
 cargo test -p rustim-app --test speech          # --speak refuses the headless flags (no backend needed)
 cargo test -p rustim-app --test export          # the export loop, the sinks and the .srt timings
 cargo test -p rustim-app --test formula         # formula structure reaches --inspect, via the binary
+cargo test -p rustim-app --test conformance     # the protocol, driven only through rustim-client
+cargo test -p rustim-client          # the client's framing rules, over in-memory streams
 cargo test -p rustim-export --test compare_cli  # the visual-regression CLI's exit codes
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo test -p rustim-web             # the browser session core, natively (no Chrome, no wasm)
@@ -338,11 +357,14 @@ last property.
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
 | `rustim-app` | The winit event loop, softbuffer presentation, keyboard and pointer input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
 | `rustim-web` | The browser host: `Session` (scene + context + renderer + draw list, target-independent and testable natively), `aria` (the semantic tree → flat ARIA projection), `pointer` (DOM wheel/pointer units and signs → `rustim-math::gesture`, pure and natively tested), `web` (the wasm shell: canvas, rAF loop, pointer/wheel listeners, DOM/ARIA overlay), the command bridge and the optional `formula` scene | Real (Chrome-verified) |
+| `rustim-client` | The **client half** of the command protocol: `read_reply` (one reply line, the presence rule enforced) and `StdioClient` (spawn, `send`, `send_raw`, `write_raw`, `hello`, `close`, seq checking). No engine logic, no rendering, no platform code — it spawns a process, which is a host's job, so it is **not** one of the six wasm kernel crates | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead. `rustim-web` sits
 beside `rustim-app`, not under it: both are hosts of the same kernel, and neither depends on the
-other.
+other. `rustim-client` is not a host and not a kernel crate: it is the workspace's own *external*
+consumer of `rustim-scene`'s protocol, existing so that the conformance suite cannot lean on
+anything a driver outside the workspace lacks.
 
 ### The frame
 
@@ -2326,6 +2348,20 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   frame still matches `linux-aarch64` with max channel error 1), and the count moved 621 → 628.
   Deferred: pinch gestures and inertial scrolling, and keyboard/focus commands (still the one
   interaction the Web version does not promise).
+- **Phase 0 of the external-driver plan is done: protocol v1's foundation.** The session handshake
+  (`{"action":"hello","protocol":1}` → a `capabilities` document, `PROTOCOL_VERSION = 1`), the
+  vocabulary lists derived from the enums the parser uses (`ShapeKind::ALL`,
+  `AnimationKind::ALL`, `PROPERTY_NAMES`, `Rate::ALL`, plus `limits.max_ticks` and the
+  `"primitive"` tool profile), the fourth reply presence (`capabilities`, beside `diff`/`tree`/
+  `error`, with `CommandOutcome::Greeted`), the new `rustim-client` crate (`read_reply` +
+  `StdioClient`), and `crates/rustim-app/tests/conformance.rs` — eight tests that drive the real
+  binary **only** through the client crate. Evidence: 631 → 649 tests, clippy and fmt clean, all
+  fourteen golden cases pass with **no baseline changed** (a handshake draws nothing). The design
+  and the remaining phases (wire text/formula, `Animate`, pause/seek/undo/checkpoint, layout,
+  linter, daemon/MCP) are in `贾维斯集成方案.md`; the wire itself is `驱动协议v1.md`, and
+  `使用说明.md` §4 documents the handshake for a user. Deliberately not done here: label addressing
+  already existed (step 22b), and no second transport, no MCP surface, no checkpointing — those are
+  later phases and the documents say so.
 
 ## AI integration
 
@@ -2338,6 +2374,28 @@ The product is an AI explainer assistant, so the engine exposes a JSON command i
 { "action": "play", "animation": { "target": 4294967299, "type": "fade_in", "duration": 0.6, "rate": "ease_in_out_sine" } }
 { "action": "narrate", "text": "两条直角边是 3 和 4", "at": 2.0 }
 ```
+
+**The engine and the assistant are separate products, and the protocol is the seam.** The assistant
+(Jarvis) is not in this repository and must not be: any model that can write JSON must be able to
+drive rustim, and a driver must be able to switch between assistants without the engine changing.
+The two normative documents are `驱动协议v1.md` (the wire) and `贾维斯集成方案.md` (the
+architecture: transports, switching mechanisms, tool tiers, roadmap). `PROTOCOL_VERSION` (`1`) and
+`Capabilities::current()` are the machine-readable half of that agreement — see "External drivers and
+the AI surface" below.
+
+**The handshake is `{"action":"hello","protocol":1}`**, and it is the recommended first line of every
+session. It does not touch the tree; it answers with a `capabilities` document — the protocol version,
+the engine's version string, and the exact shape / animation / property / rate names this build
+accepts, plus its limits. The lists are **derived from serde over the same enums the parser uses**,
+so an advertised name is accepted by construction, and a conformance test feeds every advertised word
+back through the binary (see `crates/rustim-app/tests/conformance.rs`). `PROPERTY_NAMES`,
+`AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` are what supply the lists, and a new variant
+that misses its `ALL`/name table fails a count assertion rather than silently not being advertised.
+A foreign version is refused in `SceneContext::handle` (not at parse time, so both numbers can be
+named) as `OutOfRange { property: "protocol", detail: "client speaks 2; this engine speaks 1" }`;
+the refusal round-trips as JSON like any other command. A driver that skips the handshake still
+works — the protocol is additive — but it gives up the one place a version mismatch can be reported
+before a command means something else.
 
 `target` is a **`Target`**: either a `NodeId` — an **opaque 64-bit integer**, not a small index (see
 the `slotmap` note above — the low half is the slot, the high half the generation) — or the
@@ -2399,16 +2457,55 @@ keeps that node and its descendants and sets the document's `root` to it; a miss
 different answers and a host cannot tell them apart afterwards. The reply's `live` is always `null`:
 the announcement text belongs to a host's accessibility layer, not to the kernel.
 
-`CommandOutcome` is the in-memory vocabulary that keeps the two apart — `Applied(StateDiff)` versus
-`Queried(SemanticTree)` — and `reply_line` is the only thing that turns it into JSON, so the desktop
-feed and the browser bridge cannot answer a query two different ways. The hook fires only for
-`Applied`: a scene that re-fitted itself on every read would do work the question did not ask for.
+`CommandOutcome` is the in-memory vocabulary that keeps the three answers apart — `Applied(StateDiff)`,
+`Queried(SemanticTree)` and `Greeted(Capabilities)` — and `reply_line` is the only thing that turns it
+into JSON, so the desktop feed and the browser bridge cannot answer one command two different ways.
+The hook fires only for `Applied`: a scene that re-fitted itself on every read would do work the
+question did not ask for, and a greeting changes nothing at all.
 
 Two wire-format invariants are load-bearing, both pinned by tests:
 - **Commands round-trip byte-for-byte.** `to_string(parse(json)) == json`. A host logs, replays and
   diffs these, so anything that serialises back differently is a bug.
 - **Absent shape parameters are omitted, never written as `null`.** These payloads are model output;
   echoing `"width": null` back would teach the model that nulls are part of the protocol.
+
+### External drivers and the AI surface
+
+The command layer is designed so that **the engine is one process and the assistant is another**.
+That separation is what makes "switch AI assistants freely" a property rather than a promise, and it
+is why the protocol is specified in `驱动协议v1.md` independently of any particular driver
+(`贾维斯集成方案.md` is the architecture document; both are normative for this section).
+
+Three properties make switching work, and each is already a property of the engine rather than a
+feature to add:
+
+- **All conversation state lives in the engine, not in the model.** The tree, the camera, the
+  timeline, the motion policy and the narration track are `SceneContext`'s; a driver that is replaced
+  mid-session loses nothing, because it never held anything. The obvious corollary is that a driver
+  keeps no private model of the scene either — it reads one back with `query`.
+- **A session is a command log, and the log is the state.** A script applies at virtual time zero,
+  commands round-trip byte for byte, and the headless path is deterministic; the conformance suite
+  pins this by running the same eleven-line log through **two independent processes** and comparing
+  the reply vectors and the final `SemanticTree` field for field. That is the executable definition
+  of "a second assistant takes over".
+- **Capability negotiation is explicit.** `hello` names the protocol version and the vocabulary;
+  a mismatch is refused with both numbers. An assistant adapted to one build can therefore be told
+  by another build, before it sends anything, whether it will be understood.
+
+The transports are deliberately not part of the kernel. `--script - --reply` (newline-delimited
+JSON over stdio) is the one implemented today, and `rustim-client` is its client half: `read_reply`
+enforces the one-presence rule, `send_raw` enforces `seq`, `hello` is one call, and `close` returns
+the exit status. The conformance suite in `crates/rustim-app/tests/conformance.rs` is written against
+that crate only — it spawns the real binary, never reaching into `rustim-app`'s modules — so a passing
+test is evidence that an outside driver can do the same. It asserts the advertised vocabulary is
+accepted by the binary (every shape, every animation kind with its required fields, every rate),
+that ids and labels agree across `add`/`set`/`query`, that a foreign protocol is refused readably and
+the feed continues, that blank lines are skipped and counted, and that two clients replay one log to
+one tree. A planned WebSocket/JSON-RPC transport (`rustim-daemon`, for the Jarvis UI) and an MCP
+tool surface (`rustim-mcp`) are **not implemented** and must map onto the same `SceneContext::handle`
+— a second transport is a wrapper around this protocol, never a second dialect of it.
+Checkpoint/undo/seek, the teaching-tier tools (`rustim-director`) and the two tool tiers are roadmap
+items in `贾维斯集成方案.md`; nothing in this repository currently claims them.
 
 ### The feed: a session is a file of commands
 
@@ -2426,10 +2523,11 @@ of I/O and of a JSON parser (it compiles to wasm).
   every human-facing line the binary prints (`wrote out.png (1280x720)`, the frame-rate line) moves to
   stderr (`main::note`). A host cannot skip a line it did not expect.
   `{"seq":1,"diff":{"created":[4294967297],"modified":[],"removed":[]}}` — **exactly one of `diff`,
-  `tree` and `error` is present**, and the presence is the discriminant. `created` is the only way to
-  learn the id of what was just created; a `play` gets a present-but-**empty** diff, because queueing
-  a beat changes nothing in the tree; a `query` gets a `tree` and no diff at all, because an empty
-  diff would read as a mutation that did nothing.
+  `tree`, `capabilities` and `error` is present**, and the presence is the discriminant. `created` is
+  the only way to learn the id of what was just created; a `play` gets a present-but-**empty** diff,
+  because queueing a beat changes nothing in the tree; a `query` gets a `tree` and no diff at all,
+  because an empty diff would read as a mutation that did nothing; a `hello` gets `capabilities` and
+  neither of the other two, because a handshake is not a read of the tree.
 - **`seq` is the 1-based *physical* line number**, blank lines included, so a human reading a log and a
   host reading the stream count the same way. A blank line is skipped silently and produces no reply.
 - **Every reply is flushed before the next line is read.** A file source is read whole; `-` is stdin,

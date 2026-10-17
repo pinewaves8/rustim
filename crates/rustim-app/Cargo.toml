@@ -42,3 +42,8 @@ serde_json.workspace = true
 # it only puts the same implementation in scope for our tests, so the suite
 # validates against the code a platform backend actually runs.
 accesskit_consumer = "0.39"
+# The conformance suite drives the real binary the way an external AI adapter
+# would — through `rustim-client`, not through this crate's own internals. That
+# is the point: the test is a *client of the protocol*, so it cannot accidentally
+# rely on something a host outside the workspace does not have.
+rustim-client.workspace = true
