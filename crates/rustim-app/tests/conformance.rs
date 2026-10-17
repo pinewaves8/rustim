@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (30 actions, 12 shapes, 11 animations, 10
+//!    the build actually has (31 actions, 12 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -155,7 +155,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 30, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 31, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -818,6 +818,80 @@ fn the_chart_template_addresses_each_bar_by_its_category() {
         .expect("a tree");
     assert!(
         !tree.nodes.iter().any(|node| node.name == "错图"),
+        "a refused template left its group behind"
+    );
+
+    finish(client, &png);
+}
+
+/// The sixth `explain.*` template: one frame of an algorithm's state, with
+/// numbered cells and named pointers.
+///
+/// The pieces only the real binary can prove are that the host's shaper draws
+/// each cell's value *and* its zero-based index, that a cell and a pointer are
+/// each addressable by name, that two pointers over one column stack rather
+/// than collide, and that an out-of-range pointer is refused rather than drawn
+/// pointing at nothing.
+#[test]
+fn the_algorithm_template_addresses_cells_and_pointers_by_name() {
+    let (mut client, png) = client("algorithm");
+
+    // Group, four cells each with a value and an index (12), two pointers each
+    // with a caret and a name (4), and the caption.
+    let created = expect_diff(
+        &mut client,
+        r#"{"action":"explain.algorithm","values":[5.0,3.0,8.0,1.0],"pointers":[["i",1],["j",1]],"highlight":[1],"caption":"比较中","label":"数组"}"#,
+    )
+    .created;
+    assert_eq!(created.len(), 18, "{:?}", created);
+
+    let group = created[0];
+    let tree = client
+        .send_raw(&format!(r#"{{"action":"query","target":{}}}"#, group.raw()))
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert_eq!(tree.root, group);
+    assert_eq!(tree.nodes[0].name, "数组", "the label names the group");
+    assert!(
+        tree.nodes[0].bounds.is_some(),
+        "the group declares the union of its pieces"
+    );
+    let names: Vec<&str> = tree.nodes.iter().map(|node| node.name.as_str()).collect();
+    for name in ["格0", "格1", "格2", "格3", "5", "3", "8", "1", "i", "j"] {
+        assert!(names.contains(&name), "missing {name}: {names:?}");
+    }
+
+    // A cell is addressable by its own number, and a pointer by its name — two
+    // different nodes, so neither lookup is ambiguous.
+    let diff = expect_diff(
+        &mut client,
+        r#"{"action":"set","target":"格2","property":{"name":"opacity","value":0.5}}"#,
+    );
+    assert_eq!(diff.modified, vec![created[7]], "the third cell");
+    let diff = expect_diff(
+        &mut client,
+        r#"{"action":"set","target":"i","property":{"name":"opacity","value":0.5}}"#,
+    );
+    assert_eq!(diff.modified, vec![created[14]], "the first pointer's name");
+
+    // A pointer naming a cell that does not exist is refused under `pointers`,
+    // and the refused group does not survive.
+    let error = client
+        .send_raw(
+            r#"{"action":"explain.algorithm","values":[1.0],"pointers":[["i",4]],"label":"错帧"}"#,
+        )
+        .expect("a refusal is a reply")
+        .error
+        .expect("a pointer into nothing is refused");
+    assert!(format!("{error}").contains("pointers"), "{error}");
+    let tree = client
+        .send_raw(r#"{"action":"query"}"#)
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert!(
+        !tree.nodes.iter().any(|node| node.name == "错帧"),
         "a refused template left its group behind"
     );
 

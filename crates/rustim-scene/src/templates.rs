@@ -2180,6 +2180,341 @@ fn nice_step(span: f64) -> f64 {
     nice * magnitude
 }
 
+// ---- explain.algorithm --------------------------------------------------
+
+/// The most cells one frame may have.
+///
+/// The same posture as [`MAX_CATEGORIES`]: a model-supplied array must not be
+/// able to allocate hundreds of text nodes. At the default cell and gap this is
+/// already 30 world units of row — four times a 720p frame — so the cap is a
+/// guard against a runaway payload rather than a layout choice.
+const MAX_CELLS: usize = 32;
+
+/// The most named pointers one frame may carry.
+///
+/// A pointer is two pieces (a caret and a name) and they stack, so sixteen is
+/// already more than a column can show without leaving the frame.
+const MAX_POINTERS: usize = 16;
+
+/// The side of one cell, in world units.
+const ALGORITHM_CELL_SIZE: f64 = 0.8;
+
+/// The gap between neighbouring cells.
+const ALGORITHM_CELL_GAP: f64 = 0.15;
+
+/// A cell's value text size as a fraction of the cell's side, and a cell's
+/// index text size: the value is the content and the index is an annotation, so
+/// the second is deliberately smaller than the first.
+const ALGORITHM_VALUE_FRACTION: f64 = 0.5;
+const ALGORITHM_INDEX_FRACTION: f64 = 0.28;
+
+/// The stand-off between a cell's bottom edge and its index, and the same
+/// between a pointer's tip and whatever it stands on.
+const ALGORITHM_INDEX_GAP: f64 = 0.1;
+const ALGORITHM_POINTER_GAP: f64 = 0.12;
+
+/// A pointer caret's half-width and height, both as fractions of the cell side.
+/// The caret is an isosceles triangle pointing **down** at the cell it names,
+/// so it reads as an arrow even with its label cropped away.
+const ALGORITHM_CARET_FRACTION: f64 = 0.22;
+
+/// The slots `explain.algorithm` fills.
+pub(crate) struct Algorithm<'a> {
+    pub values: &'a [f64],
+    /// `(name, cell index)` pairs drawn as carets above the cells they name.
+    pub pointers: Option<&'a [(String, u32)]>,
+    /// Cell indices painted with a wash; the rest are outlines only.
+    pub highlight: Option<&'a [u32]>,
+    pub cell_size: Option<f64>,
+    /// The highlighted cells' colour; every outline and every label stays
+    /// foreground.
+    pub color: Option<[u8; 3]>,
+    pub position: Option<[f64; 2]>,
+    pub caption: Option<&'a str>,
+    pub caption_size: Option<f64>,
+    pub label: Option<&'a str>,
+}
+
+/// One frame of an algorithm's state: a row of numbered cells, with named
+/// pointers over chosen ones.
+///
+/// The sixth and last template, and the one that is a *snapshot* rather than a
+/// diagram: an algorithm explanation is a sequence of such frames, and each one
+/// says "these are the values now, this is where `i` and `j` stand, these two
+/// are being compared". The slots are the state; the sequence is the caller's,
+/// built by sending the next frame with a different `pointers`/`highlight` (or
+/// by animating a pointer with `move_to`, since the caret is an ordinary node).
+///
+/// Indices are **zero-based**, and the index row under the cells says so. That
+/// is the one place a template deliberately does not read like prose: an
+/// algorithm's own vocabulary is `a[0]`, `a[i]`, and a frame labelled `1..n`
+/// would disagree with every line of code the lecture is explaining. A cell's
+/// own label carries the same number (`格0`, `格1`, …), so `set` or `play` can
+/// address one box without counting the tree.
+///
+/// Pieces, in `created` order: one cell and (value text, index text) per value,
+/// then one caret and name per pointer, then the caption. Every value is
+/// typeset — a frame with no numbers is not a frame — so the template needs a
+/// text typesetter even when there is no caption.
+///
+/// Pointers over the same cell **stack** upward, one per line, so `i` and `j`
+/// on the same index read as two rows rather than one on top of the other. A
+/// pointer's name is its label; the caret under it is an unlabelled
+/// decoration, so `set target "i"` resolves to exactly one node.
+pub(crate) fn algorithm(
+    tree: &mut SceneTree,
+    typesetter: &mut dyn Typesetter,
+    args: Algorithm<'_>,
+) -> Result<StateDiff, CommandError> {
+    let values = args.values;
+    if values.is_empty() {
+        return Err(CommandError::OutOfRange {
+            property: "values".to_owned(),
+            detail: "an algorithm frame needs at least one value".to_owned(),
+        });
+    }
+    if values.len() > MAX_CELLS {
+        return Err(CommandError::OutOfRange {
+            property: "values".to_owned(),
+            detail: format!("{} values exceed the {MAX_CELLS}-cell cap", values.len()),
+        });
+    }
+    if let Some(value) = values.iter().copied().find(|v| !v.is_finite()) {
+        return Err(CommandError::OutOfRange {
+            property: "values".to_owned(),
+            detail: format!("{value} is not a finite value"),
+        });
+    }
+    let count = values.len();
+    let pointers = args.pointers.unwrap_or(&[]);
+    if pointers.len() > MAX_POINTERS {
+        return Err(CommandError::OutOfRange {
+            property: "pointers".to_owned(),
+            detail: format!(
+                "{} pointers exceed the {MAX_POINTERS}-pointer cap",
+                pointers.len()
+            ),
+        });
+    }
+    for (i, (name, index)) in pointers.iter().enumerate() {
+        if name.trim().is_empty() {
+            return Err(CommandError::OutOfRange {
+                property: "pointers".to_owned(),
+                detail: format!("pointer {i} has a blank name"),
+            });
+        }
+        // A name is how a lecture addresses the pointer, so two pointers with
+        // one name would make `set target "i"` ambiguous — and unlike an
+        // object's label, a model writing `[["i", 0], ["i", 1]]` has made a
+        // mistake, not a deliberate pair of same-named things.
+        if pointers[..i].iter().any(|(other, _)| other == name) {
+            return Err(CommandError::OutOfRange {
+                property: "pointers".to_owned(),
+                detail: format!("two pointers are both named {name:?}"),
+            });
+        }
+        if *index as usize >= count {
+            return Err(CommandError::OutOfRange {
+                property: "pointers".to_owned(),
+                detail: format!("pointer {name:?} names cell {index}, but there are {count} cells"),
+            });
+        }
+    }
+    let highlight = args.highlight.unwrap_or(&[]);
+    if highlight.len() > MAX_CELLS {
+        return Err(CommandError::OutOfRange {
+            property: "highlight".to_owned(),
+            detail: format!(
+                "{} highlighted cells exceed the {MAX_CELLS}-cell cap",
+                highlight.len()
+            ),
+        });
+    }
+    if let Some(index) = highlight.iter().find(|index| **index as usize >= count) {
+        return Err(CommandError::OutOfRange {
+            property: "highlight".to_owned(),
+            detail: format!("highlighted cell {index}, but there are {count} cells"),
+        });
+    }
+    let cell = positive(args.cell_size, ALGORITHM_CELL_SIZE, "cell_size")?;
+    if let Some(size) = args.caption_size
+        && (!size.is_finite() || size <= 0.0)
+    {
+        return Err(CommandError::OutOfRange {
+            property: "caption_size".to_owned(),
+            detail: format!("{size} is not a finite, positive size"),
+        });
+    }
+    let caption = match args.caption {
+        Some(text) if text.trim().is_empty() => {
+            return Err(CommandError::OutOfRange {
+                property: "caption".to_owned(),
+                detail: "a caption needs something to say".to_owned(),
+            });
+        }
+        Some(text) => Some(text),
+        None => None,
+    };
+    // Every cell's value and every index is typeset, caption or not.
+    if !typesetter.supports_text() {
+        return Err(CommandError::Unsupported {
+            feature: "text".to_owned(),
+        });
+    }
+
+    let pitch = cell + ALGORITHM_CELL_GAP;
+    let leftmost = -((count as f64 - 1.0) / 2.0) * pitch;
+    let column = |index: usize| leftmost + index as f64 * pitch;
+    let index_size = cell * ALGORITHM_INDEX_FRACTION;
+    let index_spec = TextSpec {
+        size: Some(index_size),
+        max_width: None,
+    };
+    let value_spec = TextSpec {
+        size: Some(cell * ALGORITHM_VALUE_FRACTION),
+        // A long number wraps at the cell rather than running into its
+        // neighbour; the cell's own box is what bounds it.
+        max_width: Some(cell),
+    };
+    let highlighted = |index: usize| highlight.iter().any(|h| *h as usize == index);
+
+    let mut build = Build::open(tree, args.label, args.position, "position")?;
+    let result = (|| -> Result<(), CommandError> {
+        for (index, &value) in values.iter().enumerate() {
+            let x = column(index);
+            let on = highlighted(index);
+            let id = build.piece(
+                ShapeKind::Square,
+                ShapeParams {
+                    width: Some(cell),
+                    height: Some(cell),
+                    color: if on { args.color } else { None },
+                    position: Some([x, 0.0]),
+                    label: Some(format!("格{index}")),
+                    ..ShapeParams::default()
+                },
+            );
+            if let Some(m) = build.tree.get_mut(id) {
+                // A cell is an outline; a highlighted one is the same outline
+                // with a translucent wash behind it, so the grid's edges stay
+                // a single continuous rule either way.
+                m.style.fill_opacity = if on { 0.35 } else { 0.0 };
+                m.style.stroke_opacity = 1.0;
+                m.style.stroke = m.style.fill;
+                m.style.stroke_width = DEFAULT_THICKNESS;
+                m.dirty.style = true;
+            }
+
+            let text = tick_text(value);
+            let block = typesetter
+                .text(&text, &value_spec)
+                .map_err(|error| typeset_error(error, "values"))?;
+            build.text(
+                &text,
+                block,
+                &value_spec,
+                [x, 0.0],
+                None,
+                Some(text.clone()),
+            );
+
+            let index_text = index.to_string();
+            let block = typesetter
+                .text(&index_text, &index_spec)
+                .map_err(|error| typeset_error(error, "values"))?;
+            let half = block.local_bounds().map_or(0.0, |rect| rect.height() / 2.0);
+            // The index row hangs off the cell's bottom edge by its own measured
+            // half-height, so a shaper with a taller line box does not push it
+            // into the cell and a shorter one does not leave a gap.
+            build.text(
+                &index_text,
+                block,
+                &index_spec,
+                [x, -cell / 2.0 - ALGORITHM_INDEX_GAP - half],
+                None,
+                None,
+            );
+        }
+
+        // Each column's pen: how high above it the next pointer stands. Two
+        // pointers on one index stack, one per line, rather than overlapping.
+        let mut pen = vec![cell / 2.0; count];
+        let caret = cell * ALGORITHM_CARET_FRACTION;
+        for (name, index) in pointers {
+            let at = *index as usize;
+            let x = column(at);
+            let tip = pen[at] + ALGORITHM_POINTER_GAP;
+            let marker = build.piece(
+                ShapeKind::Polygon,
+                ShapeParams {
+                    points: Some(vec![
+                        [x, tip],
+                        [x - caret, tip + caret],
+                        [x + caret, tip + caret],
+                    ]),
+                    color: args.color,
+                    ..ShapeParams::default()
+                },
+            );
+            if let Some(m) = build.tree.get_mut(marker) {
+                // The builder already leaves a polygon as a filled contour; the
+                // caret only has to stop claiming to be a shape of its own, so
+                // `--inspect` does not announce a decorative triangle as a
+                // figure beside the values it points at.
+                m.kind = NodeKind::Unknown;
+                m.dirty.semantic = true;
+            }
+
+            let block = typesetter
+                .text(name, &index_spec)
+                .map_err(|error| typeset_error(error, "pointers"))?;
+            let half = block.local_bounds().map_or(0.0, |rect| rect.height() / 2.0);
+            let centre = tip + caret + ALGORITHM_POINTER_GAP / 2.0 + half;
+            build.text(
+                name,
+                block,
+                &index_spec,
+                [x, centre],
+                None,
+                Some(name.clone()),
+            );
+            pen[at] = centre + half;
+        }
+
+        if let Some(caption) = caption {
+            let spec = TextSpec {
+                size: args.caption_size,
+                max_width: None,
+            };
+            let block = typesetter
+                .text(caption, &spec)
+                .map_err(|error| typeset_error(error, "caption"))?;
+            let caption_half = block.local_bounds().map_or(0.0, |rect| rect.height() / 2.0);
+            let bottom = build
+                .created
+                .iter()
+                .filter_map(|id| build.tree.world_bounds(*id))
+                .map(|rect| rect.y0 - build.origin[1])
+                .fold(f64::INFINITY, f64::min);
+            let y = if bottom.is_finite() {
+                bottom - DEFAULT_GAP - caption_half
+            } else {
+                -cell / 2.0 - DEFAULT_GAP - caption_half
+            };
+            build.text(caption, block, &spec, [0.0, y], None, None);
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => Ok(build.finish()),
+        Err(error) => {
+            build.rollback();
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The pure half of `explain.plot` and `explain.chart`: Horner, the

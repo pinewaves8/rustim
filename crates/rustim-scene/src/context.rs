@@ -1465,6 +1465,45 @@ impl SceneContext {
             return crate::templates::chart(&mut self.tree, typesetter.as_mut(), args)
                 .map(CommandOutcome::Applied);
         }
+        if let Command::ExplainAlgorithm {
+            values,
+            pointers,
+            highlight,
+            cell_size,
+            color,
+            position,
+            caption,
+            caption_size,
+            label,
+        } = cmd
+        {
+            // Every value and every index is typeset, so the template needs
+            // text unconditionally — the same check as `chart`, repeated beside
+            // the capability query a host reads from `hello`.
+            if !self.supports_text() {
+                return Err(CommandError::Unsupported {
+                    feature: "text".to_owned(),
+                });
+            }
+            let Some(typesetter) = self.typesetter.as_mut() else {
+                return Err(CommandError::Unsupported {
+                    feature: "text".to_owned(),
+                });
+            };
+            let args = crate::templates::Algorithm {
+                values,
+                pointers: pointers.as_deref(),
+                highlight: highlight.as_deref(),
+                cell_size: *cell_size,
+                color: *color,
+                position: *position,
+                caption: caption.as_deref(),
+                caption_size: *caption_size,
+                label: label.as_deref(),
+            };
+            return crate::templates::algorithm(&mut self.tree, typesetter.as_mut(), args)
+                .map(CommandOutcome::Applied);
+        }
         if let Command::Highlight {
             target,
             dim,
@@ -4736,6 +4775,326 @@ mod tests {
             Err(CommandError::Typeset { .. })
         ));
         assert_eq!(ctx.tree.len(), before, "a refused chart left pieces behind");
+    }
+
+    // ---- explain.algorithm ------------------------------------------------
+
+    /// The default spelling: three cells, their values and the zero-based
+    /// index row, with every optional slot defaulted.
+    #[test]
+    fn a_bare_algorithm_frame_numbers_its_cells_from_zero() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.algorithm","values":[5,3,8],"label":"数组"}"#,
+        )
+        .expect("a wire algorithm frame");
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &cmd);
+
+        // Group, then a cell, its value text and its index text per value.
+        assert_eq!(diff.created.len(), 10, "{:?}", diff.created);
+        let group = diff.created[0];
+        assert_eq!(ctx.tree.get(group).unwrap().kind, NodeKind::Group);
+        assert_eq!(ctx.tree.get(group).unwrap().label.as_deref(), Some("数组"));
+
+        // The row is centred on the origin: pitch `cell + gap` = 0.95, so three
+        // columns sit at -0.95, 0 and 0.95.
+        for (index, (label, value)) in [("格0", "5"), ("格1", "3"), ("格2", "8")]
+            .into_iter()
+            .enumerate()
+        {
+            let cell = diff.created[1 + 3 * index];
+            let value_text = diff.created[2 + 3 * index];
+            let index_text = diff.created[3 + 3 * index];
+            let x = (index as f64 - 1.0) * 0.95;
+
+            let m = ctx.tree.get(cell).unwrap();
+            assert_eq!(m.kind, NodeKind::Square);
+            assert_eq!(m.label.as_deref(), Some(label));
+            let bounds = ctx.tree.world_bounds(cell).unwrap();
+            assert!((bounds.center().x - x).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.center().y - 0.0).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.width() - 0.8).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.height() - 0.8).abs() < 1e-12, "{bounds:?}");
+            // An un-highlighted cell is an outline only.
+            assert_eq!(m.style.fill_opacity, 0.0);
+            assert_eq!(m.style.stroke_opacity, 1.0);
+
+            // The value is centred in its cell and labelled by its own text;
+            // the index hangs one gap below the cell, unlabelled.
+            let m = ctx.tree.get(value_text).unwrap();
+            assert_eq!(m.kind, NodeKind::Text);
+            assert_eq!(m.label.as_deref(), Some(value));
+            let bounds = ctx.tree.world_bounds(value_text).unwrap();
+            assert!((bounds.center().y - 0.0).abs() < 1e-12, "{bounds:?}");
+            let m = ctx.tree.get(index_text).unwrap();
+            assert_eq!(m.kind, NodeKind::Text);
+            assert_eq!(m.label, None);
+            let bounds = ctx.tree.world_bounds(index_text).unwrap();
+            // The fake shaper's block is one unit tall, so its centre is half a
+            // unit below the top the template aligned it to.
+            assert!(
+                (bounds.y1 - (-0.4 - 0.1)).abs() < 1e-12,
+                "the index row hangs off the cell's bottom edge: {bounds:?}"
+            );
+            assert!((bounds.center().x - x).abs() < 1e-12, "{bounds:?}");
+            assert_eq!(ctx.tree.world_bounds(index_text).unwrap().center().y, -1.0);
+        }
+
+        // The group declares the union of its pieces. The cells span ±1.35; the
+        // fake shaper's one-character blocks are a unit wide, so they reach
+        // ±1.45, and its unit height takes the top to 0.5 and the index row's
+        // bottom to -1.5.
+        let declared = ctx.tree.get(group).unwrap().local_bounds.unwrap();
+        assert!((declared.x0 + 1.45).abs() < 1e-12, "{declared:?}");
+        assert!((declared.x1 - 1.45).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y0 + 1.5).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y1 - 0.5).abs() < 1e-12, "{declared:?}");
+    }
+
+    /// Pointers stack over a shared column, a highlighted cell is a wash, and
+    /// the caption sits under the lowest piece.
+    #[test]
+    fn pointers_stack_over_the_cell_they_name() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.algorithm","values":[5,3,8,1],"pointers":[["i",1],["j",2],["k",1]],"highlight":[1,2],"caption":"比较中","label":"数组"}"#,
+        )
+        .expect("a wire algorithm frame");
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &cmd);
+
+        // Group, twelve cell pieces, two per pointer, then the caption.
+        assert_eq!(diff.created.len(), 20, "{:?}", diff.created);
+
+        // `highlight` paints a translucent wash on exactly the named cells and
+        // leaves the others as outlines.
+        for index in 0..4 {
+            let m = ctx.tree.get(diff.created[1 + 3 * index]).unwrap();
+            let want = if index == 1 || index == 2 { 0.35 } else { 0.0 };
+            assert_eq!(m.style.fill_opacity, want, "cell {index}");
+        }
+
+        // Four columns at pitch 0.95, centred: -1.425, -0.475, 0.475, 1.425.
+        let column = |index: usize| (index as f64 - 1.5) * 0.95;
+        let caret = 0.8 * 0.22;
+        // `i` and `j` are the first pointer over their cells, so both carets
+        // stand one pointer gap above the cell top.
+        let tip = 0.4 + 0.12;
+        for (offset, (name, index)) in [("i", 1usize), ("j", 2usize)].into_iter().enumerate() {
+            let marker = diff.created[13 + 2 * offset];
+            let m = ctx.tree.get(marker).unwrap();
+            assert_eq!(m.kind, NodeKind::Unknown, "a caret is a decoration");
+            let bounds = ctx.tree.world_bounds(marker).unwrap();
+            assert!(
+                (bounds.center().x - column(index)).abs() < 1e-12,
+                "{bounds:?}"
+            );
+            assert!((bounds.y0 - tip).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.y1 - (tip + caret)).abs() < 1e-12, "{bounds:?}");
+            assert!((bounds.width() - 2.0 * caret).abs() < 1e-12, "{bounds:?}");
+
+            let label = diff.created[14 + 2 * offset];
+            let m = ctx.tree.get(label).unwrap();
+            assert_eq!(m.label.as_deref(), Some(name));
+            let bounds = ctx.tree.world_bounds(label).unwrap();
+            assert!(
+                (bounds.center().x - column(index)).abs() < 1e-12,
+                "{bounds:?}"
+            );
+            // A pointer's name clears its caret by half a gap.
+            assert!(
+                (bounds.y0 - (tip + caret + 0.06)).abs() < 1e-12,
+                "{bounds:?}"
+            );
+        }
+        // `k` shares cell 1 with `i`, so it stands above `i`'s name rather than
+        // on top of `i`'s caret.
+        let marker = diff.created[17];
+        let bounds = ctx.tree.world_bounds(marker).unwrap();
+        assert!((bounds.center().x - column(1)).abs() < 1e-12, "{bounds:?}");
+        let stacked_tip = tip + caret + 0.06 + 1.0 + 0.12;
+        assert!((bounds.y0 - stacked_tip).abs() < 1e-12, "{bounds:?}");
+        let bounds = ctx.tree.world_bounds(diff.created[18]).unwrap();
+        assert!((bounds.center().x - column(1)).abs() < 1e-12, "{bounds:?}");
+
+        // The caption hangs below the index row, and nothing else does.
+        let caption = diff.created[19];
+        assert_eq!(ctx.tree.get(caption).unwrap().label, None);
+        let bounds = ctx.tree.world_bounds(caption).unwrap();
+        assert!(
+            (bounds.center().y - (-1.5 - 0.35 - 0.5)).abs() < 1e-12,
+            "{bounds:?}"
+        );
+
+        // A cell is addressable by its own number, and a pointer by its name —
+        // exactly one node each, so neither lookup is ambiguous.
+        for (label, want) in [("格2", diff.created[7]), ("i", diff.created[14])] {
+            let set: Command = serde_json::from_str(&format!(
+                r#"{{"action":"set","target":"{label}","property":{{"name":"opacity","value":0.5}}}}"#
+            ))
+            .expect("a set by label");
+            let diff = applied(&mut ctx, &set);
+            assert_eq!(diff.modified, vec![want], "{label}");
+        }
+    }
+
+    /// Every refusal names its own field, and none of them leaves a node behind.
+    #[test]
+    fn an_algorithm_frame_refuses_before_creating_anything() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let before = ctx.tree.len();
+        for (json, field) in [
+            (r#"{"action":"explain.algorithm","values":[]}"#, "values"),
+            (
+                r#"{"action":"explain.algorithm","values":[1.0],"pointers":[[" ",0]]}"#,
+                "pointers",
+            ),
+            (
+                r#"{"action":"explain.algorithm","values":[1.0,2.0],"pointers":[["i",0],["i",1]]}"#,
+                "pointers",
+            ),
+            (
+                r#"{"action":"explain.algorithm","values":[1.0,2.0],"pointers":[["i",2]]}"#,
+                "pointers",
+            ),
+            (
+                r#"{"action":"explain.algorithm","values":[1.0,2.0],"highlight":[2]}"#,
+                "highlight",
+            ),
+            (
+                r#"{"action":"explain.algorithm","values":[1.0],"cell_size":0.0}"#,
+                "cell_size",
+            ),
+            (
+                r#"{"action":"explain.algorithm","values":[1.0],"caption":" "}"#,
+                "caption",
+            ),
+            (
+                r#"{"action":"explain.algorithm","values":[1.0],"caption_size":-2.0}"#,
+                "caption_size",
+            ),
+        ] {
+            let cmd: Command = serde_json::from_str(json).expect("a wire algorithm frame");
+            assert!(
+                matches!(
+                    ctx.handle(&cmd),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == field
+                ),
+                "{json} refused as the wrong field"
+            );
+            assert_eq!(ctx.tree.len(), before, "{json} left nodes behind");
+        }
+
+        // The caps and the non-finite spellings have no convenient JSON
+        // spelling, so these are built directly.
+        assert!(matches!(
+            ctx.handle(&Command::ExplainAlgorithm {
+                values: vec![1.0; 33],
+                pointers: None,
+                highlight: None,
+                cell_size: None,
+                color: None,
+                position: None,
+                caption: None,
+                caption_size: None,
+                label: None,
+            }),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "values"
+        ));
+        for bad in [f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                ctx.handle(&Command::ExplainAlgorithm {
+                    values: vec![1.0, bad],
+                    pointers: None,
+                    highlight: None,
+                    cell_size: None,
+                    color: None,
+                    position: None,
+                    caption: None,
+                    caption_size: None,
+                    label: None,
+                }),
+                Err(CommandError::OutOfRange { ref property, .. }) if property == "values"
+            ));
+        }
+        assert!(matches!(
+            ctx.handle(&Command::ExplainAlgorithm {
+                values: vec![1.0],
+                pointers: Some((0..17).map(|i| (format!("p{i}"), 0)).collect()),
+                highlight: None,
+                cell_size: None,
+                color: None,
+                position: None,
+                caption: None,
+                caption_size: None,
+                label: None,
+            }),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "pointers"
+        ));
+        assert!(matches!(
+            ctx.handle(&Command::ExplainAlgorithm {
+                values: vec![1.0],
+                pointers: None,
+                highlight: Some(vec![0; 33]),
+                cell_size: None,
+                color: None,
+                position: None,
+                caption: None,
+                caption_size: None,
+                label: None,
+            }),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "highlight"
+        ));
+        assert!(matches!(
+            ctx.handle(&Command::ExplainAlgorithm {
+                values: vec![1.0],
+                pointers: None,
+                highlight: None,
+                cell_size: None,
+                color: None,
+                position: Some([0.0, f64::INFINITY]),
+                caption: None,
+                caption_size: None,
+                label: None,
+            }),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "position"
+        ));
+        assert_eq!(ctx.tree.len(), before);
+    }
+
+    /// Every value is typeset, so a build with no typesetter refuses the frame
+    /// rather than drawing empty cells.
+    #[test]
+    fn an_algorithm_frame_needs_a_text_typesetter() {
+        let mut ctx = scene();
+        let before = ctx.tree.len();
+        let cmd: Command =
+            serde_json::from_str(r#"{"action":"explain.algorithm","values":[1.0,2.0,3.0]}"#)
+                .expect("a wire algorithm frame");
+        assert!(matches!(
+            ctx.handle(&cmd),
+            Err(CommandError::Unsupported { ref feature }) if feature == "text"
+        ));
+        assert_eq!(ctx.tree.len(), before);
+    }
+
+    /// A typesetter that fails after some cells are in the tree rolls the whole
+    /// frame back.
+    #[test]
+    fn a_failed_value_rolls_the_algorithm_frame_back() {
+        let mut ctx = with_typesetter(FakeTypesetter {
+            refuse: Some(TypesetError::failed("assets/fonts is missing")),
+            ..FakeTypesetter::both()
+        });
+        let before = ctx.tree.len();
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.algorithm","values":[1.0,2.0],"pointers":[["i",0]],"caption":"图"}"#,
+        )
+        .expect("a wire algorithm frame");
+        assert!(matches!(
+            ctx.handle(&cmd),
+            Err(CommandError::Typeset { .. })
+        ));
+        assert_eq!(ctx.tree.len(), before, "a refused frame left pieces behind");
     }
 
     fn camera_cmd(center: Option<[f64; 2]>, zoom: Option<f64>, duration: Option<f64>) -> Command {

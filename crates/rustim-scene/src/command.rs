@@ -563,6 +563,59 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// Show one frame of an algorithm's state: a row of numbered cells, with
+    /// named pointers under chosen ones.
+    ///
+    /// The sixth and last `explain.*` template, and the picture an algorithm
+    /// trace is made of: a one-dimensional array drawn as boxes with a zero-based
+    /// index row beneath, optional highlighted cells, and optional **named
+    /// pointers** (`i`, `j`, `low`, `high`) standing under the cells they name.
+    /// A lecture is a sequence of these, one per step, each with different
+    /// pointers — the template owns the layout so the step does not have to.
+    ///
+    /// `values` is 1..=32 finite numbers; a zero value is a legitimate cell
+    /// (unlike a bar, there is no "invisible" cell here). `pointers` is a list of
+    /// `[name, index]` pairs — at most 16, names non-blank and distinct, indices
+    /// inside the array — drawn as a small caret under the cell with the name
+    /// beneath it; two pointers at the same index stack vertically. `highlight`
+    /// lists the cells painted in `color` (default: the foreground).
+    ///
+    /// `cell_size` is each box's side in world units (default 0.8); the value and
+    /// index text sizes are derived from it, so one number resizes the whole
+    /// tableau. **The row is centred on `position`**, and the index row, the
+    /// pointers and the caption hang below it.
+    ///
+    /// The reply's `created` is `[group, cell…, value…, index…, (pointer caret,
+    /// pointer name)…, caption?]`, all rows in index order. Each cell is labelled
+    /// `格<i>`, so `set target "格2"` paints the third box, while the value texts
+    /// are labelled by their own text (repeated values are `ambiguous_label`, the
+    /// rule every template's labels follow) and the index labels carry no label.
+    /// Pointer names are their own labels.
+    ///
+    /// The values and the indices are typeset, so the template needs a text
+    /// typesetter; without one it refuses with [`CommandError::Unsupported`]
+    /// under `text` before anything is inserted. Answered by
+    /// [`crate::SceneContext::handle`].
+    #[serde(rename = "explain.algorithm")]
+    ExplainAlgorithm {
+        values: Vec<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pointers: Option<Vec<(String, u32)>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        highlight: Option<Vec<u32>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<[u8; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Dim everything but an object for a moment, then bring it back.
     ///
     /// The attention helper a spoken explanation needs and `point_at` does not
@@ -903,6 +956,7 @@ pub const ACTIONS: &[&str] = &[
     "camera",
     "checkpoint",
     "events",
+    "explain.algorithm",
     "explain.chart",
     "explain.equation",
     "explain.geometry",
@@ -947,6 +1001,7 @@ impl Command {
             Self::Fit { .. } => "fit",
             Self::PointAt { .. } => "point_at",
             Self::Annotate { .. } => "annotate",
+            Self::ExplainAlgorithm { .. } => "explain.algorithm",
             Self::ExplainChart { .. } => "explain.chart",
             Self::ExplainEquation { .. } => "explain.equation",
             Self::ExplainGeometry { .. } => "explain.geometry",
@@ -2223,6 +2278,11 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // Answered by `SceneContext::handle`: a template compiles a formula
             // and typesets a caption, and `apply` may not read fonts.
         }
+        Command::ExplainAlgorithm { .. } => {
+            // Answered by `SceneContext::handle`: every cell value, index and
+            // pointer name is typeset, so there is no frame `apply` could build
+            // without fonts.
+        }
         Command::ExplainChart { .. } => {
             // Answered by `SceneContext::handle`: the axis ticks, the category
             // labels and the value labels are all typeset, and `apply` may not
@@ -3118,6 +3178,12 @@ mod tests {
             // is a plain switch — an absent one must not come back as `false`.
             r#"{"action":"explain.chart","categories":["一","二","三"],"values":[3.0,5.0,2.0],"value_range":[0.0,6.0],"step":2.0,"width":7.0,"height":4.0,"show_values":true,"color":[100,181,246],"position":[0.0,0.5],"caption":"各季度销量","caption_size":0.5,"label":"柱状图"}"#.to_owned(),
             r#"{"action":"explain.chart","categories":["甲","乙"],"values":[1.0,-2.0]}"#.to_owned(),
+            // The fifth template: a full algorithm frame, then the minimal
+            // spelling. `pointers` is a list of `[name, index]` pairs — a tuple
+            // on the wire, an array in JSON — and the indices are `u32`, so the
+            // fixture writes `1` rather than `1.0`.
+            r#"{"action":"explain.algorithm","values":[5.0,3.0,8.0,1.0],"pointers":[["i",1],["j",2]],"highlight":[1,2],"cell_size":0.8,"color":[100,181,246],"position":[0.0,0.5],"caption":"冒泡排序","caption_size":0.5,"label":"数组"}"#.to_owned(),
+            r#"{"action":"explain.algorithm","values":[1.0]}"#.to_owned(),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for json in cases {
@@ -3204,6 +3270,17 @@ mod tests {
                 position: None,
                 scale: None,
                 color: None,
+                caption: None,
+                caption_size: None,
+                label: None,
+            },
+            Command::ExplainAlgorithm {
+                values: vec![5.0, 3.0, 8.0],
+                pointers: Some(vec![("i".to_owned(), 1)]),
+                highlight: Some(vec![1]),
+                cell_size: None,
+                color: None,
+                position: None,
                 caption: None,
                 caption_size: None,
                 label: None,
