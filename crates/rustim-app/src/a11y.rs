@@ -19,7 +19,7 @@
 //! Everything with logic in it therefore lives in [`A11yCore`]: the focus, the
 //! announcement throttle, the action translation, and the projection to a
 //! `TreeUpdate`. `A11y` is a wrapper that holds the adapter and forwards. The
-//! split is what makes `to_update` and `on_action` reachable from
+//! split is what makes `full_update` and `on_action` reachable from
 //! `cargo test --workspace`, which is the whole reason the crate grew a library
 //! target.
 //!
@@ -36,14 +36,22 @@
 //!   announcement node must **not** be a `Label`, and a text object must put its
 //!   text in `value`. `set_label` on a `Role::Label` node is silently ignored on
 //!   macOS and Windows alike.
-//! - **`Adapter::with_event_loop_proxy` cannot return an initial tree**, so
-//!   every update must be a *complete snapshot*. Affordable at this scene size,
-//!   and not at ten thousand nodes; see [`A11y::update`].
+//! - **`Adapter::with_event_loop_proxy` cannot return an initial tree**, so the
+//!   *first* update a consumer receives has to be a complete snapshot
+//!   (`tree: Some(..)`). Every later one is a difference from it, and the two
+//!   reset points that make that safe are `InitialTreeRequested` and
+//!   `AccessibilityDeactivated`; see [`A11yCore::invalidate`].
 //! - **`update_if_active`'s closure is not called at all when no assistive
 //!   technology is listening** — all three backends return before invoking it in
-//!   their inactive arm. The zero-overhead claim is structural, which is why
-//!   rebuilding the whole tree per frame is acceptable here rather than merely
-//!   tolerable.
+//!   their inactive arm. So the projection and the diff cost nothing unattached,
+//!   and the push counters read zero, which is correct rather than broken.
+//! - **An incremental update must satisfy the consumer's relationship rules**,
+//!   not merely look complete: a node's parent must arrive in the same update
+//!   when a child is added or removed, a removed node must not be named, and
+//!   `focus` must be present every time and must still exist. [`A11yCore::to_update`]
+//!   states the rules, and the tests replay every update through
+//!   `accesskit_consumer` — the implementation the platform backends themselves
+//!   use — because no assertion over our own `TreeUpdate` can prove them.
 //!
 //! # Focus: why the app announces it and an AT does not
 //!
@@ -116,6 +124,22 @@ pub struct A11yCore {
     live: String,
     announcer: Announcer,
     focus: FocusState,
+    /// The exact tree last handed to a backend, and the window title that went
+    /// with it. `None` means the next update must be a **full** one: nothing has
+    /// been sent yet, or [`A11yCore::invalidate`] has declared whatever was sent
+    /// no longer applies.
+    sent: Option<Sent>,
+    /// How many updates of each kind have gone out. They count inside the
+    /// adapter's `update_if_active` closure, so with no assistive technology
+    /// attached both stay at zero — which is the correct reading, not a bug.
+    full_pushes: usize,
+    incremental_pushes: usize,
+}
+
+/// One snapshot that reached a backend, kept only to be diffed against.
+struct Sent {
+    tree: SemanticTree,
+    title: String,
 }
 
 impl Default for A11yCore {
@@ -130,7 +154,32 @@ impl A11yCore {
             live: String::new(),
             announcer: Announcer::new(),
             focus: FocusState::new(),
+            sent: None,
+            full_pushes: 0,
+            incremental_pushes: 0,
         }
+    }
+
+    /// Forget what was last sent, so the next update is a complete snapshot.
+    ///
+    /// Required when the platform may have dropped our tree — it activates a
+    /// fresh observer, or a deactivation/reactivation cycle replaced its state —
+    /// because an incremental update describes a *difference from what the
+    /// consumer holds*, and after a reset it holds nothing. `main` calls this on
+    /// `InitialTreeRequested` and `AccessibilityDeactivated`; see the notes at
+    /// those sites for why winit lets that ordering be trusted.
+    pub fn invalidate(&mut self) {
+        self.sent = None;
+    }
+
+    /// How many complete snapshots have been handed to a backend.
+    pub fn full_pushes(&self) -> usize {
+        self.full_pushes
+    }
+
+    /// How many updates carried only what changed.
+    pub fn incremental_pushes(&self) -> usize {
+        self.incremental_pushes
     }
 
     /// The focused node, if the keyboard or an AT has put it somewhere.
@@ -166,17 +215,69 @@ impl A11yCore {
         self.announcer.offer(text);
     }
 
-    /// Project the scene into an AccessKit update.
+    /// Project the scene into an AccessKit update — complete the first time,
+    /// differential afterwards.
     ///
     /// Takes the context as an argument rather than holding it, so the borrow of
     /// `self` and the borrow the adapter needs stay separate.
-    pub fn to_update(&self, ctx: &SceneContext, title: &str) -> TreeUpdate {
+    ///
+    /// # What a differential update may and may not say
+    ///
+    /// AccessKit applies an update to the tree the consumer already holds, so
+    /// the rules are about *relationships*, not about the picture:
+    ///
+    /// - a node is resent only when its semantic data changed, which includes its
+    ///   `children` list — so a child added, removed or reordered necessarily
+    ///   brings its parent along in the same update;
+    /// - a removed node is never named, only dropped from its parent's new
+    ///   children list;
+    /// - `focus` is sent on **every** update, because the consumer validates it
+    ///   against the tree it holds, and a focus left over from a node the scene
+    ///   has since deleted would be refused — hence the release below, which
+    ///   happens *before* projection;
+    /// - the window node carries the title and the top-level children, so it is
+    ///   resent when either changes;
+    /// - the live region is resent when its text changes, including when it
+    ///   changes *to nothing* (an empty label, not an omission — omitting it
+    ///   would leave the old announcement spoken forever).
+    ///
+    /// The saving is real for a still scene and for small edits, and it is not
+    /// much for a camera move: every node's pixel bounds change, so every node
+    /// is resent. That is the honest boundary — this optimises *semantic* change,
+    /// not motion.
+    pub fn to_update(&mut self, ctx: &SceneContext, title: &str) -> TreeUpdate {
+        // A focus on a node the scene has deleted has to be given up here. The
+        // keyboard and the assistive technology only resync on their own events,
+        // and a `FadeOut` can remove the focused node while nobody is pressing
+        // anything; leaving the id in place makes the consumer's global
+        // validation reject the whole update.
+        if let Some(id) = self.focus.focused()
+            && ctx.tree.get(id).is_none()
+        {
+            self.focus = FocusState::new();
+        }
         let live = if self.live.is_empty() {
             None
         } else {
             Some(self.live.clone())
         };
-        to_update(&ctx.semantic_tree(live), title, self.focus.focused())
+        let semantic = ctx.semantic_tree(live);
+
+        let update = match self.sent.take() {
+            None => {
+                self.full_pushes += 1;
+                full_update(&semantic, title, self.focus.focused())
+            }
+            Some(prev) => {
+                self.incremental_pushes += 1;
+                incremental_update(&prev, &semantic, title, self.focus.focused())
+            }
+        };
+        self.sent = Some(Sent {
+            tree: semantic,
+            title: title.to_string(),
+        });
+        update
     }
 
     // -----------------------------------------------------------------------
@@ -331,46 +432,22 @@ impl Narrator for LiveSink<'_> {
     }
 }
 
-/// Project a [`SemanticTree`] into an AccessKit update.
+/// Project a [`SemanticTree`] into a **complete** AccessKit update.
 ///
 /// Pure and total: the one part of this module that was testable even before the
 /// core was split out, which is why it is a free function rather than a method.
-pub fn to_update(s: &SemanticTree, title: &str, focused: Option<NodeId>) -> TreeUpdate {
-    // The semantic tree's own root is a container that exists to hold the
-    // scene's top-level objects; AccessKit's root is the *window*, so the window
-    // node takes over that role and the semantic root is not emitted. Its
-    // children list is what says which objects belong at the top.
-    let root_children: Vec<AkNodeId> = s
-        .nodes
-        .iter()
-        .find(|n| n.id == s.root)
-        .map(|n| n.children.iter().map(|c| AkNodeId(c.raw())).collect())
-        .unwrap_or_default();
-
-    let mut root = Node::new(Role::Window);
-    root.set_label(title.to_string());
-    root.set_children(
-        root_children
-            .into_iter()
-            .chain(std::iter::once(LIVE_NODE))
-            .collect::<Vec<_>>(),
-    );
-
-    let mut nodes: Vec<(AkNodeId, Node)> = Vec::with_capacity(s.nodes.len() + 1);
-    nodes.push((ROOT_NODE, root));
-
+/// This is the update that carries `tree: Some(..)` — the first one after a
+/// consumer attaches, and the one after [`A11yCore::invalidate`].
+pub fn full_update(s: &SemanticTree, title: &str, focused: Option<NodeId>) -> TreeUpdate {
+    let mut nodes: Vec<(AkNodeId, Node)> = Vec::with_capacity(s.nodes.len() + 2);
+    nodes.push((ROOT_NODE, window_node(s, title)));
     for n in s.nodes.iter().filter(|n| n.id != s.root) {
         nodes.push((AkNodeId(n.id.raw()), node_of(n)));
     }
-
     // Always present, even with nothing to say: a live region that appears and
     // disappears generates a node-added event, which on macOS speaks the label —
     // an announcement nobody asked for, at startup.
-    let mut live = Node::new(Role::Status);
-    live.set_live(Live::Polite);
-    live.set_live_atomic();
-    live.set_label(s.live.clone().unwrap_or_default());
-    nodes.push((LIVE_NODE, live));
+    nodes.push((LIVE_NODE, live_node(s)));
 
     TreeUpdate {
         nodes,
@@ -380,7 +457,93 @@ pub fn to_update(s: &SemanticTree, title: &str, focused: Option<NodeId>) -> Tree
             toolkit_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }),
         tree_id: TreeId::ROOT,
-        focus: focused.map_or(ROOT_NODE, |f| AkNodeId(f.raw())),
+        focus: focus_of(focused),
+    }
+}
+
+/// The AccessKit node id the update should focus.
+fn focus_of(focused: Option<NodeId>) -> AkNodeId {
+    focused.map_or(ROOT_NODE, |f| AkNodeId(f.raw()))
+}
+
+/// The ids the semantic tree's own root holds, in draw order.
+///
+/// The semantic root is a container, not a node: AccessKit's root is the
+/// *window*, so the window node takes over its role and its children are what
+/// says which objects belong at the top.
+fn top_children(s: &SemanticTree) -> Vec<NodeId> {
+    s.nodes
+        .iter()
+        .find(|n| n.id == s.root)
+        .map(|n| n.children.clone())
+        .unwrap_or_default()
+}
+
+/// The window node: title, top-level objects, and the live region last.
+fn window_node(s: &SemanticTree, title: &str) -> Node {
+    let mut root = Node::new(Role::Window);
+    root.set_label(title.to_string());
+    root.set_children(
+        top_children(s)
+            .into_iter()
+            .map(|c| AkNodeId(c.raw()))
+            .chain(std::iter::once(LIVE_NODE))
+            .collect::<Vec<_>>(),
+    );
+    root
+}
+
+/// The announcement node, which carries the live text or an empty label.
+fn live_node(s: &SemanticTree) -> Node {
+    let mut live = Node::new(Role::Status);
+    live.set_live(Live::Polite);
+    live.set_live_atomic();
+    live.set_label(s.live.clone().unwrap_or_default());
+    live
+}
+
+/// The difference between the last snapshot a backend received and this one.
+///
+/// Rules, in the order they matter — see [`A11yCore::to_update`] for why:
+/// changed nodes only; parents ride along because a changed `children` list is
+/// a change; the window node on a title or top-level change; the live region on
+/// a text change; and `focus` every time.
+fn incremental_update(
+    prev: &Sent,
+    s: &SemanticTree,
+    title: &str,
+    focused: Option<NodeId>,
+) -> TreeUpdate {
+    let mut nodes = Vec::new();
+
+    if top_children(&prev.tree) != top_children(s) || prev.title != title {
+        nodes.push((ROOT_NODE, window_node(s, title)));
+    }
+    if prev.tree.live != s.live {
+        // Some(text) → None has to write an *empty* label. Omitting the node
+        // would leave the consumer holding the old announcement.
+        nodes.push((LIVE_NODE, live_node(s)));
+    }
+
+    // A node the previous snapshot did not have, or one whose semantic data
+    // (including children, bounds and hidden) moved. One hash of the old
+    // snapshot: this runs once per frame while an AT is attached, and a scan per
+    // node would make it quadratic for no gain.
+    let old: std::collections::HashMap<u64, &SemanticNode> =
+        prev.tree.nodes.iter().map(|n| (n.id.raw(), n)).collect();
+    for n in s.nodes.iter().filter(|n| n.id != s.root) {
+        if old.get(&n.id.raw()) != Some(&n) {
+            nodes.push((AkNodeId(n.id.raw()), node_of(n)));
+        }
+    }
+
+    TreeUpdate {
+        nodes,
+        // `None` is the statement "apply this to what you have". The consumer
+        // keeps the tree it was given by the last complete update.
+        tree: None,
+        tree_id: TreeId::ROOT,
+        focus: focus_of(focused),
     }
 }
 
@@ -505,27 +668,37 @@ impl A11y {
         self.core.focused()
     }
 
-    /// Push the whole tree, and release any announcement that is due.
+    /// Push the update, and release any announcement that is due.
     ///
     /// Call once per frame, **before** `request_redraw` — the tree that goes out
     /// has to describe the state that was just rendered, and the initial-tree
     /// request can arrive before any frame at all, so it is routed through this
     /// same path rather than answered separately.
     ///
-    /// The tree is rebuilt in full every time because the winit adapter, built
-    /// with an event-loop proxy, cannot hand back a synchronous initial tree: its
-    /// documentation requires a complete snapshot on every update. At the
-    /// reference scene's four nodes that costs nothing. The point at which it
-    /// stops being true is a few hundred nodes, and the fix then is to send only
-    /// the nodes [`rustim_mobject`]'s dirty flags marked, plus their parents.
+    /// The first update after construction (and after [`Self::invalidate`]) is a
+    /// complete snapshot, because the winit adapter, built with an event-loop
+    /// proxy, cannot hand back a synchronous initial tree. Every later one sends
+    /// only what changed — see [`A11yCore::to_update`] for the rules and
+    /// [`A11yCore::invalidate`] for when the difference is no longer meaningful.
+    ///
+    /// The closure runs only while an assistive technology is attached, so an
+    /// unattached app builds no update at all; the push counters are incremented
+    /// inside it for exactly that reason.
     pub fn update(&mut self, ctx: &SceneContext, now: Instant) {
         self.core.flush(now);
         let title = self.title.clone();
-        // `&mut self.adapter` and `&self.core` are disjoint fields, so the
+        // `&mut self.adapter` and `&mut self.core` are disjoint fields, so the
         // closure can borrow the core while the adapter is borrowed mutably.
         let adapter = &mut self.adapter;
-        let core = &self.core;
+        let core = &mut self.core;
         adapter.update_if_active(|| core.to_update(ctx, &title));
+    }
+
+    /// Declare the backend's copy of the tree unusable; the next update is full.
+    ///
+    /// Forwarded from [`A11yCore::invalidate`], where the reason lives.
+    pub fn invalidate(&mut self) {
+        self.core.invalidate();
     }
 }
 
@@ -551,7 +724,7 @@ mod tests {
     }
 
     fn update_of(ctx: &SceneContext, live: Option<String>) -> TreeUpdate {
-        to_update(&ctx.semantic_tree(live), "rustim — 勾股定理", None)
+        full_update(&ctx.semantic_tree(live), "rustim — 勾股定理", None)
     }
 
     fn find(u: &TreeUpdate, id: AkNodeId) -> &Node {
@@ -665,7 +838,7 @@ mod tests {
         let ctx = ctx();
         assert_eq!(update_of(&ctx, None).focus, ROOT_NODE);
         let id = ctx.root_ids()[0];
-        let u = to_update(&ctx.semantic_tree(None), "t", Some(id));
+        let u = full_update(&ctx.semantic_tree(None), "t", Some(id));
         assert_eq!(u.focus, AkNodeId(id.raw()));
     }
 
@@ -857,5 +1030,238 @@ mod tests {
             data: None,
         };
         assert_eq!(core.on_action(&request, &ctx), None, "nothing focused");
+    }
+
+    // -----------------------------------------------------------------------
+    // Incremental updates, validated by a real consumer
+    // -----------------------------------------------------------------------
+    //
+    // An update is only meaningful relative to the tree a platform is holding,
+    // so these tests hand each `TreeUpdate` to `accesskit_consumer` — the same
+    // crate the platform backends use — and let *it* decide whether the update
+    // is well formed. Asserting over our own node list cannot catch the failure
+    // mode that matters: a legal-looking update that describes the wrong tree.
+
+    use accesskit_consumer::{FullNodeId, NodeRef, Tree as ConsumerTree, TreeChangeHandler};
+
+    /// A consumer-side record of what one update changed.
+    #[derive(Debug, Default)]
+    struct Changes {
+        added: Vec<AkNodeId>,
+        updated: Vec<AkNodeId>,
+        removed: Vec<AkNodeId>,
+    }
+
+    /// The local part of a consumer id (the tree index is packed into the high
+    /// half, and there is one tree).
+    fn local(id: FullNodeId) -> AkNodeId {
+        AkNodeId((u128::from(id) >> 64) as u64)
+    }
+
+    impl TreeChangeHandler for Changes {
+        fn node_added(&mut self, node: &NodeRef) {
+            self.added.push(local(node.id()));
+        }
+        fn node_updated(&mut self, _: &NodeRef, node: &NodeRef) {
+            self.updated.push(local(node.id()));
+        }
+        fn focus_moved(&mut self, _: Option<&NodeRef>, _: Option<&NodeRef>) {}
+        fn node_removed(&mut self, node: &NodeRef) {
+            self.removed.push(local(node.id()));
+        }
+    }
+
+    /// A consumer seeded with the first update the core produces.
+    fn consumer(ctx: &SceneContext, core: &mut A11yCore) -> ConsumerTree {
+        let first = core.to_update(ctx, "t");
+        assert!(first.tree.is_some(), "the first update must be complete");
+        ConsumerTree::new(first, false)
+    }
+
+    fn apply(consumer: &mut ConsumerTree, update: TreeUpdate) -> Changes {
+        let mut changes = Changes::default();
+        consumer.update_and_process_changes(update, &mut changes);
+        changes
+    }
+
+    fn has(consumer: &ConsumerTree, id: AkNodeId) -> bool {
+        consumer
+            .state()
+            .node_by_tree_local_id(id, TreeId::ROOT)
+            .is_some()
+    }
+
+    #[test]
+    fn an_unchanged_scene_sends_nothing_but_the_focus() {
+        let ctx = ctx();
+        let mut core = A11yCore::new();
+        let mut consumer = consumer(&ctx, &mut core);
+
+        let update = core.to_update(&ctx, "t");
+        assert!(update.tree.is_none(), "a difference, not a snapshot");
+        assert!(update.nodes.is_empty(), "nothing changed");
+        assert_eq!(update.focus, ROOT_NODE);
+        let changes = apply(&mut consumer, update);
+        assert!(
+            changes.added.is_empty() && changes.updated.is_empty() && changes.removed.is_empty()
+        );
+        assert_eq!((core.full_pushes(), core.incremental_pushes()), (1, 1));
+    }
+
+    #[test]
+    fn a_new_object_reaches_the_consumer() {
+        let mut ctx = ctx();
+        let mut core = A11yCore::new();
+        let mut consumer = consumer(&ctx, &mut core);
+
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Circle,
+            &ShapeParams::default(),
+        ));
+        let update = core.to_update(&ctx, "t");
+        let names: Vec<AkNodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+        assert!(
+            names.contains(&ROOT_NODE),
+            "the new node's parent has to ride along: {names:?}"
+        );
+        assert!(names.contains(&AkNodeId(id.raw())));
+        let changes = apply(&mut consumer, update);
+        assert!(changes.added.contains(&AkNodeId(id.raw())));
+        assert!(has(&consumer, AkNodeId(id.raw())));
+    }
+
+    #[test]
+    fn a_removed_object_leaves_the_consumer_and_is_never_named() {
+        let mut ctx = ctx();
+        let doomed = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Circle,
+            &ShapeParams::default(),
+        ));
+        let mut core = A11yCore::new();
+        let mut consumer = consumer(&ctx, &mut core);
+        assert!(has(&consumer, AkNodeId(doomed.raw())));
+
+        ctx.tree.remove_subtree(doomed);
+        let update = core.to_update(&ctx, "t");
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(id, _)| *id == AkNodeId(doomed.raw())),
+            "a removed node must not appear in the update"
+        );
+        let changes = apply(&mut consumer, update);
+        assert!(changes.removed.contains(&AkNodeId(doomed.raw())));
+        assert!(!has(&consumer, AkNodeId(doomed.raw())));
+    }
+
+    /// The panic regression: a `FadeOut` can delete the focused node while the
+    /// keyboard and the AT are both idle, so nothing else would ever resync the
+    /// focus. The consumer validates `focus` against the tree it holds and
+    /// rejects an update that names a node it has just been told is gone.
+    #[test]
+    fn removing_the_focused_node_releases_the_focus() {
+        let mut ctx = ctx();
+        let id = ctx.root_ids()[0];
+        let mut core = A11yCore::new();
+        let mut consumer = consumer(&ctx, &mut core);
+        core.focus_on(id, &ctx);
+        let _ = apply(&mut consumer, core.to_update(&ctx, "t"));
+
+        ctx.tree.remove_subtree(id);
+        assert_eq!(core.focused(), Some(id), "nothing has resynced yet");
+        let update = core.to_update(&ctx, "t");
+        assert_eq!(core.focused(), None, "the projection gives the focus up");
+        assert_eq!(update.focus, ROOT_NODE);
+        apply(&mut consumer, update);
+    }
+
+    #[test]
+    fn invalidating_forces_a_complete_snapshot() {
+        let ctx = ctx();
+        let mut core = A11yCore::new();
+        let mut consumer = consumer(&ctx, &mut core);
+        let _ = apply(&mut consumer, core.to_update(&ctx, "t"));
+
+        core.invalidate();
+        let update = core.to_update(&ctx, "t");
+        assert!(update.tree.is_some(), "a full update after invalidation");
+        assert!(
+            update.nodes.len() > ctx.tree.len(),
+            "every scene node has to be present, not just the changed ones"
+        );
+        apply(&mut consumer, update);
+        assert_eq!((core.full_pushes(), core.incremental_pushes()), (2, 1));
+    }
+
+    #[test]
+    fn a_title_change_resends_only_the_window() {
+        let ctx = ctx();
+        let mut core = A11yCore::new();
+        let mut consumer = consumer(&ctx, &mut core);
+
+        let update = core.to_update(&ctx, "另一首");
+        assert_eq!(update.nodes.len(), 1, "the window, and nothing else");
+        assert_eq!(update.nodes[0].0, ROOT_NODE);
+        assert_eq!(update.nodes[0].1.label(), Some("另一首"));
+        apply(&mut consumer, update);
+        assert_eq!(
+            consumer.state().root().label().as_deref(),
+            Some("另一首"),
+            "the consumer took the new title"
+        );
+    }
+
+    #[test]
+    fn a_cleared_announcement_is_resent_as_an_empty_label() {
+        let ctx = ctx();
+        let mut core = A11yCore::new();
+        let mut consumer = consumer(&ctx, &mut core);
+
+        core.offer("说过的");
+        core.flush(Instant::now());
+        let _ = apply(&mut consumer, core.to_update(&ctx, "t"));
+
+        // Some → None: the live node must be present with an empty label.
+        // Omitting it would leave the old announcement on the consumer forever.
+        core.live.clear();
+        let update = core.to_update(&ctx, "t");
+        let live = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == LIVE_NODE)
+            .map(|(_, n)| n)
+            .expect("the live node is resent when its text goes away");
+        assert_eq!(live.label(), Some(""));
+        apply(&mut consumer, update);
+    }
+
+    #[test]
+    fn a_reparent_lands_on_the_consumer() {
+        let mut ctx = ctx();
+        let parent = ctx.root_ids()[0];
+        let child = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Circle,
+            &ShapeParams::default(),
+        ));
+        let mut core = A11yCore::new();
+        let mut consumer = consumer(&ctx, &mut core);
+
+        assert!(ctx.tree.reparent(child, parent));
+        let update = core.to_update(&ctx, "t");
+        let names: Vec<AkNodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+        assert!(names.contains(&ROOT_NODE), "the old parent lost a child");
+        assert!(
+            names.contains(&AkNodeId(parent.raw())),
+            "the new parent gained one"
+        );
+        apply(&mut consumer, update);
+
+        let node = consumer
+            .state()
+            .node_by_tree_local_id(AkNodeId(parent.raw()), TreeId::ROOT)
+            .expect("the parent");
+        let children: Vec<AkNodeId> = node.children().map(|c| local(c.id())).collect();
+        assert_eq!(children, vec![AkNodeId(child.raw())]);
     }
 }

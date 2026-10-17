@@ -3132,6 +3132,7 @@ name = "rustim-app"
 version = "0.0.0"
 dependencies = [
  "accesskit",
+ "accesskit_consumer",
  "accesskit_winit",
  "rustim-anim",
  "rustim-color",

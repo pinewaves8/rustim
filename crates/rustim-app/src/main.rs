@@ -1637,9 +1637,18 @@ impl ApplicationHandler<AppEvent> for App {
                     // Routed through the ordinary frame path rather than answered
                     // here. The adapter was built with an event-loop proxy, so it
                     // cannot take a synchronous initial tree; the answer has to be
-                    // the next frame's full snapshot, and `a11y.update` runs before
+                    // the next frame's snapshot, and `a11y.update` runs before
                     // `request_redraw` in that frame, which is what guarantees the
                     // snapshot describes the state that is on screen.
+                    //
+                    // It also has to be a **full** snapshot: a consumer asking for
+                    // an initial tree has just attached and holds nothing, and an
+                    // incremental update describes a difference from a tree it
+                    // does not have. The request is drained before the redraw it
+                    // triggers, so the invalidation cannot miss the frame.
+                    if let Some(w) = self.windowed.as_mut() {
+                        w.a11y.invalidate();
+                    }
                     self.request_redraw();
                 }
                 accesskit_winit::WindowEvent::ActionRequested(req) => {
@@ -1659,9 +1668,17 @@ impl ApplicationHandler<AppEvent> for App {
                         None => {}
                     }
                 }
-                // Nothing to do: the next `update` is a full snapshot anyway, and
-                // `update_if_active` will not even build one while inactive.
-                accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+                // The platform is dropping our tree, so whatever was sent is no
+                // longer held by anyone. The next attachment starts from an
+                // `InitialTreeRequested` (which invalidates too), but doing it
+                // here as well is what makes the two events independent: neither
+                // can leave an incremental update describing a tree the consumer
+                // never received.
+                accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                    if let Some(w) = self.windowed.as_mut() {
+                        w.a11y.invalidate();
+                    }
+                }
             },
             AppEvent::Command { seq, line } => {
                 // Queued, not applied: this runs on the event loop's thread but

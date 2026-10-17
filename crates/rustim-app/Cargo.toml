@@ -29,3 +29,13 @@ accesskit_winit.workspace = true
 # JSON, because on a machine with no screen reader and no AT-SPI session bus a
 # file is the only way to see what the accessibility layer would say.
 serde_json.workspace = true
+
+[dev-dependencies]
+# It is the *consumer* of an AccessKit update — it validates that an incremental
+# update is well formed against the tree a platform would be holding, which is
+# exactly the property "send only what changed" can break and which no assertion
+# over our own `TreeUpdate` can check. It is already in the Linux graph through
+# `accesskit_unix` (the AT-SPI backend builds on it), so this line adds no crate;
+# it only puts the same implementation in scope for our tests, so the suite
+# validates against the code a platform backend actually runs.
+accesskit_consumer = "0.39"
