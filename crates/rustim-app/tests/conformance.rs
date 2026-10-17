@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (31 actions, 12 shapes, 11 animations, 10
+//!    the build actually has (32 actions, 12 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -118,9 +118,11 @@ fn expect_diff(client: &mut StdioClient, line: &str) -> rustim_scene::command::S
     );
     let Some(diff) = reply.diff else {
         panic!(
-            "{line} was not answered with a diff (reply seq {}, tree {}, capabilities {})",
+            "{line} was not answered with a diff (reply seq {}, tree {}, report {}, \
+             capabilities {})",
             reply.seq,
             reply.tree.is_some(),
+            reply.report.is_some(),
             reply.capabilities.is_some()
         );
     };
@@ -155,7 +157,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 31, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 32, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -311,6 +313,87 @@ fn batch_and_validate_answer_through_the_wire() {
         .expect("a refusal is a reply");
     let error = reply.error.expect("a query cannot live in a list");
     assert!(format!("{error}").contains("commands[0]"), "{error}");
+
+    finish(client, &png);
+}
+
+/// The linter is the third read on the wire, and the one a model needs most:
+/// it answers with a `report` — not a diff, not a tree — and the report names
+/// what it measured, node included.
+///
+/// The three findings this pins are the three kinds the linter has to keep
+/// apart: a clean frame (an empty list in a *present* field), a geometry
+/// finding that names a node, and a timeline finding that has no node to name.
+#[test]
+fn check_reports_what_the_frame_and_the_timeline_get_wrong() {
+    let (mut client, png) = client("check");
+
+    expect_diff(
+        &mut client,
+        r#"{"action":"add","type":"square","params":{"width":1.0,"label":"方块"}}"#,
+    );
+    let reply = client
+        .send_raw(r#"{"action":"check"}"#)
+        .expect("a check is a reply");
+    assert!(
+        reply.diff.is_none() && reply.tree.is_none() && reply.error.is_none(),
+        "a check answers in `report` alone"
+    );
+    let report = reply.report.expect("a check answers with a report");
+    assert!(report.findings.is_empty(), "a clean scene: {report:?}");
+
+    // Move the square a hundred units away: outside a 1280x720 frame at the
+    // default camera, and the finding has to name the node it is about.
+    expect_diff(
+        &mut client,
+        r#"{"action":"set","target":"方块","property":{"name":"position","value":[100.0,0.0]}}"#,
+    );
+    // A beat under the minimum, and two narration lines closer together than
+    // they can be read. Neither has a node, so both findings must omit one.
+    expect_diff(
+        &mut client,
+        r#"{"action":"play","animation":{"target":"方块","type":"fade_in","duration":0.05}}"#,
+    );
+    expect_diff(
+        &mut client,
+        r#"{"action":"narrate","text":"这一句需要好几秒才读得完","at":0.0}"#,
+    );
+    expect_diff(
+        &mut client,
+        r#"{"action":"narrate","text":"马上又来一句","at":0.1}"#,
+    );
+
+    let reply = client
+        .send_raw(r#"{"action":"check"}"#)
+        .expect("a check is a reply");
+    let report = reply.report.expect("a check answers with a report");
+    let codes: Vec<_> = report.findings.iter().map(|f| f.code.name()).collect();
+    assert!(codes.contains(&"out_of_frame"), "{codes:?}");
+    assert!(codes.contains(&"beat_too_fast"), "{codes:?}");
+    assert!(codes.contains(&"narration_too_fast"), "{codes:?}");
+
+    let off = report
+        .findings
+        .iter()
+        .find(|f| f.code.name() == "out_of_frame")
+        .unwrap();
+    assert_eq!(off.label.as_deref(), Some("方块"));
+    assert!(off.target.is_some(), "a geometry finding names its node");
+    let pacing = report
+        .findings
+        .iter()
+        .find(|f| f.code.name() == "beat_too_fast")
+        .unwrap();
+    assert!(
+        pacing.target.is_none() && pacing.label.is_none(),
+        "a timeline finding has no node to name"
+    );
+
+    // A check is a read: the square is still at the position `set` gave it.
+    let after = client
+        .send_raw(r#"{"action":"query","target":"方块"}"#)
+        .expect("a query is a reply");
+    assert!(after.tree.is_some());
 
     finish(client, &png);
 }

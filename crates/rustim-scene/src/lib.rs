@@ -45,6 +45,7 @@
 //! parser, by the same rule that keeps `accesskit` out of it.
 
 pub mod a11y;
+pub mod check;
 pub mod command;
 pub mod context;
 pub mod event;
@@ -53,6 +54,7 @@ pub mod text;
 pub mod typeset;
 
 pub use a11y::{CameraView, SemanticNode, SemanticRole, SemanticTree, SemanticValue};
+pub use check::{CheckCode, CheckReport, Finding, Severity};
 pub use command::{Command, CommandError, CommandOutcome, CommandReply, StateDiff, Target};
 pub use context::{Scene, SceneContext};
 pub use event::{Event, EventKind, EventLine, MAX_EVENTS, event_line};

@@ -214,6 +214,26 @@ impl Sequence {
         self.steps.len()
     }
 
+    /// The nominal length of each queued beat, in the order it will play.
+    ///
+    /// `max(duration)` over a beat's members — the same total
+    /// [`Sequence::start_next`] hands the scheduler, and the same one
+    /// `StartedBeat::duration` reports under either motion mode. The linter's
+    /// pacing check reads the script through this: it is the only honest answer
+    /// to "how long will these beats take" that a caller outside the queue can
+    /// get, because the animations themselves are boxed into `steps` and cannot
+    /// be inspected one by one.
+    pub fn durations(&self) -> Vec<f64> {
+        self.steps
+            .iter()
+            .map(|beat| {
+                beat.iter()
+                    .map(|animation| animation.duration())
+                    .fold(0.0, f64::max)
+            })
+            .collect()
+    }
+
     pub fn clear(&mut self) {
         self.steps.clear();
     }

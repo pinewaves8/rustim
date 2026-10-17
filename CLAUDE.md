@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **892 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **919 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -63,7 +63,9 @@ scenes match their checked-in
 baselines, a script replays to a byte-identical frame, an exported frame equals the still pixel for
 pixel, a scripted `add` of `text` / `formula` / `group` builds real objects through the host's
 `Typesetter` (the desktop `hello` advertises all **12** shapes; the plain browser page advertises
-ten, the formula page eleven), and `rustim-app --png out.png` reproduces the
+ten, the formula page eleven), `check` answers a clean scene with an empty `findings` array and a
+broken one with the findings that names the node and the timeline problem it measured (see "The
+linter"), and `rustim-app --png out.png` reproduces the
 Manim reference frame with an **identical content bounding box** (`343,90,936,629`); only 0.012% of
 pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The browser host
 builds both ways (with and without Typst) and was **run in Chrome 151**, where its canvas matches the
@@ -147,6 +149,7 @@ cargo run --release -p rustim-app -- --video-png frames/ --srt out.srt  # ...or 
 cargo run -p rustim-export --bin rustim-compare -- a.png b.png   # exit 0 pass / 1 fail / 2 cannot
 cargo run -p rustim-app -- --script sessions/intro.jsonl --reply  # drive it with JSON commands
 cargo run -p rustim-app -- --script - --reply --png out.png       # ...from stdin, answering each
+echo '{"action":"check"}' | cargo run -p rustim-app -- --script - --reply --png out.png  # lint the frame
 #   a script that sent {"action":"events","enabled":true} gets {"event":…} lines beside the replies
 cargo run -p rustim-app -- --script crates/rustim-app/tests/fixtures/script/session.jsonl --inspect
 cargo run -p rustim-daemon           # ws://127.0.0.1:7300, blank scene, auto clock
@@ -372,8 +375,8 @@ last property.
 | `rustim-mobject` | `Mobject` (points / declared `local_bounds` / a wire-shaped `text: Option<TextBlock>` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot` / `polygon` / `group`) and `AxesScale`, `text` (`TextBlock` / `TextRun` / `FontData` — the glyph geometry a shaper hands over), `critical_point`, `world_anchors`, `ids_with_label` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
-| `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it), `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) and `templates` (the `explain.*` thick tools: one group, addressable pieces, a declared box and an atomic rollback) | Real |
-| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; all six templates live one crate up) |
+| `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it), `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts), `templates` (the `explain.*` thick tools: one group, addressable pieces, a declared box and an atomic rollback) and `check` (the linter: pure frame checks plus timeline pacing — see "The linter") | Real |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the linter lives in `rustim-scene::check` for the same reason `handle` owns the arm — only the context holds the viewport and the queued timeline. `ScenePlan` is deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; all six templates live one crate up) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -671,6 +674,70 @@ Two consequences in the mobject vocabulary:
 
 The command layer exposes `stroke_opacity` (0..=1), `stroke_color` (`[r, g, b]`) and `stroke_width`
 (finite, `>= 0`), all writing `dirty.style` like `fill_opacity` does.
+
+### The linter
+
+`{"action":"check"}` is a **read**: it lints the frame *and* the timeline that has not played yet,
+changes nothing, and answers a `report` — the fifth reply presence (see "The feed"). The split is the
+design: `rustim_scene::check::check(tree, viewport)` is a pure function of the tree and the frame,
+`check::pacing(beats, narration)` is a pure function of timelines, and `SceneContext::check` is the
+only place the two meet — only the context holds the viewport, the queued beat durations
+(`Sequence::durations`) and the narration lines still waiting for their due time. A pure
+`command::apply` function has none of them, so the arm is in `handle`.
+
+Seven codes, and the severity is a **function of the code**, never a field a caller supplies:
+`OutOfFrame` is `Error` (an object a viewer cannot see is the picture being wrong);
+`Overlap` / `TextTooSmall` / `LowContrast` are `Warning` (legible but degraded); `EmptyText` /
+`BeatTooFast` / `NarrationTooFast` are `Info` (geometry cannot measure whether an explanation is
+right, and a sub-second beat is a legitimate flourish — report, do not judge). The `severity` field
+still travels on the wire because a model reading a finding should not have to hold the table.
+
+The thresholds are **constants in `check`, not wire parameters**: `MIN_TEXT_PX = 18`,
+`MIN_CONTRAST = 3.0` (WCAG large-text floor; the palette lives at 7.4:1 / 4.7:1, so the rule flags a
+colour a caller invented to be dim), `OVERLAP_FRACTION = 0.1`, `MIN_BEAT_SECONDS = 0.2`,
+`READING_CHARS_PER_SECOND = 8` — the same figure the caption band's `hold_seconds` is based on, so a
+line the captions hold long enough to read is a line this check accepts. Every `detail` states the
+number *it* measured, which is what lets a host that disagrees filter the report; a configurable
+threshold table would be a second answer to one question.
+
+Five properties are load-bearing:
+
+- **Geometry follows the camera.** `out_of_frame` compares each top-level object's subtree box
+  against `visible_height()/zoom` and the viewport aspect, and `text_too_small` measures the line box
+  through `parent_transform · transform` times pixels-per-unit, so zooming in clears both and zooming
+  out creates both. Contrast is the one camera-free rule (it is a property of the paint).
+- **Only top-level objects are compared for out-of-frame and overlap.** A group's children are laid
+  out *to* overlap inside it; comparing pairs would flag every template. Text and contrast are
+  per-node, walked in `draw_order()` so a report is stable.
+- **Overlap is an area fraction of the smaller box, and zero-area boxes are excluded.** A horizontal
+  plot crossing an axis has zero intersection area; flagging that would make every graph yellow.
+  Neighbours sharing an edge have zero intersection too, which is why the rule is not "any
+  intersection".
+- **Fully transparent nodes are skipped**, and a pass whose alpha is below `0.5` is not judged for
+  contrast — an invisible colour is not a legible-colour problem. Only the channel the node actually
+  paints is judged: the fill when there are points or text, otherwise a finite positive-width stroke.
+- **A finding names ids.** Node findings carry `target` (always the id, whatever spelling the scene
+  used) and `label` when the node has one; `overlap` also carries `other`. Pacing findings — which
+  have no node at all — omit all three rather than writing nulls.
+
+Pacing is deliberately half-blind: **only beats not yet handed to the clock are paced.** The beat on
+the clock has only its remaining time known, and calling a half-played one-second beat "too fast"
+would flag a beat that was fine when it was queued. A duration of exactly `0.0` is legal (an instant
+snap) and is not flagged. Narration is sorted by due time and each gap is compared with
+`chars / 8.0` for the line before it.
+
+`check` cannot be a `batch`/`validate` member: a list replies with one diff and `check` answers a
+report, so `check_batchable` refuses it under `commands[i]` before any member runs — the same rule
+that keeps `query` and `hello` out. It has no fields, so it has no `OutOfRange` of its own; an
+unknown field is `unparseable`, and otherwise the answer is always a report, empty findings
+included. A degenerate viewport or non-finite camera only makes the visible window unknown, so those
+two rules do not fire rather than the command failing.
+
+Evidence: 20 unit tests in `check.rs` over hand-built trees (including the palette passing the
+contrast floor, a camera zoom clearing an out-of-frame finding, a child overlapping its parent not
+being reported, a fully faded object reporting nothing, and the report's field order), five context
+tests, a conformance case through the real binary, and — the point of the whole feature — **all
+eight goldens unchanged**: a read draws nothing.
 
 ### The timeline: three layers
 
@@ -2947,8 +3014,8 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   tests, two round-trip fixtures and the extended conformance case; `ACTIONS` 24 → 25. **All eight
   goldens are unchanged**, and the count moved 836 → 842.
   Deliberately deferred at the time: labels that follow their subject, the remaining `explain.*`
-  templates, the linter and `ScenePlan`. The templates have all since landed; the linter and
-  `ScenePlan` have not.
+  templates, the linter and `ScenePlan`. The templates and the linter have all since landed;
+  `ScenePlan` has not.
 - **Phase 2's fifth slice — the first template, `explain.equation` — is done.** The `explain.*` thick
   tools now exist as a layer (`rustim-scene::templates`), and the first one compiles a formula, styles
   it, measures its world bottom and hangs an optional typeset caption one `DEFAULT_GAP` below it, all
@@ -3085,6 +3152,41 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   fixtures, and a conformance case through the real binary that reads back the cell and pointer
   names, asserts `格2` and `i` each address one node, and proves an out-of-range pointer leaves no
   group behind; **all eight goldens unchanged**, count 886 → 892.
+- **Phase 2's eleventh slice — the linter, `check` — is done**, and it is the only tool in the
+  director's list that reads the whole frame rather than a node: `{"action":"check"}` answers with a
+  `report`, the **fifth reply presence** beside `diff`, `tree`, `capabilities` and `error`. The split
+  is the design, and it is forced by what the question needs: `rustim_scene::check::check(tree,
+  viewport)` is pure tree-and-frame geometry (out of frame, overlap, text size, contrast, empty
+  text), `pacing(beats, narration)` is pure timeline (a beat under 0.2 s, narration read faster than
+  8 characters a second), and `SceneContext::check` joins the two — the viewport and the queue live
+  on the context, not the tree, which is why the command is intercepted by `handle` and why it can
+  answer with `CommandOutcome::Checked` and no `StateDiff`. `Sequence::durations()` is the one queue
+  accessor the linter needed: the beats are boxed and cannot be peered into one by one, so the
+  nominal `max(duration)` per beat is the only honest answer to "how long will these take". Five
+  properties are load-bearing. **Seven codes, and severity is derived from the code**, never a wire
+  field: `out_of_frame` is the only error (an object a viewer cannot see is the picture being
+  wrong), `overlap` / `text_too_small` / `low_contrast` warn, and `empty_text` / `beat_too_fast` /
+  `narration_too_fast` are info — geometry does not measure whether an explanation is right, and a
+  sub-second beat is a legitimate flourish. **The thresholds are constants, not parameters**
+  (`MIN_TEXT_PX 18`, `MIN_CONTRAST 3.0`, `OVERLAP_FRACTION 0.1`, `MIN_BEAT_SECONDS 0.2`,
+  `READING_CHARS_PER_SECOND 8.0`): a configurable table would be a second answer about the same
+  picture, and the `detail` string says what was measured. **The frame test follows the camera**
+  (`visible_world` from `visible_height()`/zoom and the viewport's aspect), so a moved or zoomed view
+  changes which objects are out of frame — the same reason `a11y` projects through `tree.camera`.
+  **Only top-level objects are compared for overlap** (a group and its own child always overlap),
+  and the fraction excludes zero-area intersections; a degenerate viewport hides the frame check
+  rather than reporting everything. **Pacing reads only beats not yet started** — a beat already
+  playing was paced when it began — and a `duration` of `0.0` is an instant snap, not a fast beat.
+  Findings are in a stable order, name ids (a label too), and a node-less finding omits
+  `target`/`label` rather than writing nulls. `check` is a read: it is refused as a `batch` /
+  `validate` member (`check answers with a report, not a diff`) and has no `out_of_range` of its
+  own. Evidence: twenty unit tests over the pure halves (each code, severities, the constants, the
+  camera dependence, contrast on alpha), five context tests (the joined report, only-unstarted
+  pacing, a clean scene, a degenerate viewport, `handle`'s reply), a client test reading the fifth
+  half, a conformance case through the real binary (a clean `{"findings":[]}`, then a square moved
+  off-frame plus a 0.05 s beat and two narration lines, all named, with a following `query` still a
+  tree), and the round-trip fixture; `ACTIONS` 31 → 32. **All eight goldens unchanged** — a linter
+  reads the frame and draws nothing — count 892 → 919.
 
 ## AI integration
 
@@ -3110,7 +3212,7 @@ the AI surface" below.
 session. It does not touch the tree; it answers with a `capabilities` document — the protocol version,
 the engine's version string, and the exact action / shape / animation / property / rate names this
 build accepts, plus its limits and two advisory profiles. The lists are **derived from serde over the
-same enums the parser uses** — `actions` from `Command::action_name` (31 verbs), `PROPERTY_NAMES`,
+same enums the parser uses** — `actions` from `Command::action_name` (32 verbs), `PROPERTY_NAMES`,
 `AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` for the nouns — so an advertised name is
 accepted by construction, and a conformance test feeds every advertised word back through the binary
 (see `crates/rustim-app/tests/conformance.rs`). A new variant that misses its `ALL`/name table fails a
@@ -3330,11 +3432,12 @@ success and the identical error on failure. The scheduler and narration track ar
 copied — a queued animation captured its start and is not replayable data, and a dry run must not
 speak.
 
-`CommandOutcome` is the in-memory vocabulary that keeps the three answers apart — `Applied(StateDiff)`,
-`Queried(SemanticTree)` and `Greeted(Capabilities)` — and `reply_line` is the only thing that turns it
-into JSON, so the desktop feed and the browser bridge cannot answer one command two different ways.
-The hook fires only for `Applied`: a scene that re-fitted itself on every read would do work the
-question did not ask for, and a greeting changes nothing at all.
+`CommandOutcome` is the in-memory vocabulary that keeps the four answers apart —
+`Applied(StateDiff)`, `Queried(SemanticTree)`, `Checked(CheckReport)` and `Greeted(Capabilities)` —
+and `reply_line` is the only thing that turns it into JSON, so the desktop feed and the browser
+bridge cannot answer one command two different ways. The hook fires only for `Applied`: a scene that
+re-fitted itself on every read would do work the question did not ask for, a lint changes nothing,
+and a greeting changes nothing at all.
 
 Two wire-format invariants are load-bearing, both pinned by tests:
 - **Commands round-trip byte-for-byte.** `to_string(parse(json)) == json`. A host logs, replays and
@@ -3560,11 +3663,13 @@ of I/O and of a JSON parser (it compiles to wasm).
   every human-facing line the binary prints (`wrote out.png (1280x720)`, the frame-rate line) moves to
   stderr (`main::note`). A host cannot skip a line it did not expect.
   `{"seq":1,"diff":{"created":[4294967297],"modified":[],"removed":[]}}` — **exactly one of `diff`,
-  `tree`, `capabilities` and `error` is present**, and the presence is the discriminant. `created` is
-  the only way to learn the id of what was just created; a `play` gets a present-but-**empty** diff,
-  because queueing a beat changes nothing in the tree; a `query` gets a `tree` and no diff at all,
-  because an empty diff would read as a mutation that did nothing; a `hello` gets `capabilities` and
-  neither of the other two, because a handshake is not a read of the tree.
+  `tree`, `report`, `capabilities` and `error` is present**, and the presence is the discriminant.
+  `created` is the only way to learn the id of what was just created; a `play` gets a
+  present-but-**empty** diff, because queueing a beat changes nothing in the tree; a `query` gets a
+  `tree` and no diff at all, because an empty diff would read as a mutation that did nothing; a
+  `check` gets a `report` — the empty-findings array is itself the clean answer, so “checked and
+  clean” is distinguishable from “did not ask”; a `hello` gets `capabilities` and none of the other
+  four, because a handshake is not a read of the tree.
 - **`seq` is the 1-based *physical* line number**, blank lines included, so a human reading a log and a
   host reading the stream count the same way. A blank line is skipped silently and produces no reply.
 - **Every reply is flushed before the next line is read.** A file source is read whole; `-` is stdin,

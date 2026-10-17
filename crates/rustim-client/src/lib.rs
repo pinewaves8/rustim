@@ -3,8 +3,8 @@
 //! This crate is the *client half* of [`rustim_scene::command`], and nothing
 //! else. It turns a [`Command`] into one JSON line, reads the one reply line
 //! back, and checks the two framing rules the protocol states — one reply per
-//! command line, exactly one of `diff` / `tree` / `capabilities` / `error`
-//! present — so every consumer gets the same conformance check rather than each
+//! command line, exactly one of `diff` / `tree` / `report` / `capabilities` /
+//! `error` present — so every consumer gets the same conformance check rather than each
 //! reimplementing it.
 //!
 //! **Why it exists.** The AI layer is not in this repository (see
@@ -40,6 +40,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command as Process, ExitStatus, Stdio};
 
+pub use rustim_scene::check::CheckReport;
 pub use rustim_scene::command::{
     Capabilities, Command, CommandError, CommandOutcome, CommandReply, PROTOCOL_VERSION,
     parse_command, reply_line,
@@ -81,6 +82,7 @@ pub fn read_reply<R: BufRead>(reader: &mut R) -> io::Result<CommandReply> {
         let present = [
             reply.diff.is_some(),
             reply.tree.is_some(),
+            reply.report.is_some(),
             reply.capabilities.is_some(),
             reply.error.is_some(),
         ]
@@ -90,7 +92,9 @@ pub fn read_reply<R: BufRead>(reader: &mut R) -> io::Result<CommandReply> {
         if present != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("a reply must carry exactly one of diff/tree/capabilities/error: {text}"),
+                format!(
+                    "a reply must carry exactly one of diff/tree/report/capabilities/error: {text}"
+                ),
             ));
         }
         return Ok(reply);
@@ -317,5 +321,17 @@ mod tests {
         let mut input = Cursor::new(format!("{line}\n"));
         let reply = read_reply(&mut input).unwrap();
         assert_eq!(reply.capabilities, Some(caps));
+    }
+
+    /// A lint is the fifth half, and an empty report is a legal answer: the
+    /// reader counts the *field*, not how much is in it.
+    #[test]
+    fn a_check_is_read_as_a_report() {
+        let line =
+            serde_json::to_string(&CommandReply::checked(1, CheckReport::default())).unwrap();
+        let mut input = Cursor::new(format!("{line}\n"));
+        let reply = read_reply(&mut input).unwrap();
+        assert_eq!(reply.report, Some(CheckReport::default()));
+        assert!(reply.diff.is_none() && reply.tree.is_none());
     }
 }

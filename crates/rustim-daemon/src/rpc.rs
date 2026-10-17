@@ -4,7 +4,7 @@
 //!
 //! `rustim_scene::command` already owns the *payload*: a command is one JSON
 //! object with an `"action"`, a reply is one with `"seq"` and exactly one of
-//! `diff` / `tree` / `capabilities` / `error`. The stdio feed prepends nothing
+//! `diff` / `tree` / `report` / `capabilities` / `error`. The stdio feed prepends nothing
 //! because a pipe is one ordered line stream and every line is a command. A
 //! socket is different in three ways that the envelope has to answer:
 //!

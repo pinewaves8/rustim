@@ -12,6 +12,7 @@ use rustim_mobject::{NodeId, SceneTree};
 use rustim_render::{DrawList, DrawOp};
 
 use crate::a11y;
+use crate::check::{self, CheckReport};
 use crate::command::{self, Capabilities, Command, CommandError, CommandOutcome, StateDiff};
 use crate::event::{Event, EventKind, MAX_EVENTS};
 use crate::typeset::{TextSpec, Typesetter, typeset_error};
@@ -674,6 +675,7 @@ impl SceneContext {
             let why = match member {
                 Command::Hello { .. } => "hello answers with capabilities, not a diff",
                 Command::Query { .. } => "query answers with a tree, not a diff",
+                Command::Check => "check answers with a report, not a diff",
                 Command::Batch { .. } | Command::Validate { .. } => {
                     "a command list cannot be nested"
                 }
@@ -1610,6 +1612,9 @@ impl SceneContext {
             };
             return Ok(CommandOutcome::Queried(tree));
         }
+        if let Command::Check = cmd {
+            return Ok(CommandOutcome::Checked(self.check()));
+        }
         if let Command::Add {
             kind,
             params,
@@ -1750,6 +1755,32 @@ impl SceneContext {
         a11y::build(&self.tree, &self.viewport, live)
     }
 
+    /// Lint the frame and the timeline, changing nothing.
+    ///
+    /// The two halves come from two different places and meet here because
+    /// only the context holds both: [`check::check`] needs the viewport to know
+    /// what "in frame" means, and [`check::pacing`] needs the queued beats
+    /// ([`rustim_anim::Sequence::durations`]) and the narration lines still
+    /// waiting for their due time. Neither is tree state, so this cannot live
+    /// in the pure command layer.
+    ///
+    /// Findings are ordered: the geometry checks first, in the order
+    /// [`check::check`] emits them, then the timeline checks. The order is
+    /// stable across calls, which is what lets a host diff two reports — a
+    /// report from before and after a fix should differ only by the fix.
+    ///
+    /// Only beats **not yet started** are paced. The beat on the clock has
+    /// already been handed to the scheduler, where only its remaining time is
+    /// known, and calling a half-played beat "too fast" would flag a beat that
+    /// was a second long when it was queued.
+    pub fn check(&self) -> CheckReport {
+        let mut report = check::check(&self.tree, &self.viewport);
+        report
+            .findings
+            .extend(check::pacing(&self.playback.durations(), &self.narration));
+        report
+    }
+
     /// Open a frame: clear the list, fill the background, install the viewport.
     ///
     /// Every draw list starts here, whether it is produced by the default tree
@@ -1886,6 +1917,7 @@ mod tests {
         match ctx.handle(cmd).expect("a well-formed command") {
             CommandOutcome::Applied(diff) => diff,
             CommandOutcome::Queried(_) => panic!("a query is not a mutation"),
+            CommandOutcome::Checked(_) => panic!("a check is not a mutation"),
             CommandOutcome::Greeted(_) => panic!("a greeting is not a mutation"),
         }
     }
@@ -2276,6 +2308,129 @@ mod tests {
                 target: Some("不存在".into())
             }),
             Err(CommandError::NoSuchLabel { .. })
+        ));
+    }
+
+    /// A check answers with a report and no diff, and a clean scene's report is
+    /// an *empty list in a present field* — a host has to be able to tell
+    /// "checked and clean" from "did not ask".
+    #[test]
+    fn a_check_answers_with_a_report_and_changes_nothing() {
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        let before = ctx.tree.len();
+
+        let outcome = ctx.handle(&Command::Check).unwrap();
+        assert!(outcome.diff().is_none(), "a check changes no node");
+        let CommandOutcome::Checked(report) = outcome else {
+            panic!("a check is a read, not a mutation");
+        };
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(ctx.tree.len(), before);
+        assert!(ctx.tree.get(id).is_some());
+    }
+
+    /// The geometry half reaches the report through the context, with the
+    /// viewport the context actually holds: an object a hundred units away is
+    /// outside a 1280×720 frame and the finding names it by id and label.
+    #[test]
+    fn a_check_reports_an_object_outside_the_viewport() {
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        ctx.tree.get_mut(id).unwrap().label = Some("方块".to_owned());
+        ctx.tree.get_mut(id).unwrap().transform = Affine2::translate((100.0, 0.0));
+
+        let CommandOutcome::Checked(report) = ctx.handle(&Command::Check).unwrap() else {
+            panic!("a check is a read");
+        };
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == crate::check::CheckCode::OutOfFrame)
+            .expect("the square is off the frame");
+        assert_eq!(finding.target, Some(id.into()));
+        assert_eq!(finding.label.as_deref(), Some("方块"));
+    }
+
+    /// The pacing half only exists here: a beat too short to play is queued by
+    /// `play`, where no tree-level function can see it.
+    #[test]
+    fn a_check_paces_the_beats_still_queued() {
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        ctx.play(rustim_anim::FadeIn::new(id).with_duration(0.05));
+
+        let CommandOutcome::Checked(report) = ctx.handle(&Command::Check).unwrap() else {
+            panic!("a check is a read");
+        };
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::check::CheckCode::BeatTooFast),
+            "{report:?}"
+        );
+        // The check started nothing: the beat is still queued, and `is_playing`
+        // being true is exactly the documented state for a queued-but-unstarted
+        // beat (it is not `!animations.is_empty()`).
+        assert!(ctx.animations.is_empty(), "nothing was handed to the clock");
+    }
+
+    /// Narration is paced against the gap to the next line, over the lines that
+    /// have not been drained yet — the same track `take_narration` serves.
+    #[test]
+    fn a_check_paces_pending_narration() {
+        let mut ctx = scene();
+        applied(
+            &mut ctx,
+            &Command::Narrate {
+                text: "这是一句足够长的讲解词".to_owned(),
+                at: Some(0.0),
+            },
+        );
+        applied(
+            &mut ctx,
+            &Command::Narrate {
+                text: "下一句".to_owned(),
+                at: Some(0.25),
+            },
+        );
+
+        let CommandOutcome::Checked(report) = ctx.handle(&Command::Check).unwrap() else {
+            panic!("a check is a read");
+        };
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::check::CheckCode::NarrationTooFast),
+            "{report:?}"
+        );
+    }
+
+    /// `batch` replies with one diff, so a member that answers with a report
+    /// has to be refused before anything runs — the same rule `query` and
+    /// `hello` already follow.
+    #[test]
+    fn a_check_cannot_be_a_batch_member() {
+        let mut ctx = scene();
+        let err = ctx
+            .handle(&Command::Batch {
+                commands: vec![Command::Check],
+            })
+            .expect_err("a check answers with a report, not a diff");
+        assert!(matches!(
+            err,
+            CommandError::OutOfRange { ref property, .. } if property == "commands[0]"
         ));
     }
 
@@ -5210,6 +5365,7 @@ mod tests {
         .map(|outcome| match outcome {
             CommandOutcome::Applied(diff) => diff,
             CommandOutcome::Queried(_) => panic!("narration is not a query"),
+            CommandOutcome::Checked(_) => panic!("narration is not a check"),
             CommandOutcome::Greeted(_) => panic!("narration is not a greeting"),
         })
     }

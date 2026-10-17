@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::a11y::SemanticTree;
+use crate::check::CheckReport;
 use crate::event::EventKind;
 use rustim_anim::{
     Animate, Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale,
@@ -935,6 +936,30 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<Target>,
     },
+    /// Lint the current frame and timeline, changing nothing.
+    ///
+    /// The third read on the wire, after `query`. A query answers *what is
+    /// there*; `check` answers *what is wrong with it* — an object off the
+    /// frame, two top-level objects buried in each other, text too small or
+    /// too dim to read, an empty text block, a beat that flashes past, two
+    /// narration lines closer together than they can be read.
+    ///
+    /// It is **not** a refusal and not an error: every command a finding is
+    /// about was legal. A model that composes a scene from data can be
+    /// perfectly well-formed and pedagogically wrong, and the engine has no
+    /// other place to say so. The answer is a [`CheckReport`] — a list of
+    /// findings, each with a code, a severity, and the node at fault — and the
+    /// host decides what to do with it.
+    ///
+    /// Answered by [`crate::SceneContext::handle`] rather than [`apply`]:
+    /// "inside the frame" needs the viewport, and the pacing checks need the
+    /// queued beats and pending narration, none of which live in the tree.
+    ///
+    /// The thresholds (`MIN_TEXT_PX`, `MIN_CONTRAST`, …) are constants in
+    /// [`crate::check`], not wire parameters. A finding's `detail` states what
+    /// it measured, so a host that disagrees can filter the report; a second
+    /// configurable threshold table would be a second answer to one question.
+    Check,
 }
 
 /// Every action name the wire accepts, alphabetically.
@@ -954,6 +979,7 @@ pub const ACTIONS: &[&str] = &[
     "arrange",
     "batch",
     "camera",
+    "check",
     "checkpoint",
     "events",
     "explain.algorithm",
@@ -1023,6 +1049,7 @@ impl Command {
             Self::Motion { .. } => "motion",
             Self::Events { .. } => "events",
             Self::Query { .. } => "query",
+            Self::Check => "check",
         }
     }
 }
@@ -1568,12 +1595,14 @@ pub struct Limits {
 /// * `"primitive"` — the §3 command surface: the vocabulary in this struct.
 /// * `"teaching"` — the batch layer, i.e. `batch` and `validate` are accepted,
 ///   which is the tier a model that wants fewer round trips and cheap trial and
-///   error asks for. The layout actions (`next_to`, `arrange`, `fit`) are in
-///   `actions` for **every** build, because they are pure tree geometry and
-///   need no provider; the rest of `rustim-director`'s tools (`explain.*`,
-///   `check`, `point_at`) will widen this tier later. The meaning only grows,
-///   and a client that needs one of those checks `actions`, where it is absent
-///   today.
+///   error asks for. The tools a lesson is built from are in `actions` for
+///   **every** build, because they are tree work that needs no external
+///   provider: the layout actions (`next_to`, `arrange`, `fit`), the attention
+///   actions (`highlight`, `point_at`, `annotate`), the six `explain.*`
+///   templates and the linter (`check`). A template that needs a typesetter
+///   refuses under `text` rather than disappearing from the list. `ScenePlan`
+///   is the one tool still planned; a client checks `actions` for it, where it
+///   is absent today, and the profile's meaning only grows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     /// The protocol version this reply describes — the same
@@ -1828,15 +1857,18 @@ impl StateDiff {
 ///
 /// `Applied` covers everything that mutated (including the host-answered
 /// commands whose diff is present and empty: `play`, `camera`, `motion`,
-/// `narrate`), `Queried` carries the document a `query` asked for, and
-/// `Greeted` carries the vocabulary description a `hello` asks for. None of
-/// the three is a tree change, so only `Applied` has a diff at all.
+/// `narrate`), `Queried` carries the document a `query` asked for, `Checked`
+/// carries the findings a `check` reports, and `Greeted` carries the
+/// vocabulary description a `hello` asks for. None of the four is a tree
+/// change, so only `Applied` has a diff at all.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandOutcome {
     /// The command ran. The diff describes the tree change, which may be empty.
     Applied(StateDiff),
     /// The command read the tree and changed nothing.
     Queried(SemanticTree),
+    /// The command linted the frame and timeline, changing nothing.
+    Checked(CheckReport),
     /// The command asked what the build can do.
     Greeted(Capabilities),
 }
@@ -1846,17 +1878,17 @@ impl CommandOutcome {
     pub fn diff(&self) -> Option<&StateDiff> {
         match self {
             Self::Applied(diff) => Some(diff),
-            Self::Queried(_) | Self::Greeted(_) => None,
+            Self::Queried(_) | Self::Checked(_) | Self::Greeted(_) => None,
         }
     }
 }
 
 /// What a host gets back for one line of a command feed.
 ///
-/// **Exactly one of `diff`, `tree`, `capabilities` and `error` is present, and
-/// the presence is the discriminant.** The absent ones are omitted rather than
-/// written as `null`, the same rule the commands themselves follow — these are a
-/// model's output too.
+/// **Exactly one of `diff`, `tree`, `report`, `capabilities` and `error` is
+/// present, and the presence is the discriminant.** The absent ones are omitted
+/// rather than written as `null`, the same rule the commands themselves follow —
+/// these are a model's output too.
 ///
 /// A host that sent a `play` gets a `diff` that is present and *empty*: queueing
 /// a beat changes nothing in the tree, and saying so is more useful than saying
@@ -1865,8 +1897,11 @@ impl CommandOutcome {
 /// was just created, and without it nothing could be done to that object
 /// afterwards. A host that sent a `query` gets a `tree`, and no `diff`, because
 /// a read changes nothing and an empty diff would read as "a mutation that did
-/// nothing". A host that sent a `hello` gets `capabilities`: the vocabulary of
-/// this build, not the state of this session.
+/// nothing". A host that sent a `check` gets a `report`: what the linter found,
+/// which is present even when the list is empty — "checked and clean" is an
+/// answer, and an absent field would read as "did not ask". A host that sent a
+/// `hello` gets `capabilities`: the vocabulary of this build, not the state of
+/// this session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandReply {
     /// The 1-based *physical* line the command came from, so a human reading a
@@ -1877,6 +1912,9 @@ pub struct CommandReply {
     /// The document a `query` asked for; see [`SemanticTree`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tree: Option<SemanticTree>,
+    /// What a `check` found; see [`CheckReport`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<CheckReport>,
     /// What the build can do, for a `hello`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Capabilities>,
@@ -1891,6 +1929,7 @@ impl CommandReply {
             seq,
             diff: Some(diff),
             tree: None,
+            report: None,
             capabilities: None,
             error: None,
         }
@@ -1902,6 +1941,20 @@ impl CommandReply {
             seq,
             diff: None,
             tree: Some(tree),
+            report: None,
+            capabilities: None,
+            error: None,
+        }
+    }
+
+    /// The reply to a `check`: what the linter found, and nothing about the
+    /// tree — a lint changes nothing.
+    pub fn checked(seq: u64, report: CheckReport) -> Self {
+        Self {
+            seq,
+            diff: None,
+            tree: None,
+            report: Some(report),
             capabilities: None,
             error: None,
         }
@@ -1914,6 +1967,7 @@ impl CommandReply {
             seq,
             diff: None,
             tree: None,
+            report: None,
             capabilities: Some(capabilities),
             error: None,
         }
@@ -1926,6 +1980,7 @@ impl CommandReply {
             seq,
             diff: None,
             tree: None,
+            report: None,
             capabilities: None,
             error: Some(error),
         }
@@ -1961,6 +2016,7 @@ pub fn reply_line(seq: u64, outcome: Result<CommandOutcome, CommandError>) -> St
     let reply = match outcome {
         Ok(CommandOutcome::Applied(diff)) => CommandReply::applied(seq, diff),
         Ok(CommandOutcome::Queried(tree)) => CommandReply::queried(seq, tree),
+        Ok(CommandOutcome::Checked(report)) => CommandReply::checked(seq, report),
         Ok(CommandOutcome::Greeted(capabilities)) => CommandReply::greeted(seq, capabilities),
         Err(error) => CommandReply::refused(seq, error),
     };
@@ -2314,6 +2370,12 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // ingredient: projecting a `SemanticTree` needs the viewport, and
             // that lives on the context, not in the tree. Also, a query would
             // not fit this function's return type — it has no diff to give.
+        }
+        Command::Check => {
+            // Answered by `SceneContext::handle` for both of `query`'s reasons
+            // and one more: "inside the frame" needs the viewport, and the
+            // pacing checks need the queued beats and pending narration, which
+            // live on the context. It has no diff to give either.
         }
         Command::Batch { .. } | Command::Validate { .. } => {
             // Answered by `SceneContext::handle` because a list may contain
@@ -3080,6 +3142,8 @@ mod tests {
             // subtree. Neither writes a field it did not receive.
             r#"{"action":"query"}"#.to_owned(),
             format!(r#"{{"action":"query","target":{id}}}"#),
+            // The linter: a unit variant like `stop`, so it is the bare tag.
+            r#"{"action":"check"}"#.to_owned(),
             // The interrupt: a unit variant, so it is the bare tag and nothing
             // else. An implementation that serialised an empty object or a
             // `null` payload here would change what a relayed log says.
@@ -3246,6 +3310,7 @@ mod tests {
                 at: Some(1.0),
             },
             Command::Query { target: None },
+            Command::Check,
             Command::Highlight {
                 target: id.into(),
                 dim: None,
@@ -3360,6 +3425,15 @@ mod tests {
                 .to_owned(),
             r#"{"seq":5,"error":{"error":"unparseable","detail":"expected `,` at line 1 column 12"}}"#
                 .to_owned(),
+            // The lint's two shapes: a clean answer is an empty list in a
+            // *present* field, and a node finding writes `code`, `severity`,
+            // `target`, `label`, `other`, `detail` in that order. A finding
+            // about the timeline has no node and omits all three node fields.
+            r#"{"seq":6,"report":{"findings":[]}}"#.to_owned(),
+            r#"{"seq":7,"report":{"findings":[{"code":"out_of_frame","severity":"error","target":4294967296,"label":"方块","detail":"moved off the frame"}]}}"#
+                .to_owned(),
+            r#"{"seq":8,"report":{"findings":[{"code":"beat_too_fast","severity":"info","detail":"beat 1 lasts 0.05 s"}]}}"#
+                .to_owned(),
         ];
         for json in cases {
             let reply: CommandReply =
@@ -3373,15 +3447,31 @@ mod tests {
     #[test]
     fn a_reply_carries_exactly_one_half() {
         let ok = CommandReply::applied(7, StateDiff::default());
-        assert!(ok.diff.is_some() && ok.tree.is_none() && ok.error.is_none());
+        assert!(
+            ok.diff.is_some() && ok.tree.is_none() && ok.report.is_none() && ok.error.is_none()
+        );
         assert!(!serde_json::to_string(&ok).unwrap().contains("error"));
 
         let read = CommandReply::queried(
             8,
             crate::a11y::build(&SceneTree::new(), &Viewport::default(), None),
         );
-        assert!(read.diff.is_none() && read.tree.is_some() && read.error.is_none());
+        assert!(
+            read.diff.is_none()
+                && read.tree.is_some()
+                && read.report.is_none()
+                && read.error.is_none()
+        );
         assert!(!serde_json::to_string(&read).unwrap().contains("error"));
+
+        let lint = CommandReply::checked(11, CheckReport::default());
+        assert!(
+            lint.diff.is_none()
+                && lint.tree.is_none()
+                && lint.report.is_some()
+                && lint.error.is_none()
+        );
+        assert!(!serde_json::to_string(&lint).unwrap().contains("null"));
 
         let no = CommandReply::refused(
             9,
@@ -3389,13 +3479,16 @@ mod tests {
                 detail: "nope".into(),
             },
         );
-        assert!(no.diff.is_none() && no.tree.is_none() && no.error.is_some());
+        assert!(
+            no.diff.is_none() && no.tree.is_none() && no.report.is_none() && no.error.is_some()
+        );
         assert!(!serde_json::to_string(&no).unwrap().contains("null"));
 
         let hello = CommandReply::greeted(10, Capabilities::current());
         assert!(
             hello.diff.is_none()
                 && hello.tree.is_none()
+                && hello.report.is_none()
                 && hello.error.is_none()
                 && hello.capabilities.is_some()
         );
@@ -5585,10 +5678,10 @@ mod tests {
         );
     }
 
-    /// The presence of `diff`, `tree`, `capabilities` or `error` is the
-    /// discriminant; the others are omitted, never written as null.
+    /// The presence of `diff`, `tree`, `report`, `capabilities` or `error` is
+    /// the discriminant; the others are omitted, never written as null.
     #[test]
-    fn a_reply_carries_exactly_one_of_diff_tree_capabilities_and_error() {
+    fn a_reply_carries_exactly_one_half_and_never_a_null() {
         let applied: serde_json::Value = serde_json::from_str(&reply_line(
             3,
             Ok(CommandOutcome::Applied(StateDiff::default())),
@@ -5597,6 +5690,7 @@ mod tests {
         assert_eq!(applied["seq"], 3);
         assert!(applied.get("diff").is_some());
         assert!(applied.get("tree").is_none());
+        assert!(applied.get("report").is_none());
         assert!(applied.get("error").is_none());
 
         // A read says so by carrying a document and no diff at all. An empty
@@ -5614,10 +5708,27 @@ mod tests {
         assert_eq!(queried["seq"], 4);
         assert!(queried.get("tree").is_some());
         assert!(queried.get("diff").is_none());
+        assert!(queried.get("report").is_none());
         assert!(queried.get("error").is_none());
         assert_eq!(queried["tree"]["nodes"].as_array().unwrap().len(), 1);
 
-        // A greeting is the fourth presence: the document it answers with is
+        // A lint answers in `report`, and it is present even when the list is
+        // empty — "checked and clean" is an answer, and an absent field would
+        // read as "did not ask". It is not a tree document, so `tree` stays
+        // absent, which is the distinction from a query.
+        let checked: serde_json::Value = serde_json::from_str(&reply_line(
+            7,
+            Ok(CommandOutcome::Checked(CheckReport::default())),
+        ))
+        .unwrap();
+        assert_eq!(checked["seq"], 7);
+        assert!(checked.get("report").is_some());
+        assert!(checked.get("diff").is_none());
+        assert!(checked.get("tree").is_none());
+        assert!(checked.get("error").is_none());
+        assert_eq!(checked["report"]["findings"].as_array().unwrap().len(), 0);
+
+        // A greeting is the fifth presence: the document it answers with is
         // the build's vocabulary. It is neither a mutation nor a read of the
         // tree, so both of those fields are absent.
         let greeted: serde_json::Value = serde_json::from_str(&reply_line(
@@ -5629,6 +5740,7 @@ mod tests {
         assert!(greeted.get("capabilities").is_some());
         assert!(greeted.get("diff").is_none());
         assert!(greeted.get("tree").is_none());
+        assert!(greeted.get("report").is_none());
         assert!(greeted.get("error").is_none());
         assert_eq!(greeted["capabilities"]["protocol"], PROTOCOL_VERSION);
 
@@ -5643,6 +5755,7 @@ mod tests {
         assert!(refused.get("error").is_some());
         assert!(refused.get("diff").is_none());
         assert!(refused.get("tree").is_none());
+        assert!(refused.get("report").is_none());
         assert_eq!(refused["error"]["error"], "unparseable");
     }
 }
