@@ -1232,7 +1232,10 @@ mod tests {
         let mut seq = Sequence::new();
         seq.push([CameraMove::new(target).with_duration(0.8)]);
         let mut sched = crate::AnimationScheduler::new();
-        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
+        assert!(
+            seq.start_next(&mut sched, &mut tree, Motion::Reduced)
+                .is_some()
+        );
         assert_eq!(tree.camera, target);
     }
 
@@ -1774,8 +1777,14 @@ mod tests {
         seq.push([Create::new(whole).with_duration(0.4)]);
         seq.push([Uncreate::new(removed).with_duration(0.4)]);
         let mut sched = AnimationScheduler::new();
-        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
-        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
+        assert!(
+            seq.start_next(&mut sched, &mut tree, Motion::Reduced)
+                .is_some()
+        );
+        assert!(
+            seq.start_next(&mut sched, &mut tree, Motion::Reduced)
+                .is_some()
+        );
 
         assert_eq!(
             tree.get(whole).unwrap().points,

@@ -1499,6 +1499,11 @@ struct App {
     /// text and reporting only when it changes says the same thing once.
     text_error: Option<String>,
     frame: u64,
+    /// Frames that actually reached the window — the number a `frame_ready`
+    /// reports. Distinct from [`Self::frame`], which counts loop iterations:
+    /// an idle scene iterates without presenting, so the two diverge exactly
+    /// where the event would otherwise claim a picture that does not exist.
+    presented: u64,
     max_frames: Option<u64>,
     render_ms: Vec<f64>,
     last: Instant,
@@ -1525,6 +1530,43 @@ impl App {
             zoom: Some(camera.zoom),
             focus: None,
             duration: None,
+        });
+    }
+
+    /// Publish this session's events, and this frame's `frame_ready` if there
+    /// was one.
+    ///
+    /// Called once per loop iteration after the frame counter has moved, so the
+    /// two describe the same frame: the events are what the update in that frame
+    /// did, and `frame_ready` says the picture carrying it reached the window.
+    /// `drew` is false when the frame changed nothing on screen (`Damage::None`)
+    /// or could not be rasterised — those iterations still produce timeline
+    /// events, but nothing a subscriber could look at, and reporting a frame
+    /// every tick would make the event a heartbeat rather than a notification.
+    /// The kernel records events whether or not anyone listens; the queue is
+    /// drained either way (see [`feed::publish_events`]), so a session that
+    /// later subscribes starts from what happens next.
+    ///
+    /// A write failure is ignored. The windowed loop has no one to report a
+    /// vanished host to — the stream is a courtesy to an attached client, and a
+    /// broken pipe must not take the picture down.
+    fn publish_events(&mut self, drew: bool) {
+        if !self.reply {
+            // Still drain: the queue is bounded, and a `--frames` run with a
+            // script must not accumulate events nobody asked for.
+            let _ = self.ctx.take_events();
+            return;
+        }
+        if drew {
+            self.presented += 1;
+        }
+        let mut out = std::io::stdout().lock();
+        let _ = feed::publish_events(&mut self.ctx, &mut out).and_then(|()| {
+            if drew {
+                feed::publish_frame(&mut self.ctx, self.presented, &mut out)
+            } else {
+                Ok(())
+            }
         });
     }
 
@@ -1928,12 +1970,19 @@ impl ApplicationHandler<AppEvent> for App {
                         false
                     }
                 };
+                // What `frame_ready` reports: a frame that changed the window.
+                // `Damage::None` presents nothing (see `blit_damage`), so a still
+                // scene emits timeline events but no frame lines — otherwise a
+                // subscriber would be told sixty times a second that the same
+                // picture is ready. A failed rasterisation, or a surface that
+                // could not be mapped, is not a picture either.
+                let mut drew = false;
                 if rasterised {
                     if let Some(w) = self.windowed.as_mut()
                         && let Ok(mut buf) = w.surface.buffer_mut()
                     {
                         blit_damage(self.renderer.pixels(), &mut buf, self.list.width, damage);
-                        let _ = buf.present();
+                        drew = damage != Damage::None && buf.present().is_ok();
                     }
                     // Only now is `prev` the frame that is on screen. An error
                     // leaves it alone, so the next attempt is compared against
@@ -2020,6 +2069,10 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 self.frame += 1;
+                // After the counter and after the presentation above, so a
+                // client reading `frame_ready` knows the picture exists rather
+                // than that it was attempted.
+                self.publish_events(drew);
                 if self.frame.is_multiple_of(120) {
                     let recent = &self.render_ms[self.render_ms.len() - 120..];
                     let mean: f64 = recent.iter().sum::<f64>() / recent.len() as f64;
@@ -2466,6 +2519,16 @@ fn main() {
             reply,
             format_args!("wrote {path} ({}x{})", renderer.width(), renderer.height()),
         );
+        // The still is a frame this host wrote, so a subscriber hears about the
+        // events its timeline produced and then one `frame_ready` for the image
+        // — the same pair the windowed loop emits. After the informational line,
+        // because that line went to stderr: on stdout the reply stream stays the
+        // only thing with a line order a host can rely on.
+        if reply {
+            let mut out = std::io::stdout().lock();
+            let _ = feed::publish_events(&mut ctx, &mut out)
+                .and_then(|()| feed::publish_frame(&mut ctx, 1, &mut out));
+        }
         return;
     }
 
@@ -2695,6 +2758,7 @@ fn main() {
         was_animating: true,
         text_error: None,
         frame: 0,
+        presented: 0,
         max_frames,
         render_ms: Vec::new(),
         last: Instant::now(),

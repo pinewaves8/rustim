@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **734 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **745 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -141,6 +141,7 @@ cargo run --release -p rustim-app -- --video-png frames/ --srt out.srt  # ...or 
 cargo run -p rustim-export --bin rustim-compare -- a.png b.png   # exit 0 pass / 1 fail / 2 cannot
 cargo run -p rustim-app -- --script sessions/intro.jsonl --reply  # drive it with JSON commands
 cargo run -p rustim-app -- --script - --reply --png out.png       # ...from stdin, answering each
+#   a script that sent {"action":"events","enabled":true} gets {"event":…} lines beside the replies
 cargo run -p rustim-app -- --script crates/rustim-app/tests/fixtures/script/session.jsonl --inspect
 cargo test --workspace               # unit tests across all crates
 cargo test -p rustim-math ease_in_out       # a single test by name
@@ -354,7 +355,7 @@ last property.
 | `rustim-mobject` | `Mobject` (points / declared `local_bounds` / a wire-shaped `text: Option<TextBlock>` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot` / `group`) and `AxesScale`, `text` (`TextBlock` / `TextRun` / `FontData` — the glyph geometry a shaper hands over), `critical_point`, `world_anchors`, `ids_with_label` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
-| `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it) and `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) | Real |
+| `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it) and `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -2549,7 +2550,7 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   `hello`/`query`/`batch`/`validate` members are `OutOfRange` under `commands`/`commands[i]` before
   anything runs; and **`validate` is a real run on scratch state** — same `handle`, same order, tree /
   camera / clock / pause / tempo / motion / checkpoint stack copied, the host's `Typesetter` moved in
-  and back, scheduler and narration track deliberately not copied. `capabilities` grew `actions` (18
+  and back, scheduler and narration track deliberately not copied. `capabilities` grew `actions` (19
   verbs, from `Command::action_name`, asserted against the round-trip fixtures' action set) and
   `profiles: ["primitive", "teaching"]`, advisory beside the exact list. Evidence: nine
   `playback_control_tests` in `context.rs` (net diff, stop-at-index with the prefix applied, atomic
@@ -2559,6 +2560,22 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   **pixel-identical** to its members written out, and a refused batch names its member while the
   feed continues), and the fixture-set assertion in the round-trip test. **All eight goldens are
   unchanged** (a list draws nothing on its own), and the count moved 722 → 734.
+- **Phase 1's sixth slice — the event stream — is done**, and it is the slice the daemon needs: a
+  request/response client cannot see a beat start or end, and polling `query` is both late and
+  wasteful. `rustim-scene/src/event.rs` holds the vocabulary, `SceneContext` records into a bounded
+  queue and emits from `advance_clock`, `Sequence::start_next` returns `StartedBeat` so the start
+  event carries the script's own beat shape, and `{"action":"events","enabled":…,"kinds"?}` joins the
+  protocol (19 actions; `capabilities.actions` grew with it). The design decisions are in "Events:
+  what the timeline did": per-beat `animation_done`, stop is not a completion, events are a log
+  rather than state, `frame_ready` is host-produced, and subscription defaults off so a
+  strictly request/response host never reads an unexpected line. Evidence: kernel tests in
+  `context.rs` (start/end pairing and timing, reduced motion reporting the script's beat, a stopped
+  beat never completing, the filter refusing an empty list and suppressing kinds without stopping
+  the drain, `reset` keeping the subscription, a hand-added animation not being a beat), two
+  `feed.rs` tests (lines written beside replies, unsubscribed drain), and the end-to-end
+  `a_subscribed_script_receives_beat_events_and_a_frame_ready` over the real binary. **All eight
+  goldens are unchanged** — an event is a notification, not a draw op — and the count moved
+  734 → 745.
 
 ## AI integration
 
@@ -2584,7 +2601,7 @@ the AI surface" below.
 session. It does not touch the tree; it answers with a `capabilities` document — the protocol version,
 the engine's version string, and the exact action / shape / animation / property / rate names this
 build accepts, plus its limits and two advisory profiles. The lists are **derived from serde over the
-same enums the parser uses** — `actions` from `Command::action_name` (18 verbs), `PROPERTY_NAMES`,
+same enums the parser uses** — `actions` from `Command::action_name` (19 verbs), `PROPERTY_NAMES`,
 `AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` for the nouns — so an advertised name is
 accepted by construction, and a conformance test feeds every advertised word back through the binary
 (see `crates/rustim-app/tests/conformance.rs`). A new variant that misses its `ALL`/name table fails a
@@ -2676,6 +2693,80 @@ keeps that node and its descendants and sets the document's `root` to it; a miss
 `NoSuchNode`, never an empty tree, because "there is nothing under it" and "it is not there" are
 different answers and a host cannot tell them apart afterwards. The reply's `live` is always `null`:
 the announcement text belongs to a host's accessibility layer, not to the kernel.
+
+### Events: what the timeline did
+
+A reply answers a command. An **event** answers nothing — it reports something the engine did on its
+own, which is exactly what a client driving a *continuous* engine cannot learn from a
+request/response stream. `{"action":"events","enabled":true}` subscribes;
+`{"action":"events","enabled":false}` unsubscribes; an optional `kinds` selects the vocabulary
+(`["beat_started","animation_done"]` is the useful lecture subset, because `frame_ready` is one line
+per presented frame). An empty `kinds` list is refused as `OutOfRange` under `"kinds"`. The command returns an
+**empty `StateDiff`**, for `play`'s reason: a subscription is session state, not a node.
+
+An event line carries **no `seq`** and exactly one key, `event` — that absence is the classifier:
+
+```json
+{"event":{"kind":"beat_started","beat":1,"members":2,"duration":1.5,"clock":0.25}}
+{"event":{"kind":"animation_done","beat":1,"clock":1.75}}
+{"event":{"kind":"frame_ready","frame":108,"clock":1.8}}
+```
+
+Three kinds, in `rustim_scene::event`:
+
+- **`beat_started`** — a beat left the queue and reached the clock. `beat` is 1-based within the
+  session, `members` how many animations the script put in it, `duration` its nominal length
+  (`max(duration)` over the members, the scheduler's own total), `clock` the lecture time it began
+  at. `Sequence::start_next` returns a `StartedBeat { members, duration }` for exactly this, and it
+  is computed from the script's beat **even under reduced motion** — the hold that substitutes for
+  it is the same length, so the reported shape does not lie about what was written.
+- **`animation_done`** — every animation in that beat has finished. **Per beat, not per member**:
+  a beat is the unit a script and a viewer both see, and per-member counting would force a client to
+  know how reduced motion replaces N animations with one `Wait`. Emitted when the scheduler empties,
+  from `advance_clock`, after the tick that finished it.
+- **`frame_ready`** — the host presented or wrote a frame. **Host-produced**: the kernel has no
+  frames, only virtual time. The variant lives in the kernel's vocabulary so a client parses one
+  stream with one type, and so `wants_event(FrameReady)` is a filter a host can honour.
+
+**What is deliberately not an event**: a `stop`, `undo` or `reset` does not finish anything (no
+`finish` runs; a `FadeOut` in flight leaves its target, see "stop"), so none of them produces
+`animation_done`. Telling a client an interrupted beat *completed* is a lie it would act on. Events
+are a **log, not state**: a checkpoint does not capture them, `undo` neither replays nor erases them
+(what the engine did cannot be unwound by restoring a tree), and `reset` clears the log, restarts beat
+numbering at 1 and **keeps the subscription**.
+
+**The kernel records, the host delivers.** `SceneContext` keeps a `VecDeque<Event>` capped at
+`MAX_EVENTS` (4096, oldest dropped) because it has no transport — a seek can cross thousands of
+beats, and a host that stopped reading must not turn that into unbounded memory.
+`take_events()` is the single drain point and drains **unconditionally**, so an unsubscribed host
+still empties the queue; `events_subscribed()`/`wants_event(kind)` decide what is *written*.
+`feed::publish_events` writes the drained tail after each reply, and `feed::publish_frame` writes one
+`frame_ready`; both flush. The host layer is what connects them:
+
+- **Feed** (`--script … --reply`): events go to stdout only when `--reply` is on **and** the session
+  subscribed — a strict request/response client that never sent `events` never sees a line it did
+  not order. Events for the applied script are published right after the last reply.
+- **Windowed**: `App::publish_events` drains every iteration after the frame counter advances; when
+  `--reply` is off it drops them (`take_events` still runs) rather than letting the queue grow.
+  `frame_ready` is written only for a frame that **changed the window** — `Damage::None` presents
+  nothing and a failed rasterisation is not a picture, so an idle scene emits timeline events and no
+  frame lines instead of a heartbeat sixty times a second. The event's `frame` numbers presented
+  frames (`App::presented`), not loop iterations, which is why the two counters are separate.
+- **Headless `--png`**: after the still is written, the settle-time events and one `frame_ready`
+  (frame 1, clock 10.0) are published. Video export does not publish `frame_ready` yet — the sink
+  loop is not a viewer, and that decision is written down rather than implied.
+- **The browser does not publish events yet.** `Session::apply` accepts the subscription (it is
+  `handle`'s own arm), but nothing drains the queue to JS, so a browser subscriber sees no event
+  lines. The queue is capped, so this is an undelivered feature rather than a leak; the JS callback
+  belongs with the Web interaction work, not here.
+
+The end-to-end evidence is `crates/rustim-app/tests/script.rs`'s
+`a_subscribed_script_receives_beat_events_and_a_frame_ready`: it partitions the real binary's stdout
+into replies and events by the presence of `seq`, and asserts a `beat_started` (beat 1, one member,
+0.5 s), an `animation_done` at ≈0.5 s and a `frame_ready` at the 10 s still. The kernel tests pin
+what is not visible there: reduced motion reports the script's beat shape, a stopped beat never
+reports completion, the filter suppresses kinds without stopping the drain, and a hand-added
+scheduler animation is not a beat.
 
 `add` builds more than polygons: `text`, `formula` and `group` are on the wire (see "Wire-level text,
 formulas and groups: the `Typesetter` seam"), and their availability is in `hello`. A scripted

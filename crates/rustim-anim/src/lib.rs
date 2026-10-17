@@ -65,7 +65,7 @@ pub use ops::{
     Uncreate, Wait,
 };
 pub use rustim_math::rate::{self, Rate, RateFunc};
-pub use sequence::Sequence;
+pub use sequence::{Sequence, StartedBeat};
 pub use with_rate::WithRate;
 
 /// How much of a scene's motion to actually play.
@@ -592,7 +592,7 @@ mod tests {
         // The order `SceneContext::advance` uses: start the next beat, then advance.
         while !seq.is_empty() || !sched.is_empty() {
             if sched.is_empty() {
-                seq.start_next(&mut sched, &mut tree, Motion::Full);
+                let _ = seq.start_next(&mut sched, &mut tree, Motion::Full);
             }
             sched.update(1.0 / 60.0, &mut tree);
             frames += 1;

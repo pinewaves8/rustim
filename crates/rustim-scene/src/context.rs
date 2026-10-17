@@ -1,5 +1,7 @@
 //! The scene trait and the context a scene is handed.
 
+use std::collections::VecDeque;
+
 use rustim_anim::{Animation, AnimationScheduler, CameraMove, Motion, Sequence, Wait};
 use rustim_math::{Affine2, Camera, Viewport};
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
@@ -8,6 +10,7 @@ use rustim_render::{DrawList, DrawOp};
 
 use crate::a11y;
 use crate::command::{self, Capabilities, Command, CommandError, CommandOutcome, StateDiff};
+use crate::event::{Event, EventKind, MAX_EVENTS};
 use crate::typeset::{TextSpec, TypesetError, Typesetter};
 
 /// A scene: the user-facing entry point, mirroring Manim's `construct()`.
@@ -174,6 +177,27 @@ pub struct SceneContext {
     /// [`SceneContext::take_narration`] may drain it — a host that read it
     /// directly would have to reproduce the "due at or before the clock" rule.
     narration: Vec<(f64, String)>,
+    /// What the timeline did, waiting to be published.
+    ///
+    /// Private because delivery is a transport question: the kernel records and
+    /// a host drains ([`SceneContext::take_events`]). See [`crate::event`] for
+    /// the vocabulary, the bounded tail and what is deliberately not an event.
+    events: VecDeque<Event>,
+    /// The number the next beat started will carry (1-based, never reused).
+    next_beat: u64,
+    /// The beat currently on the clock, so its completion can name it.
+    ///
+    /// `None` when nothing of the queue is playing — including after a `stop`,
+    /// an `undo` or a `reset`, because an interrupt is not a completion and must
+    /// not produce an `animation_done`.
+    current_beat: Option<u64>,
+    /// Which event kinds this session publishes, or `None` for no stream.
+    ///
+    /// A session setting, not tree state: it survives `reset` (a host that
+    /// subscribed still wants events from the next scene), is **not** part of a
+    /// checkpoint (an undo does not rewind a transport), and is changed only by
+    /// [`Command::Events`].
+    published: Option<Vec<EventKind>>,
     /// The session snapshots [`SceneContext::undo`] unwinds, newest last.
     ///
     /// Private because the stack is only useful through the two named methods:
@@ -210,6 +234,10 @@ impl SceneContext {
             playback: Sequence::new(),
             clock: 0.0,
             narration: Vec::new(),
+            events: VecDeque::new(),
+            next_beat: 0,
+            current_beat: None,
+            published: None,
             checkpoints: Vec::new(),
             typesetter: None,
         }
@@ -340,11 +368,87 @@ impl SceneContext {
         // second start of the lecture. A narration already drained is gone, so
         // stepping back cannot replay it — the track is a script, not a tape.
         self.clock = (self.clock + dt).max(0.0);
-        if self.animations.is_empty() {
-            self.playback
-                .start_next(&mut self.animations, &mut self.tree, self.motion);
+        if self.animations.is_empty()
+            && let Some(started) =
+                self.playback
+                    .start_next(&mut self.animations, &mut self.tree, self.motion)
+        {
+            self.next_beat += 1;
+            self.current_beat = Some(self.next_beat);
+            self.record_event(Event::BeatStarted {
+                beat: self.next_beat,
+                members: started.members,
+                duration: started.duration,
+                clock: self.clock,
+            });
         }
         self.animations.update(dt, &mut self.tree);
+        // The complement of the start above: when the clock drains, the beat
+        // that was on it has ended. A zero-length beat both starts and ends on
+        // the same tick, which is honest — the scheduler completes a
+        // zero-duration animation on its first update.
+        //
+        // Only a beat *started through the queue* has a `current_beat`, so an
+        // animation a caller pushed straight into `ctx.animations` is not
+        // reported; the queue is what events describe, and that bypass is
+        // already documented as bypassing the motion policy too.
+        if self.animations.is_empty()
+            && let Some(beat) = self.current_beat.take()
+        {
+            self.record_event(Event::AnimationDone {
+                beat,
+                clock: self.clock,
+            });
+        }
+    }
+
+    /// Record one event, keeping the queue bounded.
+    ///
+    /// Oldest first out: a host that has stopped draining is more likely to act
+    /// on what just happened than on the beginning of a burst it missed, and a
+    /// silent unbounded `Vec` on input the engine does not control is exactly
+    /// what [`MAX_EVENTS`] exists to prevent.
+    fn record_event(&mut self, event: Event) {
+        if self.events.len() == MAX_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
+    /// Take the events recorded since the last call, oldest first.
+    ///
+    /// Draining rather than reading, for [`SceneContext::take_narration`]'s
+    /// reason: an event is a report of something that happened once, and a host
+    /// that read without draining would publish it again on the next frame.
+    /// A host must call this even when it is not subscribed — the queue is the
+    /// kernel's memory, and delivery is the transport's job.
+    ///
+    /// Returns an empty vector without allocating when nothing happened, which
+    /// is the common case for every frame without a beat boundary.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        self.events.drain(..).collect()
+    }
+
+    /// Whether this session publishes events at all.
+    ///
+    /// Off until a [`Command::Events`] turns it on. Kept on the context rather
+    /// than in a transport so the subscription is part of the session a
+    /// handover inherits — and so the command layer has one place to write it.
+    pub fn events_subscribed(&self) -> bool {
+        self.published.is_some()
+    }
+
+    /// Whether `kind` passes the session's filter.
+    ///
+    /// False when nothing is subscribed, so a transport can ask this per event
+    /// and never write a line the session did not order. A `frame_ready` a host
+    /// produces itself is gated by this too, which is what makes
+    /// `{"enabled":true,"kinds":["beat_started","animation_done"]}` a usable
+    /// way to follow the timeline without a line per frame.
+    pub fn wants_event(&self, kind: EventKind) -> bool {
+        self.published
+            .as_ref()
+            .is_some_and(|kinds| kinds.contains(&kind))
     }
 
     /// Freeze the timeline where it is.
@@ -710,6 +814,9 @@ impl SceneContext {
     pub fn stop(&mut self) {
         self.animations.clear();
         self.playback.clear();
+        // An interrupt is not a completion: drop the beat identity without
+        // recording an `animation_done` for it. See `crate::event`.
+        self.current_beat = None;
     }
 
     /// Is there anything left to play — now or later?
@@ -810,6 +917,12 @@ impl SceneContext {
         // over for the same reason — the new scene's `at: 0` means *its* zero.
         self.clock = 0.0;
         self.narration.clear();
+        // The old scene's events describe a picture that no longer exists, and
+        // its beat numbers start over with the new script. The *subscription*
+        // stays: it is a property of the transport, not of the scene.
+        self.events.clear();
+        self.current_beat = None;
+        self.next_beat = 0;
         // A snapshot of the previous scene is not history for the new one:
         // undoing into a tree the script never built would put back objects
         // whose ids the new scene has already retired, and the host asking for
@@ -828,8 +941,8 @@ impl SceneContext {
     /// [`Command::Pause`], [`Command::Resume`], [`Command::Tempo`],
     /// [`Command::Seek`], [`Command::Checkpoint`], [`Command::Undo`],
     /// [`Command::Batch`], [`Command::Validate`], [`Command::Camera`],
-    /// [`Command::Motion`], [`Command::Narrate`] and [`Command::Query`] are
-    /// answered **here** rather than in `command::apply`:
+    /// [`Command::Motion`], [`Command::Events`], [`Command::Narrate`] and
+    /// [`Command::Query`] are answered **here** rather than in `command::apply`:
     /// a hello answers with capabilities rather than a diff — a shape `apply`
     /// cannot return — a play needs the playback machine, a stop needs it *and*
     /// the scheduler, the playback controls name fields on this context beside
@@ -886,6 +999,13 @@ impl SceneContext {
     /// A [`Command::Motion`] writes `self.motion` and answers with an empty diff
     /// for the same reason; it reads back through [`SceneContext::motion`]'s field,
     /// not through the tree.
+    ///
+    /// A [`Command::Events`] writes the session's event subscription and answers
+    /// with an empty diff: a subscription is not a node. The kinds it may name
+    /// are [`crate::event::EventKind`]'s, and an empty list is refused under
+    /// `kinds` rather than read as "nothing" — `{"enabled":false}` is the
+    /// spelling for stopping the stream. What the engine records is unaffected;
+    /// see [`SceneContext::take_events`].
     ///
     /// A [`Command::Narrate`] is queued on the narration track at
     /// `clock + at`, and answers with an empty diff because speaking is not a
@@ -1005,6 +1125,20 @@ impl SceneContext {
         }
         if let Command::Motion { mode } = cmd {
             self.motion = (*mode).into();
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Events { enabled, kinds } = cmd {
+            if let Some(kinds) = kinds
+                && kinds.is_empty()
+            {
+                return Err(CommandError::OutOfRange {
+                    property: "kinds".to_owned(),
+                    detail: "an empty filter selects nothing; use {\"enabled\":false} to stop the stream"
+                        .to_owned(),
+                });
+            }
+            self.published =
+                enabled.then(|| kinds.clone().unwrap_or_else(|| EventKind::ALL.to_vec()));
             return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Narrate { text, at } = cmd {
@@ -2050,6 +2184,226 @@ mod tests {
 
         tick(&mut ctx, 20);
         assert_eq!(ctx.take_narration(), vec!["停下来".to_owned()]);
+    }
+
+    /// A beat reports itself twice — once when it reaches the clock and once
+    /// when its last animation ends — and says nothing in between.
+    ///
+    /// This is the pair a polling client cannot reconstruct: the tree is
+    /// identical on either side of a beat boundary, so `query` alone can only
+    /// tell a finished beat from a queued one by watching values converge. The
+    /// clock in each event is the lecture clock at the boundary, which is what a
+    /// host times its own narration against.
+    #[test]
+    fn a_beat_reports_its_start_and_its_end() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(0.5));
+
+        tick(&mut ctx, 1);
+        let started = ctx.take_events();
+        assert_eq!(started.len(), 1, "{started:?}");
+        match &started[0] {
+            Event::BeatStarted {
+                beat,
+                members,
+                duration,
+                clock,
+            } => {
+                assert_eq!(*beat, 1);
+                assert_eq!(*members, 1);
+                assert_eq!(*duration, 0.5);
+                assert!((*clock - DT).abs() < 1e-12, "{clock}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        tick(&mut ctx, 5);
+        assert!(
+            ctx.take_events().is_empty(),
+            "a running beat reports nothing"
+        );
+
+        while ctx.is_playing() {
+            ctx.advance(DT);
+        }
+        let done = ctx.take_events();
+        assert_eq!(done.len(), 1, "{done:?}");
+        match &done[0] {
+            Event::AnimationDone { beat, clock } => {
+                assert_eq!(*beat, 1);
+                // The fade is half a second; one frame of overshoot at most.
+                assert!((*clock - 0.5).abs() < 2.0 * DT, "{clock}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(ctx.take_events().is_empty(), "an event is said once");
+    }
+
+    /// Under reduced motion a beat still reports **the same members and the
+    /// same duration**, because they describe the script's beat, not the single
+    /// `Wait` that stood in for it. A client that counted scheduler entries
+    /// would see one animation either way and get the beat wrong; this is why
+    /// the event is per beat.
+    #[test]
+    fn reduced_motion_reports_the_beats_own_shape() {
+        let mut ctx = scene_at(Motion::Reduced);
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(0.75));
+        ctx.play(Wait::new(0.25));
+
+        tick(&mut ctx, 1);
+        match &ctx.take_events()[0] {
+            Event::BeatStarted {
+                beat,
+                members,
+                duration,
+                ..
+            } => {
+                assert_eq!(*beat, 1);
+                assert_eq!(*members, 1, "the script's members, not the hold");
+                assert_eq!(*duration, 0.75);
+            }
+            other => panic!("{other:?}"),
+        }
+        // The picture is already the end state: reduced motion snaps, then holds.
+        assert_eq!(opacity(&ctx, id), 1.0);
+
+        while ctx.is_playing() {
+            ctx.advance(DT);
+        }
+        let all = ctx.take_events();
+        let beats: Vec<u64> = all
+            .iter()
+            .filter_map(|e| match e {
+                Event::AnimationDone { beat, .. } => Some(*beat),
+                Event::BeatStarted { .. } | Event::FrameReady { .. } => None,
+            })
+            .collect();
+        assert_eq!(beats, [1, 2], "both beats complete, in order");
+    }
+
+    /// **An interrupt is not a completion.** A stopped beat never reports
+    /// `animation_done`: no `finish` ran, the picture is frozen half-way, and a
+    /// client told "done" would act on an end state that does not exist.
+    #[test]
+    fn a_stopped_beat_never_reports_completion() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(1.0));
+
+        tick(&mut ctx, 10);
+        assert!(matches!(
+            ctx.take_events().as_slice(),
+            [Event::BeatStarted { beat: 1, .. }]
+        ));
+        applied(&mut ctx, &Command::Stop);
+        tick(&mut ctx, 30);
+        assert!(
+            ctx.take_events().is_empty(),
+            "a stop is not a fast-forward and not an ending"
+        );
+        assert!(opacity(&ctx, id) > 0.0 && opacity(&ctx, id) < 0.2);
+    }
+
+    /// The subscription is read by `wants_event`, which is what a transport asks
+    /// per event; an empty filter is refused because it selects nothing and
+    /// `enabled: false` is the way to say stop.
+    #[test]
+    fn the_event_subscription_filters_and_refuses_an_empty_list() {
+        let mut ctx = scene();
+        assert!(!ctx.events_subscribed());
+        assert!(!ctx.wants_event(EventKind::BeatStarted));
+
+        let err = ctx
+            .handle(&Command::Events {
+                enabled: true,
+                kinds: Some(vec![]),
+            })
+            .expect_err("an empty filter is refused");
+        assert!(
+            matches!(&err, CommandError::OutOfRange { property, .. } if property == "kinds"),
+            "{err:?}"
+        );
+
+        let diff = applied(
+            &mut ctx,
+            &Command::Events {
+                enabled: true,
+                kinds: Some(vec![EventKind::BeatStarted]),
+            },
+        );
+        assert!(diff.is_empty(), "a subscription is not a tree change");
+        assert!(ctx.events_subscribed());
+        assert!(ctx.wants_event(EventKind::BeatStarted));
+        assert!(!ctx.wants_event(EventKind::FrameReady));
+
+        // The kernel records every kind regardless; filtering is the
+        // transport's job and `wants_event` is the one place it reads.
+        ctx.play(Wait::new(0.5));
+        tick(&mut ctx, 1);
+        assert!(matches!(
+            ctx.take_events().as_slice(),
+            [Event::BeatStarted { .. }]
+        ));
+
+        applied(
+            &mut ctx,
+            &Command::Events {
+                enabled: false,
+                kinds: None,
+            },
+        );
+        assert!(!ctx.events_subscribed());
+        assert!(!ctx.wants_event(EventKind::BeatStarted));
+    }
+
+    /// A rewrite is a new session for the log — old events describe a picture
+    /// that no longer exists and beat numbers start over — but the **transport
+    /// stays subscribed**, because a subscription is a property of the client,
+    /// not of the scene it happens to be watching.
+    #[test]
+    fn reset_clears_the_log_and_keeps_the_subscription() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(0.25));
+        applied(
+            &mut ctx,
+            &Command::Events {
+                enabled: true,
+                kinds: None,
+            },
+        );
+        tick(&mut ctx, 2);
+        assert!(!ctx.take_events().is_empty());
+
+        ctx.reset();
+        assert!(ctx.events_subscribed(), "the client is still listening");
+        assert!(ctx.take_events().is_empty(), "the old scene's log is gone");
+
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(0.25));
+        tick(&mut ctx, 1);
+        match &ctx.take_events()[0] {
+            Event::BeatStarted { beat, .. } => assert_eq!(*beat, 1, "numbering starts over"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An animation pushed straight into the scheduler is **not** reported.
+    ///
+    /// The queue is what events describe: a bypass skips the motion policy and
+    /// the beat identity together, and inventing a beat number for it would
+    /// make `beat` mean two things.
+    #[test]
+    fn a_hand_added_animation_is_not_a_beat() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.animations.add(FadeIn::new(id).with_duration(0.25));
+        while !ctx.animations.is_empty() {
+            ctx.advance(DT);
+        }
+        assert!(ctx.take_events().is_empty());
     }
 
     /// Manim's `Scene.wait` is `play(Wait(duration))` (`scene.py:1242-1276`), and it

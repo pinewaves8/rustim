@@ -47,12 +47,14 @@
 pub mod a11y;
 pub mod command;
 pub mod context;
+pub mod event;
 pub mod text;
 pub mod typeset;
 
 pub use a11y::{CameraView, SemanticNode, SemanticRole, SemanticTree, SemanticValue};
 pub use command::{Command, CommandError, CommandOutcome, CommandReply, StateDiff, Target};
 pub use context::{Scene, SceneContext};
+pub use event::{Event, EventKind, EventLine, MAX_EVENTS, event_line};
 pub use typeset::{TextSpec, TypesetError, TypesetFormula, Typesetter};
 
 /// Re-exported so scene authors do not have to depend on the mobject crate

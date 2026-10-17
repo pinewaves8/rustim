@@ -1371,6 +1371,87 @@ fn a_transform_command_needs_into_on_the_wire() {
     assert_eq!(wire["property"], "into");
 }
 
+/// A subscription turns the reply stream into a stream of two kinds of line,
+/// and the *presence of `seq`* is the classifier between them.
+///
+/// The events a still produces are the ones its timeline did: the beat started,
+/// it ended, and then the host wrote a frame. The ordering is the contract — the
+/// replies come first (a `--png` run applies the whole script at t = 0, before
+/// any time passes), and the beat events follow the timeline that ran during
+/// `settle`. This is the end-to-end form of "a client can follow the engine
+/// without polling", made against the real binary.
+#[test]
+fn a_subscribed_script_receives_beat_events_and_a_frame_ready() {
+    let script = scratch(
+        "events",
+        concat!(
+            r#"{"action":"events","enabled":true}"#,
+            "\n",
+            r#"{"action":"add","type":"square","params":{"width":1.0}}"#,
+            "\n",
+            r#"{"action":"play","animation":{"target":4294967297,"type":"fade_in","duration":0.5}}"#,
+            "\n",
+        ),
+    );
+    let ran = run(&[
+        "--script",
+        script.to_str().unwrap(),
+        "--reply",
+        "--png",
+        out_path("events").to_str().unwrap(),
+    ]);
+    ran.ok("--script with an event subscription");
+
+    let values: Vec<serde_json::Value> = ran
+        .stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{l:?}: {e}")))
+        .collect();
+    let (replies, events): (Vec<_>, Vec<_>) = values.iter().partition(|v| v.get("seq").is_some());
+
+    assert_eq!(replies.len(), 3, "one reply per command: {:#?}", replies);
+    assert_eq!(
+        events.len(),
+        3,
+        "a start, an end and a frame: {:#?}",
+        events
+    );
+    for event in &events {
+        assert!(event.get("seq").is_none(), "an event answers no command");
+        assert_eq!(
+            event.as_object().expect("an object").len(),
+            1,
+            "one key: {event}"
+        );
+    }
+
+    let started = &events[0]["event"];
+    assert_eq!(started["kind"], "beat_started");
+    assert_eq!(started["beat"], 1);
+    assert_eq!(started["members"], 1);
+    assert_eq!(started["duration"], 0.5);
+    let at = started["clock"].as_f64().expect("a clock");
+    assert!(at > 0.0 && at < 0.1, "the first frame starts it: {at}");
+
+    let done = &events[1]["event"];
+    assert_eq!(done["kind"], "animation_done");
+    assert_eq!(done["beat"], 1);
+    let ended = done["clock"].as_f64().expect("a clock");
+    assert!(
+        (ended - 0.5).abs() < 0.05,
+        "half a second after the start: {ended}"
+    );
+
+    let frame = &events[2]["event"];
+    assert_eq!(frame["kind"], "frame_ready");
+    assert_eq!(frame["frame"], 1, "a still is one frame");
+    let clock = frame["clock"].as_f64().expect("a clock");
+    assert!(
+        (clock - 10.0).abs() < 1e-6,
+        "the still is taken at t = 10: {clock}"
+    );
+}
+
 /// A script path that cannot be read is an `exit(2)`, not a silent no-op.
 ///
 /// The one failure here that is not a per-line refusal: there is no line to

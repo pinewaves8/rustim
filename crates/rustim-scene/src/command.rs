@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::a11y::SemanticTree;
+use crate::event::EventKind;
 use rustim_anim::{
     Animate, Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale,
     StyleProperty, Succession, TransformGroup, Uncreate, WithRate,
@@ -316,6 +317,44 @@ pub enum Command {
     /// context rather than in the tree; the returned diff is empty for the same
     /// reason a camera command's is.
     Motion { mode: MotionMode },
+    /// Subscribe this session to out-of-band events, or stop the stream.
+    ///
+    /// A reply answers a command; an event reports what the engine did on its
+    /// own — the two facts a client driving a *continuous* engine cannot get
+    /// from request/response. After this command, the transport may interleave
+    /// event lines with replies:
+    ///
+    /// ```text
+    /// {"event":{"kind":"beat_started","beat":1,"members":2,"duration":1.5,"clock":0.25}}
+    /// {"event":{"kind":"animation_done","beat":1,"clock":1.75}}
+    /// {"event":{"kind":"frame_ready","frame":108,"clock":1.8}}
+    /// ```
+    ///
+    /// An event line carries **no `seq`** and the single key `event`, so it
+    /// answers no command and a client reads a line by asking which of the two
+    /// it is. A client that never sends this command never sees one, which is
+    /// what keeps a strictly request/response host from skipping lines it did
+    /// not order.
+    ///
+    /// `kinds` selects a subset; absent means all of them. The useful spelling
+    /// for a script-follower is `["beat_started","animation_done"]`, because a
+    /// `frame_ready` arrives at the frame rate. An empty list is refused under
+    /// `kinds`: it selects nothing, and `enabled: false` is the way to say
+    /// stop.
+    ///
+    /// The subscription is **session state**, not tree state: it survives a
+    /// `reset` (the next scene still publishes to the same client) and is not
+    /// captured by `checkpoint`/`undo` (an undo does not rewind a transport).
+    /// The reply is an empty [`StateDiff`] for `play`'s reason: a subscription
+    /// changes no node.
+    ///
+    /// What is emitted is described in [`crate::event`] — in particular, an
+    /// interrupt (`stop`, `undo`) is **not** an `animation_done`.
+    Events {
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kinds: Option<Vec<EventKind>>,
+    },
     /// Read the semantic tree back, changing nothing.
     ///
     /// The read half of the command surface. Until it existed a live session
@@ -359,6 +398,7 @@ pub const ACTIONS: &[&str] = &[
     "batch",
     "camera",
     "checkpoint",
+    "events",
     "hello",
     "motion",
     "narrate",
@@ -402,6 +442,7 @@ impl Command {
             Self::Camera { .. } => "camera",
             Self::Narrate { .. } => "narrate",
             Self::Motion { .. } => "motion",
+            Self::Events { .. } => "events",
             Self::Query { .. } => "query",
         }
     }
@@ -1327,6 +1368,12 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // reach. Keeping the arm is what lets a direct `apply` caller replay
             // the same command log without a panic.
         }
+        Command::Events { .. } => {
+            // And likewise: the subscription is session state on the
+            // `SceneContext`, not a node. Keeping the arm is what lets a direct
+            // `apply` caller replay a whole log — including the subscription —
+            // without a panic.
+        }
         Command::Narrate { .. } => {
             // Answered by `SceneContext::handle`, because scheduling narration
             // needs the virtual clock and the narration track — neither of which
@@ -2082,6 +2129,12 @@ mod tests {
             // and giving it one would tie the protocol to a library's naming.
             r#"{"action":"motion","mode":"reduced"}"#.to_owned(),
             r#"{"action":"motion","mode":"full"}"#.to_owned(),
+            // The event subscription. `enabled` is the switch and `kinds` an
+            // optional filter — absent means every kind, so the second spelling
+            // must not gain an empty array or a `null`.
+            r#"{"action":"events","enabled":true}"#.to_owned(),
+            r#"{"action":"events","enabled":true,"kinds":["beat_started","frame_ready"]}"#.to_owned(),
+            r#"{"action":"events","enabled":false}"#.to_owned(),
             // Narration: `text` then `at` (declaration order), and an absent
             // delay is omitted rather than written as `null`. The text is UTF-8
             // in the document — serde_json does not escape non-ASCII — so a
@@ -2185,6 +2238,10 @@ mod tests {
             },
             Command::Motion {
                 mode: MotionMode::Reduced,
+            },
+            Command::Events {
+                enabled: true,
+                kinds: None,
             },
             Command::Narrate {
                 text: "先看这个三角形".to_owned(),

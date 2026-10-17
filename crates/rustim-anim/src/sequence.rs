@@ -35,6 +35,22 @@ use rustim_mobject::SceneTree;
 
 use crate::{Animation, AnimationScheduler, Motion, Wait};
 
+/// What a beat looked like when it was handed to the clock.
+///
+/// Returned by [`Sequence::start_next`] so a caller — the scene context — can
+/// report a `beat_started` event without knowing how the queue is stored or how
+/// reduced motion substitutes a hold. Counted from the **script**, not from the
+/// scheduler: under [`Motion::Reduced`] the members never reach the clock, and
+/// `members` is still what the scene wrote, because that is what a client that
+/// is following along was told the beat was.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StartedBeat {
+    /// How many animations the beat contains.
+    pub members: usize,
+    /// The beat's nominal length: `max(duration)` over its members, in seconds.
+    pub duration: f64,
+}
+
 /// A script of beats.
 ///
 /// A *beat* is the set of animations that play together — Manim's one
@@ -88,11 +104,17 @@ impl Sequence {
         }
     }
 
-    /// Move the next beat into `sched`, and report whether there was one.
+    /// Move the next beat into `sched`, and report what was started.
     ///
     /// This is the only way a beat ever reaches the scheduler, which is what makes
     /// both "one beat at a time" and the reduced-motion policy properties of the
     /// type rather than of every caller.
+    ///
+    /// `None` means the script is exhausted; `Some` describes the beat that was
+    /// handed over, for a caller that reports it as an event. The returned
+    /// description is of the **script's** beat even under [`Motion::Reduced`],
+    /// where its members are snapped to their end state and a single hold takes
+    /// their place on the clock.
     ///
     /// # `motion`
     ///
@@ -144,15 +166,19 @@ impl Sequence {
         sched: &mut AnimationScheduler,
         tree: &mut SceneTree,
         motion: Motion,
-    ) -> bool {
-        let Some(mut beat) = self.steps.pop_front() else {
-            return false;
-        };
+    ) -> Option<StartedBeat> {
+        let mut beat = self.steps.pop_front()?;
+        let members = beat.len();
+        let duration = beat
+            .iter()
+            .map(|anim| anim.duration())
+            .fold(0.0_f64, f64::max);
+        let started = StartedBeat { members, duration };
         if !motion.is_reduced() {
             for anim in beat {
                 sched.add_boxed(anim);
             }
-            return true;
+            return Some(started);
         }
         let mut hold = 0.0_f64;
         for anim in &mut beat {
@@ -171,7 +197,7 @@ impl Sequence {
         if hold > 0.0 {
             sched.add_boxed(Box::new(Wait::new(hold)));
         }
-        true
+        Some(started)
     }
 
     /// True when no beats are left to start.
@@ -283,7 +309,7 @@ mod tests {
         let mut frames = 0;
         while !seq.is_empty() || !sched.is_empty() {
             if sched.is_empty() {
-                seq.start_next(&mut sched, &mut tree, motion);
+                let _ = seq.start_next(&mut sched, &mut tree, motion);
             }
             sched.update(DT, &mut tree);
             clock.tick();
@@ -424,7 +450,8 @@ mod tests {
         let mut sched = AnimationScheduler::new();
         let mut tree = SceneTree::new();
         assert!(
-            !seq.start_next(&mut sched, &mut tree, Motion::Full),
+            seq.start_next(&mut sched, &mut tree, Motion::Full)
+                .is_none(),
             "nothing to start"
         );
         assert!(sched.is_empty(), "and the scheduler stays empty");
@@ -451,11 +478,15 @@ mod tests {
         let mut tree = SceneTree::new();
         seq.push([a]);
 
-        assert!(seq.start_next(&mut sched, &mut tree, Motion::Full));
+        assert!(
+            seq.start_next(&mut sched, &mut tree, Motion::Full)
+                .is_some()
+        );
         assert_eq!(sched.len(), 1);
         assert!(seq.is_empty());
         assert!(
-            !seq.start_next(&mut sched, &mut tree, Motion::Full),
+            seq.start_next(&mut sched, &mut tree, Motion::Full)
+                .is_none(),
             "the script is exhausted"
         );
         assert_eq!(sched.len(), 1, "and nothing was added");
@@ -506,7 +537,10 @@ mod tests {
 
         let mut sched = AnimationScheduler::new();
         let mut tree = SceneTree::new();
-        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
+        assert!(
+            seq.start_next(&mut sched, &mut tree, Motion::Reduced)
+                .is_some()
+        );
 
         for _ in 0..40 {
             sched.update(DT, &mut tree);
@@ -591,7 +625,10 @@ mod tests {
         seq.push(beat);
 
         let mut sched = AnimationScheduler::new();
-        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
+        assert!(
+            seq.start_next(&mut sched, &mut tree, Motion::Reduced)
+                .is_some()
+        );
 
         assert!(
             tree.get(gone).is_none(),

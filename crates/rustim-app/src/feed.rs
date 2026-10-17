@@ -49,7 +49,8 @@ use std::io::{self, BufRead, Write};
 
 use rustim_anim::Rate;
 use rustim_scene::command::AnimationKind;
-use rustim_scene::{Scene, SceneContext};
+use rustim_scene::event::event_line;
+use rustim_scene::{Event, EventKind, Scene, SceneContext};
 
 use crate::AppEvent;
 
@@ -129,7 +130,14 @@ pub fn apply_all(
         }
 
         if let Some(w) = reply.as_mut() {
-            let written = writeln!(w, "{}", reply_line(seq, outcome)).and_then(|()| w.flush());
+            // The reply first, then whatever the command set in motion: a
+            // `seek` can cross several beats, and each `beat_started` /
+            // `animation_done` it produces follows the reply that asked for
+            // it. A refusal publishes nothing, because a refused line changed
+            // nothing to report.
+            let written = writeln!(w, "{}", reply_line(seq, outcome))
+                .and_then(|()| w.flush())
+                .and_then(|()| publish_events(ctx, w));
             if written.is_err() {
                 // The host's end of the pipe is gone. Stop answering rather than
                 // repeating the same failure for every remaining line; the feed
@@ -140,6 +148,66 @@ pub fn apply_all(
         }
     }
     counts
+}
+
+/// Publish the events recorded since the last call, oldest first.
+///
+/// The transport half of [`rustim_scene::event`]: the kernel records what the
+/// timeline did, and this writes the lines a subscribed session asked for. Two
+/// rules it keeps:
+///
+/// * **It drains whether or not the session is subscribed.** The queue is the
+///   kernel's memory and is bounded; a host that never subscribed must still
+///   empty it, or a long session fills [`rustim_scene::MAX_EVENTS`] and starts
+///   dropping the events it *would* have wanted after subscribing mid-run.
+/// * **It writes only what passes the session's filter.** `wants_event` is the
+///   one place the subscription is read, so a `frame_ready`-only subscriber
+///   gets no beat lines without this function knowing about the filter itself.
+///
+/// The lines carry no `seq`: an event answers no command. See [`rustim_scene::event`]
+/// for why the two kinds of line are distinguished by their key rather than by
+/// a position in the stream.
+pub fn publish_events(ctx: &mut SceneContext, w: &mut dyn Write) -> io::Result<()> {
+    let events = ctx.take_events();
+    if events.is_empty() {
+        return Ok(());
+    }
+    let mut wrote = false;
+    for event in &events {
+        if !ctx.wants_event(event.kind()) {
+            continue;
+        }
+        writeln!(w, "{}", event_line(event))?;
+        wrote = true;
+    }
+    if wrote {
+        // Flushed like a reply: the host on the other end of a pipe is waiting
+        // for the beat, not for the process to exit.
+        w.flush()?;
+    }
+    Ok(())
+}
+
+/// Publish one `frame_ready` for a frame this host has presented or written.
+///
+/// Host-produced, because the engine has no frames — it has virtual time. The
+/// number is the host's own 1-based frame count, and it is deliberately *not*
+/// the draw-list's op count or anything the kernel could disagree with. Gated
+/// by the subscription exactly as the kernel's events are, so a timeline-only
+/// subscriber pays one `is_some_and` per frame and no line.
+pub fn publish_frame(ctx: &mut SceneContext, frame: u64, w: &mut dyn Write) -> io::Result<()> {
+    if !ctx.wants_event(EventKind::FrameReady) {
+        return Ok(());
+    }
+    writeln!(
+        w,
+        "{}",
+        event_line(&Event::FrameReady {
+            frame,
+            clock: ctx.clock(),
+        })
+    )?;
+    w.flush()
 }
 
 /// Every line of a script, numbered from 1.
@@ -537,6 +605,110 @@ mod tests {
         assert_eq!(scene.seen[0].created.len(), 1);
         assert_eq!(scene.seen[1].created.len(), 1);
         assert_ne!(scene.seen[0].created[0], scene.seen[1].created[0]);
+    }
+
+    /// A subscribed session's stream carries both kinds of line: replies with
+    /// `seq`, and events with no `seq` and a single `event` key.
+    ///
+    /// The beat event arrives *after* the reply that queued it, because a
+    /// command's answer is about the command and the event is about what it set
+    /// in motion. A client's line classifier is "does it have `seq`", which is
+    /// exactly why the event line must not carry one.
+    #[test]
+    fn a_subscribed_session_publishes_events_beside_its_replies() {
+        let mut scene = Recorder::default();
+        let mut ctx = context();
+        let mut out: Vec<u8> = Vec::new();
+
+        apply_all(
+            &mut scene,
+            &mut ctx,
+            vec![(1, r#"{"action":"events","enabled":true}"#.to_owned())],
+            Some(&mut out),
+        );
+        // A subscription itself produces no event.
+        publish_events(&mut ctx, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out.clone()).unwrap().lines().count(), 1);
+
+        let id = ctx.add(rustim_mobject::shapes::build(
+            rustim_mobject::shapes::ShapeKind::Square,
+            &rustim_mobject::shapes::ShapeParams::default(),
+        ));
+        ctx.play(rustim_anim::FadeIn::new(id).with_duration(0.25));
+        ctx.advance(1.0 / 60.0);
+        publish_events(&mut ctx, &mut out).unwrap();
+        publish_frame(&mut ctx, 7, &mut out).unwrap();
+
+        let text = String::from_utf8(out).expect("utf-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        let reply: CommandReply = serde_json::from_str(lines[0]).expect("a reply");
+        assert_eq!(reply.seq, 1);
+        assert!(reply.diff.as_ref().is_some_and(StateDiff::is_empty));
+
+        let event: rustim_scene::EventLine =
+            serde_json::from_str(lines[1]).unwrap_or_else(|e| panic!("{}: {e}", lines[1]));
+        assert_eq!(
+            event.event,
+            Event::BeatStarted {
+                beat: 1,
+                members: 1,
+                duration: 0.25,
+                clock: 1.0 / 60.0,
+            }
+        );
+        assert!(!lines[1].contains("\"seq\""), "{}", lines[1]);
+
+        let frame: rustim_scene::EventLine = serde_json::from_str(lines[2]).expect("a frame line");
+        assert_eq!(
+            frame.event,
+            Event::FrameReady {
+                frame: 7,
+                clock: 1.0 / 60.0
+            }
+        );
+        assert!(!lines[2].contains("\"seq\""), "{}", lines[2]);
+    }
+
+    /// The filter is applied at publication, and the queue is drained either
+    /// way. Both halves matter: a `frame_ready`-only subscriber must not be
+    /// flooded with beat lines, and a session that never subscribed must still
+    /// empty the bounded queue so a later subscription starts from now.
+    #[test]
+    fn the_filter_selects_what_is_written_and_the_queue_drains_regardless() {
+        let mut ctx = context();
+        let mut out: Vec<u8> = Vec::new();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            rustim_mobject::shapes::ShapeKind::Square,
+            &rustim_mobject::shapes::ShapeParams::default(),
+        ));
+
+        // Not subscribed: a produced beat event is written nowhere, and the
+        // queue is empty afterwards. That is the drain every host owes the
+        // kernel whether or not it listens.
+        ctx.play(rustim_anim::FadeIn::new(id).with_duration(0.25));
+        ctx.advance(1.0 / 60.0);
+        publish_events(&mut ctx, &mut out).unwrap();
+        assert!(out.is_empty());
+        assert!(ctx.take_events().is_empty(), "the queue was drained");
+
+        // Subscribed to `frame_ready` alone: the host's own frame line passes
+        // and the kernel's beat events do not.
+        ctx.handle(&Command::Events {
+            enabled: true,
+            kinds: Some(vec![EventKind::FrameReady]),
+        })
+        .unwrap();
+        // A second beat, produced by the same context, so the filter has
+        // something real to suppress.
+        ctx.play(rustim_anim::Wait::new(0.25));
+        ctx.advance(1.0);
+        publish_events(&mut ctx, &mut out).unwrap();
+        assert!(out.is_empty(), "beat_started was filtered out");
+        publish_frame(&mut ctx, 1, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("frame_ready"), "{text}");
     }
 
     /// The reply stream survives a host that stops reading.

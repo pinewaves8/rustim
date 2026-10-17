@@ -685,8 +685,10 @@ mod tests {
         seq.push(group);
 
         let mut sched = AnimationScheduler::new();
-        let beat = seq.start_next(&mut sched, &mut tree, Motion::Reduced);
-        assert!(beat);
+        assert!(
+            seq.start_next(&mut sched, &mut tree, Motion::Reduced)
+                .is_some()
+        );
         assert!(
             tree.get(id).is_none(),
             "a reduced composed beat still runs its members' removals"
