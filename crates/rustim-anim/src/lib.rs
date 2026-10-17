@@ -55,7 +55,7 @@ pub mod sequence;
 
 use rustim_mobject::{NodeId, SceneTree};
 
-pub use ops::{FadeIn, MoveTo, Transform, Wait};
+pub use ops::{FadeIn, FadeOut, MoveTo, Rotate, Scale, Transform, Wait};
 pub use rustim_math::rate::{self, RateFunc};
 pub use sequence::Sequence;
 
@@ -110,6 +110,27 @@ pub trait Animation {
     /// Easing is applied *inside* the implementation, not by the scheduler.
     fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree);
 
+    /// Called exactly once, **after** the last `interpolate`, when the animation
+    /// has reached its end.
+    ///
+    /// The hook Manim calls `clean_up_from_scene` (`animation/animation.py:229-241`),
+    /// which is what makes `FadeOut` actually remove its object (`fading.py:184-192`)
+    /// rather than leaving a transparent one behind. Most animations have nothing
+    /// to do here, so the default is a no-op.
+    ///
+    /// Two things about the contract are load-bearing:
+    ///
+    /// * **It runs only for animations that *complete*.** A script dropped by
+    ///   [`Sequence::clear`] or [`AnimationScheduler::clear`] leaves its objects in
+    ///   the tree — "the scene was dismantled" is not "the animation finished", and
+    ///   a half-removed scene is worse than an un-removed one.
+    /// * **It must be forwarded by the blanket `impl Animation for Box<T>`.** Both
+    ///   containers here hold `Box<dyn Animation>`, so a non-forwarding impl sends
+    ///   every call to this default and the removal silently never happens through
+    ///   the two routes that matter — while a direct call on a concrete animation
+    ///   still works, which is what makes it expensive to find. See the impl below.
+    fn finish(&mut self, _tree: &mut SceneTree) {}
+
     /// The easing curve applied to raw progress before `interpolate`.
     fn rate_func(&self) -> RateFunc {
         rate::ease_in_out
@@ -147,6 +168,20 @@ impl<T: Animation + ?Sized> Animation for Box<T> {
 
     fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
         (**self).interpolate(alpha, tree)
+    }
+
+    /// Forwarded, and this one is not a formality like the others.
+    ///
+    /// `duration`, `begin`, `interpolate` and `rate_func` all have to be here or
+    /// the box would not work at all; `finish` is different, because it has a
+    /// *default*. Omit the forward and `Box<dyn Animation>::finish` resolves to
+    /// the trait's no-op, which type-checks, runs, and silently skips the one
+    /// thing the hook exists for — through the scheduler and through
+    /// `Sequence`, the only two places that drive a boxed animation. That is why
+    /// `fade_out_removes_its_target_when_the_scheduler_finishes_it` goes through
+    /// `AnimationScheduler::add` rather than calling `finish` directly.
+    fn finish(&mut self, tree: &mut SceneTree) {
+        (**self).finish(tree)
     }
 
     fn rate_func(&self) -> RateFunc {
@@ -231,6 +266,19 @@ impl AnimationScheduler {
             let raw = if d <= 0.0 { 1.0 } else { age / d };
             let alpha = r.anim.ease(raw);
             r.anim.interpolate(alpha, tree);
+        }
+        // Completion, then the sweep. The predicate is the exact complement of
+        // `retain`'s, so an animation's `finish` runs on the same tick it leaves
+        // the list — once, after an `interpolate(1.0)` it can rely on, and for a
+        // zero-duration animation on its very first tick (`raw` is forced to 1.0
+        // above, and `0.0 < 0.0` is already false for `retain`).
+        //
+        // `finish` may remove nodes from `tree`; `running` is a different field, so
+        // the two borrows are disjoint and the walk stays valid.
+        for r in &mut self.running {
+            if self.elapsed - r.started_at >= r.anim.duration() {
+                r.anim.finish(tree);
+            }
         }
         self.running
             .retain(|r| self.elapsed - r.started_at < r.anim.duration());
@@ -578,5 +626,149 @@ mod tests {
         // no-op, not a crash, because the AI layer can reach this.
         let mut anim = FadeIn::new(ghost);
         anim.interpolate(0.5, &mut tree);
+    }
+
+    // ---- the `finish` hook ------------------------------------------------
+
+    /// Records *when* `finish` ran, as the number of alphas seen by then.
+    ///
+    /// The contract is about order and count rather than about the hook
+    /// existing, so a boolean would not be able to fail the interesting cases —
+    /// `finish` running before the last frame, or running on every frame after
+    /// the first.
+    /// Shared with the test, which reads what the animation recorded.
+    type Alphas = std::rc::Rc<std::cell::RefCell<Vec<f64>>>;
+    type Finishes = std::rc::Rc<std::cell::RefCell<Vec<usize>>>;
+
+    struct Lifecycle {
+        alphas: Alphas,
+        finishes: Finishes,
+        duration: f64,
+    }
+
+    impl Lifecycle {
+        fn new(duration: f64) -> (Self, Alphas, Finishes) {
+            let alphas: Alphas = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let finishes: Finishes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            (
+                Self {
+                    alphas: alphas.clone(),
+                    finishes: finishes.clone(),
+                    duration,
+                },
+                alphas,
+                finishes,
+            )
+        }
+    }
+
+    impl Animation for Lifecycle {
+        fn duration(&self) -> f64 {
+            self.duration
+        }
+        fn interpolate(&mut self, alpha: f64, _tree: &mut SceneTree) {
+            self.alphas.borrow_mut().push(alpha);
+        }
+        fn finish(&mut self, _tree: &mut SceneTree) {
+            self.finishes.borrow_mut().push(self.alphas.borrow().len());
+        }
+        fn rate_func(&self) -> RateFunc {
+            rate::linear
+        }
+    }
+
+    /// `finish` runs **once**, on the same tick the animation leaves, and after an
+    /// `interpolate(1.0)` it can rely on.
+    ///
+    /// All three parts matter and each has its own counterfactual: running before
+    /// the last frame means "the object is removed, then drawn at full opacity";
+    /// running every frame after the end would attempt the removal repeatedly;
+    /// never running is the `Box<dyn Animation>` trap the blanket impl's doc names.
+    #[test]
+    fn finish_runs_once_and_after_the_last_interpolate() {
+        let (anim, alphas, finishes) = Lifecycle::new(0.5);
+        let mut sched = AnimationScheduler::new();
+        // Through `add`, so the call reaches `Box<dyn Animation>::finish` — the
+        // only route a scene has.
+        sched.add(anim);
+        let (mut tree, _) = scene_with_cube();
+        for _ in 0..40 {
+            sched.update(1.0 / 60.0, &mut tree);
+        }
+
+        let alphas = alphas.borrow();
+        let finishes = finishes.borrow();
+        assert_eq!(
+            finishes.len(),
+            1,
+            "exactly one completion, not one per frame"
+        );
+        assert_eq!(finishes[0], alphas.len(), "and after the last interpolate");
+        assert_eq!(*alphas.last().unwrap(), 1.0, "which is the end state");
+        assert!(sched.is_empty());
+    }
+
+    #[test]
+    fn finish_is_not_called_while_the_animation_runs() {
+        let (anim, alphas, finishes) = Lifecycle::new(1.0);
+        let mut sched = AnimationScheduler::new();
+        sched.add(anim);
+        let (mut tree, _) = scene_with_cube();
+        for _ in 0..30 {
+            sched.update(1.0 / 60.0, &mut tree);
+        }
+        assert!(!alphas.borrow().is_empty(), "it really is running");
+        assert!(!sched.is_empty());
+        assert!(
+            finishes.borrow().is_empty(),
+            "half a second in, nothing has completed"
+        );
+    }
+
+    /// The scheduler forces `raw` to `1.0` for a zero-duration animation rather
+    /// than dividing by zero, and the completion predicate is that same
+    /// comparison — so this reaches its end on the very first tick and must be
+    /// finished there. A `Wait::new(0.0)`-style beat is the ordinary way this
+    /// arises.
+    #[test]
+    fn a_zero_duration_animation_is_finished_too() {
+        let (anim, alphas, finishes) = Lifecycle::new(0.0);
+        let mut sched = AnimationScheduler::new();
+        sched.add(anim);
+        let (mut tree, _) = scene_with_cube();
+
+        sched.update(1.0 / 60.0, &mut tree);
+
+        assert_eq!(alphas.borrow().as_slice(), &[1.0]);
+        assert_eq!(
+            finishes.borrow().as_slice(),
+            &[1],
+            "finished on that same tick"
+        );
+        assert!(sched.is_empty());
+    }
+
+    /// "The scene was dismantled" is not "the animation finished".
+    ///
+    /// A dropped script must leave its objects where they are: half-removing a
+    /// scene when its timeline is torn down would make a reset depend on how far
+    /// the script happened to have got.
+    #[test]
+    fn clearing_the_scheduler_does_not_finish() {
+        let (anim, _, finishes) = Lifecycle::new(2.0);
+        let mut sched = AnimationScheduler::new();
+        sched.add(anim);
+        let (mut tree, _) = scene_with_cube();
+        for _ in 0..10 {
+            sched.update(1.0 / 60.0, &mut tree);
+        }
+
+        sched.clear();
+
+        assert!(sched.is_empty());
+        assert!(
+            finishes.borrow().is_empty(),
+            "a teardown is not a completion"
+        );
     }
 }

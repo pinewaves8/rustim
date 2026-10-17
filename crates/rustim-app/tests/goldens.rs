@@ -29,8 +29,8 @@
 //! Blessing writes whatever the current build produces, so it is only correct
 //! when the change is meant. It should also be run in the same profile the suite
 //! is run in, since the render and the baseline have to come from the same float
-//! codegen — the three scenes here were measured byte-identical between debug and
-//! release on the floor machine, but that is luck about this build, not a
+//! codegen — all seven scenes have been measured **byte-identical between debug
+//! and release** on the floor machine, but that is luck about this build, not a
 //! property of the pipeline.
 //!
 //! # What is *not* here
@@ -54,13 +54,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_rustim-app");
 /// registry without a golden fails the suite rather than quietly going
 /// untested, and a scene removed from it fails too, rather than leaving a stale
 /// baseline behind.
-const SCENES: [&str; 6] = [
+const SCENES: [&str; 7] = [
     "pythagorean",
     "primitives",
     "composite",
     "text",
     "formula",
     "transform",
+    "rotate",
 ];
 
 fn platform() -> String {
@@ -99,12 +100,20 @@ fn artifacts_dir() -> PathBuf {
 /// (`reduced_motion_leaves_the_settled_frame_identical`), not one to rely on for
 /// what a baseline means.
 fn render(scene: &str) -> PathBuf {
-    render_at(scene, "full")
+    render_at(scene, "full", "golden")
 }
 
 /// Render one scene at a chosen motion mode.
-fn render_at(scene: &str, motion: &str) -> PathBuf {
-    let out = artifacts_dir().join(format!("{scene}-{motion}-{}.png", platform()));
+///
+/// **`tag` names the caller, and it is not decoration either.** Two tests can ask
+/// for the same `(scene, motion)` — the golden test and the reduced-motion
+/// comparison, which renders the full mode a second time — and cargo runs tests in
+/// parallel threads. Without the tag they share an artifact path, and the reader
+/// intermittently gets a file the other thread has just truncated:
+/// `transform-full-linux-aarch64.png: unexpected end of file`, from a test whose
+/// own two renders were perfectly fine.
+fn render_at(scene: &str, motion: &str, tag: &str) -> PathBuf {
+    let out = artifacts_dir().join(format!("{scene}-{motion}-{tag}-{}.png", platform()));
     std::fs::create_dir_all(out.parent().expect("artifacts dir has a parent"))
         .expect("create artifacts dir");
 
@@ -230,7 +239,119 @@ fn transform_matches_its_baseline() {
     check("transform");
 }
 
-/// **Reduced motion changes the journey, not the picture.**
+/// The rotate scene is the only one where the third beat makes an object
+/// *disappear*, and the still is the evidence that it did.
+///
+/// What an image adds over the unit tests: `FadeOut`'s opacity ramp is pinned in
+/// `rustim-anim`, and its `finish` hook is pinned through the scheduler — but only
+/// a render shows that the removal reached the mutating tree the draw walk reads,
+/// that a **rotated arrow** rasterises (the arrow is the one shape whose outline
+/// the rasteriser has never been asked for at an angle), and that the circle grew
+/// about *its own* centre: a scale about the origin instead would have carried the
+/// circle across the frame, and no unit test asserts where the scene put it.
+#[test]
+fn rotate_matches_its_baseline() {
+    check("rotate");
+}
+
+/// The same identity as the transform scene's, over a scene that exercises a
+/// *different* `finish` call site.
+///
+/// `Sequence`'s reduced branch never hands a beat to the scheduler, so a `FadeOut`
+/// under `--motion reduced` is finished there rather than in
+/// `AnimationScheduler::update`. Both routes have to end with the square gone and
+/// the arrow at the same angle, and comparing the two stills is what says so.
+#[test]
+fn reduced_motion_leaves_the_rotate_scene_identical() {
+    let full = render_at("rotate", "full", "vs-reduced");
+    let reduced = render_at("rotate", "reduced", "vs-reduced");
+
+    let tolerance = Tolerance::default();
+    let diff = compare_png_files(&full, &reduced, &tolerance).unwrap_or_else(|e| {
+        panic!(
+            "comparing {} against {}: {e}",
+            full.display(),
+            reduced.display()
+        )
+    });
+    assert_eq!(
+        diff.max,
+        0,
+        "the settled rotate frame moved under reduced motion — the reduced \
+         branch's `finish` and the scheduler's must leave the tree in the same \
+         state.\n{}",
+        diff.report(&tolerance),
+    );
+    assert!(
+        diff.diff_bbox.is_none(),
+        "no pixel may differ at all, not merely none by more than the tolerance"
+    );
+}
+
+/// **The only assertion in the workspace that can see a `finish` that never ran.**
+///
+/// The rotate scene fades a square out as its third beat; a `FadeOut` that ramps the
+/// opacity to zero but never removes its node leaves a fully transparent mobject in
+/// the tree, and **no image can tell the difference** — it draws nothing either way.
+/// The accessibility tree can: the node is still there to be reached by Tab and
+/// announced by a screen reader, which for a vanished object is a lie.
+///
+/// Counting is deliberately on the accessibility projection rather than on
+/// `SceneTree::root_ids` (which `rustim-anim`'s own tests already assert), because
+/// that is the *consumer* that would be wrong; and it is done by running the real
+/// binary, because the count the module under test reports about itself is the same
+/// one that would be wrong about itself.
+#[test]
+fn the_rotate_scene_leaves_two_objects_behind() {
+    let output = Command::new(BIN)
+        .args(["--scene", "rotate", "--inspect"])
+        .output()
+        .expect("run --inspect");
+    assert!(
+        output.status.success(),
+        "`--scene rotate --inspect` failed with {}:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let tree: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--inspect must emit JSON");
+    let nodes = tree["nodes"].as_array().expect("nodes must be an array");
+    let root = &tree["root"];
+
+    // The root is one of the nodes, so two objects is three entries.
+    assert_eq!(
+        nodes.len(),
+        3,
+        "expected the arrow and the circle, and nothing else, in:\n{}",
+        serde_json::to_string_pretty(&tree).unwrap_or_default(),
+    );
+
+    let root_node = nodes
+        .iter()
+        .find(|n| &n["id"] == root)
+        .expect("the root id must name a node");
+    let children = root_node["children"]
+        .as_array()
+        .expect("children must be an array");
+    assert_eq!(children.len(), 2, "the root group has two members");
+
+    // The square was the one carrying that label, so its absence is the claim; the
+    // other two labels are asserted too, so a scene edit that faded out the wrong
+    // object cannot pass by keeping the count right.
+    let names: Vec<&str> = nodes
+        .iter()
+        .filter_map(|n| n["name"].as_str())
+        .filter(|n| !n.is_empty())
+        .collect();
+    assert_eq!(
+        names,
+        ["位移", "圆的面积"],
+        "the square that faded out is the one that must be missing"
+    );
+}
+
+/// The scene list here and the scene registry in the binary must not drift.
 ///
 /// Under `--motion reduced` a beat is not interpolated: it lands on its end state
 /// and holds for its own length (`rustim_anim::Sequence::start_next`). The still
@@ -244,8 +365,8 @@ fn transform_matches_its_baseline() {
 /// is a scalar and would agree for trivial reasons.
 #[test]
 fn reduced_motion_leaves_the_settled_frame_identical() {
-    let full = render_at("transform", "full");
-    let reduced = render_at("transform", "reduced");
+    let full = render_at("transform", "full", "vs-reduced");
+    let reduced = render_at("transform", "reduced", "vs-reduced");
 
     let tolerance = Tolerance::default();
     let diff = compare_png_files(&full, &reduced, &tolerance).unwrap_or_else(|e| {

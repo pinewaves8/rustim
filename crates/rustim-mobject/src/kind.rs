@@ -36,10 +36,18 @@ use crate::shapes::ShapeKind;
 pub enum NodeKind {
     #[default]
     Unknown,
-    /// The three shapes [`crate::shapes::build`] can construct.
+    /// The shapes [`crate::shapes::build`] can construct.
     Square,
     Circle,
     RightTriangle,
+    /// A straight segment and a segment with a head on it.
+    ///
+    /// Distinct kinds rather than `Unknown` even though both are drawn as filled
+    /// outlines here (see [`crate::shapes::line`]): a reader who is told "长 3 的
+    /// 箭头" has been told the one thing that matters about it, and the length is
+    /// not recoverable from the kind the way a square's side is.
+    Line,
+    Arrow,
     /// A container. Reserved: nothing builds one yet, `SceneTree::reparent` is
     /// the only way to make a group today.
     Group,
@@ -56,6 +64,8 @@ impl From<ShapeKind> for NodeKind {
             ShapeKind::Square => Self::Square,
             ShapeKind::Circle => Self::Circle,
             ShapeKind::RightTriangle => Self::RightTriangle,
+            ShapeKind::Line => Self::Line,
+            ShapeKind::Arrow => Self::Arrow,
         }
     }
 }
@@ -72,6 +82,8 @@ mod tests {
             ShapeKind::Square,
             ShapeKind::Circle,
             ShapeKind::RightTriangle,
+            ShapeKind::Line,
+            ShapeKind::Arrow,
         ] {
             assert_eq!(
                 serde_json::to_string(&NodeKind::from(kind)).unwrap(),
@@ -88,6 +100,8 @@ mod tests {
             NodeKind::Square,
             NodeKind::Circle,
             NodeKind::RightTriangle,
+            NodeKind::Line,
+            NodeKind::Arrow,
             NodeKind::Group,
             NodeKind::Text,
             NodeKind::Heading,

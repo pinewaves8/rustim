@@ -126,6 +126,11 @@ impl Sequence {
     ///   and the same timing it has at full motion. A scene written with explicit
     ///   `wait(..)` calls therefore degrades correctly, which is why there is no
     ///   per-animation "is this motion?" flag to consult.
+    /// * **Every member is `finish`-ed**, because a reduced beat's members never
+    ///   reach the scheduler and it is the scheduler that normally runs an
+    ///   animation's completion step. Skipping it would make `Motion::Reduced`
+    ///   change the *picture* — a `FadeOut`'s object would still be in the tree —
+    ///   which is the one thing this mode may not do.
     ///
     /// A beat whose members are all zero-length adds no hold at all: `update`
     /// advances the clock on every call whether or not anything is running
@@ -154,6 +159,11 @@ impl Sequence {
         for anim in &mut beat {
             let alpha = anim.ease(1.0);
             anim.interpolate(alpha, tree);
+            // The beat's members never reach the scheduler on this path, so its
+            // completion step is ours to run — otherwise a `FadeOut` would remove
+            // its object at full motion and leave it behind here, which is the one
+            // way this mode could change the *picture* rather than the journey.
+            anim.finish(tree);
         }
         if hold > 0.0 {
             sched.add_boxed(Box::new(Wait::new(hold)));
@@ -183,8 +193,8 @@ impl Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RateFunc, rate};
-    use rustim_mobject::SceneTree;
+    use crate::{FadeIn, FadeOut, RateFunc, rate};
+    use rustim_mobject::{Mobject, SceneTree, shapes};
 
     /// The frame grid every recorder in a test shares.
     ///
@@ -554,6 +564,38 @@ mod tests {
             full_alphas.len() > 1,
             "the full run interpolates; {full_alphas:?}"
         );
+    }
+
+    /// **A reduced beat must still *finish* its members.**
+    ///
+    /// A beat's animations never reach the scheduler on this path, and the
+    /// scheduler is what normally runs an animation's completion step — so without
+    /// `start_next` running `finish` itself, a `FadeOut` would remove its object at
+    /// full motion and leave it in the tree here. That is the one thing reduced
+    /// motion may not do: it changes the journey, never the picture. The assertion
+    /// is on the tree rather than on a counter, because the tree *is* the picture.
+    #[test]
+    fn a_reduced_beat_finishes_its_members_too() {
+        let mut tree = SceneTree::new();
+        let gone = tree.insert(Mobject::new(shapes::circle(1.0)));
+        let kept = tree.insert(Mobject::new(shapes::square(2.0, 2.0)));
+
+        let mut seq = Sequence::new();
+        let beat: Vec<Box<dyn Animation>> = vec![
+            Box::new(FadeOut::new(gone).with_duration(0.4)),
+            Box::new(FadeIn::new(kept).with_duration(0.4)),
+        ];
+        seq.push(beat);
+
+        let mut sched = AnimationScheduler::new();
+        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
+
+        assert!(
+            tree.get(gone).is_none(),
+            "the faded node must leave the tree under reduced motion too"
+        );
+        assert!(tree.get(kept).is_some(), "and its neighbour must survive");
+        assert_eq!(tree.root_ids(), &[kept]);
     }
 
     #[test]

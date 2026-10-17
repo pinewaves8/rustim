@@ -374,6 +374,98 @@ impl Scene for TransformScene {
 }
 
 // ---------------------------------------------------------------------------
+// The rotate scene: a pivot, an in-place scale, and a removal
+// ---------------------------------------------------------------------------
+
+/// The arrow's tail, in world units.
+///
+/// A named constant because it is used twice and the two uses have to agree: once
+/// to place the arrow, and once as the `Rotate` pivot. A scene that measured the
+/// tail back out of `critical_point` would be testing its own arithmetic against
+/// itself, and the whole claim of the middle beat — "the tail does not move" — is a
+/// claim about *this* point.
+const ARROW_TAIL: (f64, f64) = (-4.5, -1.6);
+
+/// How far the arrow turns, in radians — about 34°, deliberately not a multiple of
+/// a right angle: a quarter turn about a pivot lies on the pivot's axis and hides
+/// which pivot was used, since the two candidates very nearly agree.
+const ARROW_TURN: f64 = 0.6;
+
+/// Three beats, each the only place one claim is visible.
+///
+/// 1. A fade-in of an **arrow**, a **circle** and a **square**, together.
+/// 2. A `Rotate` of the arrow about **its tail** while a `Scale` grows the circle
+///    **in place**. The settled frame is the evidence for both pivots at once: the
+///    arrow is at an angle with its tail where it started, and the circle is
+///    bigger around an unmoved centre. Neither could be read off a scene that did
+///    one of them.
+/// 3. A `FadeOut` of the square. **The settled frame has two objects, not three**,
+///    and `--inspect` lists two nodes — the only way to see that the removal
+///    happened rather than that the square merely became transparent.
+///
+/// There is no `update` override at all, unlike [`TransformScene`]'s post-timeline
+/// relabel. That is itself the claim: the removal is the *animation's* business
+/// (`Animation::finish`), not something the script has to notice and re-do, so this
+/// scene is pure `construct`.
+struct RotateScene;
+
+impl Scene for RotateScene {
+    fn construct(&mut self, ctx: &mut SceneContext) {
+        // The arrow is a *tail-anchored* shape — `shapes::arrow` puts its tail at
+        // the local origin — so its transform is the tail's position outright and
+        // `centred` (which would place its middle) is exactly wrong here.
+        let mut arrow = Mobject::new(rustim_mobject::shapes::arrow(3.0, 0.06))
+            .with_style(filled(rustim_color::BLUE, 1.0))
+            .with_kind(NodeKind::Arrow)
+            .with_label("位移");
+        arrow.transform = Affine2::translate(ARROW_TAIL);
+        arrow.opacity = 0.0;
+
+        let mut circle = centred(
+            Mobject::new(rustim_mobject::shapes::circle(1.0)),
+            (2.5, -0.6),
+        )
+        .with_style(filled(rustim_color::YELLOW, 1.0))
+        .with_kind(NodeKind::Circle)
+        .with_label("圆的面积");
+        circle.opacity = 0.0;
+
+        let mut square = centred(
+            Mobject::new(rustim_mobject::shapes::square(1.5, 1.5)),
+            (-0.4, 2.4),
+        )
+        .with_style(filled(rustim_color::RED, 1.0))
+        .with_kind(NodeKind::Square)
+        .with_label("待淡出的正方形");
+        square.opacity = 0.0;
+
+        let arrow_id = ctx.add(arrow);
+        let circle_id = ctx.add(circle);
+        let square_id = ctx.add(square);
+
+        ctx.play_all(
+            [arrow_id, circle_id, square_id]
+                .into_iter()
+                .map(|id| rustim_anim::FadeIn::new(id).with_duration(0.4)),
+        );
+
+        // One beat, two animations: a rotation whose parameter is an angle and a
+        // scale whose parameter is a factor — neither of which a componentwise
+        // affine lerp could interpolate, which is why both have their own type.
+        let turn = rustim_anim::Rotate::new(arrow_id, ARROW_TURN)
+            .about_point(Point::new(ARROW_TAIL.0, ARROW_TAIL.1))
+            .with_duration(1.2);
+        let grow = rustim_anim::Scale::new(circle_id, 1.8).with_duration(1.2);
+        ctx.play_all([
+            Box::new(turn) as Box<dyn rustim_anim::Animation>,
+            Box::new(grow),
+        ]);
+
+        ctx.play(rustim_anim::FadeOut::new(square_id).with_duration(0.6));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The primitives scene: raw draw operations
 // ---------------------------------------------------------------------------
 
@@ -910,6 +1002,7 @@ fn scene_by_name(name: &str) -> Option<Box<dyn Scene>> {
         "text" => Some(Box::new(TextScene::new())),
         "formula" => Some(Box::new(FormulaScene::new())),
         "transform" => Some(Box::new(TransformScene::new())),
+        "rotate" => Some(Box::new(RotateScene)),
         _ => None,
     }
 }
@@ -929,6 +1022,7 @@ fn scene_names() -> String {
         "text",
         "formula",
         "transform",
+        "rotate",
     ]
     .join(", ")
 }

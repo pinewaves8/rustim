@@ -1,12 +1,13 @@
 //! Concrete animations.
 //!
-//! Three of them, chosen to exercise the three shapes the design has to support:
-//! an animation that drives a scalar ([`FadeIn`]), one that interpolates a
-//! transform ([`MoveTo`]) — where the deferred transform pays off directly — and
-//! one that interpolates *point arrays* ([`Transform`], the morph), which is what
-//! puts Manim's `align_points` machinery to work.
+//! The shapes the design has to support, one animation each: a scalar
+//! ([`FadeIn`], [`FadeOut`]), an interpolated transform ([`MoveTo`]) — where the
+//! deferred transform pays off directly — a parameterised *rigid* transform whose
+//! parameter is not a matrix entry ([`Rotate`], [`Scale`]), and point arrays
+//! ([`Transform`], the morph), which is what puts Manim's `align_points`
+//! machinery to work.
 //!
-//! [`Wait`] is the fourth and has no shape at all: it writes nothing and only
+//! [`Wait`] is the last and has no shape at all: it writes nothing and only
 //! occupies the clock, which is exactly what makes a pause an animation like any
 //! other.
 
@@ -66,6 +67,72 @@ impl Animation for FadeIn {
     }
 }
 
+/// Fades an object out and **removes it from the scene**.
+///
+/// `FadeIn`'s mirror, with one asymmetry that is the whole reason [`Animation::finish`]
+/// exists: Manim's `FadeOut` is a `remover=True` animation (`animation/fading.py:184-192`),
+/// so when it ends the object is gone from the scene rather than sitting there at
+/// zero opacity. `Alpha`-zeroed and gone are different states — a stale node is
+/// still in the accessibility tree, still addressable by an AI command, and still
+/// counted by `--inspect`.
+///
+/// Manim spells that half as `clean_up_from_scene`, called by the renderer once
+/// the animation has reached its end; here it is [`Animation::finish`], which the
+/// scheduler calls on exactly the same tick. The opacity work is `FadeIn`'s with
+/// the endpoints swapped.
+#[derive(Debug, Clone)]
+pub struct FadeOut {
+    target: NodeId,
+    from: f64,
+    to: f64,
+    duration: f64,
+}
+
+impl FadeOut {
+    pub fn new(target: NodeId) -> Self {
+        Self {
+            target,
+            from: 1.0,
+            to: 0.0,
+            duration: 1.0,
+        }
+    }
+
+    pub fn with_duration(mut self, seconds: f64) -> Self {
+        self.duration = seconds;
+        self
+    }
+}
+
+impl Animation for FadeOut {
+    fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    fn begin(&mut self, tree: &SceneTree) {
+        // From wherever the object currently is, for the reason `FadeIn` gives:
+        // an interrupted fade must not snap.
+        if let Some(m) = tree.get(self.target) {
+            self.from = m.opacity;
+        }
+    }
+
+    fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
+        if let Some(m) = tree.get_mut(self.target) {
+            m.opacity = self.from + (self.to - self.from) * alpha;
+            m.dirty.style = true;
+        }
+    }
+
+    /// The removal. Note it is the *subtree*, matching Manim's
+    /// `mobject.get_family()` (`fading.py:191`): fading out a group takes the
+    /// group's contents with it rather than emptying them into the scene, which
+    /// is what [`SceneTree::remove`] alone would do.
+    fn finish(&mut self, tree: &mut SceneTree) {
+        tree.remove_subtree(self.target);
+    }
+}
+
 /// Moves an object to a target transform.
 ///
 /// This is the animation that demonstrates why transforms are deferred: the
@@ -116,6 +183,181 @@ impl Animation for MoveTo {
             return;
         };
         m.set_transform(lerp_affine(start, self.target_transform, alpha));
+    }
+}
+
+/// Spins an object about a pivot, interpolating the **angle**.
+///
+/// The animation [`MoveTo`] cannot express, and the reason it exists rather than
+/// reusing that one: `MoveTo` interpolates an affine componentwise, which for a
+/// rotation is not the same curve. Halfway between identity and a quarter turn,
+/// lerping the matrix gives the shear-ish halfway matrix whose on-curve points are
+/// *inside* the arc, while the angle halfway is the 45° rotation. Manim makes the
+/// same distinction by having `Rotate` be a `Transform` whose `path_arc` is the
+/// angle (`animation/rotation.py:155-184`) — the parameter rides beside the
+/// matrix rather than inside it.
+///
+/// # What it is faithful to, and where it is stricter
+///
+/// * **The angle is interpolated linearly**, `rotate(interpolate(0, self.angle,
+///   alpha), about_point=..)` (`rotation.py:181`), not eased twice and not
+///   slerped. The ease is the rate function's, applied once to `alpha` before
+///   `interpolate` is reached, exactly as everywhere else in this crate.
+/// * **The pivot defaults to the object's own centre**, which is Manim's
+///   `mobject.get_center()` (`rotation.py:164-169`) — read here as
+///   `critical_point((0.0, 0.0))`, the midpoint of the anchors' box.
+/// * **The pivot is captured at `begin`, not at construction**, because the
+///   object may be moved between the two, and Manim reads `get_center()` when the
+///   animation starts.
+/// * **A rotation composes with the existing transform** rather than replacing it
+///   — `rotate_about(θ·α, pivot) * start` — so "move it, then spin it" keeps the
+///   move. `Mobject.rotate` is in-place in the same sense.
+///
+/// Manim's `about_point` is a full-width rotation carrying the object around the
+/// pivot, and so is this one; [`Mobject::rotate_about`] documents what "the pivot"
+/// means when the object is nested.
+///
+/// The one divergence: Manim's default `angle` is `TAU / 4`, which is a defect
+/// nobody means to hit — a bare `Rotate(mob)` turning a quarter turn is a
+/// surprise, and the command layer refuses it for that reason.
+#[derive(Debug, Clone)]
+pub struct Rotate {
+    target: NodeId,
+    angle: f64,
+    /// A *world* point, as a caller thinks of it; converted once in `begin`. The
+    /// stored pivot is in the parent's space, which is what
+    /// [`Mobject::rotate_about`] takes.
+    about_point: Option<Point>,
+    start: Option<Affine2>,
+    pivot: Option<Point>,
+    duration: f64,
+}
+
+impl Rotate {
+    /// Rotate by `angle` radians about the object's own centre.
+    pub fn new(target: NodeId, angle: f64) -> Self {
+        Self {
+            target,
+            angle,
+            about_point: None,
+            start: None,
+            pivot: None,
+            duration: 1.0,
+        }
+    }
+
+    /// Rotate about a **world** point instead of the object's centre.
+    ///
+    /// World rather than parent-space because that is the frame the scene author
+    /// writes in — no scene in this workspace has a nesting depth to speak of, and
+    /// a caller who has a world point should not have to learn the tree's
+    /// coordinate conventions to use it.
+    pub fn about_point(mut self, point: Point) -> Self {
+        self.about_point = Some(point);
+        self
+    }
+
+    pub fn with_duration(mut self, seconds: f64) -> Self {
+        self.duration = seconds;
+        self
+    }
+}
+
+impl Animation for Rotate {
+    fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    fn begin(&mut self, tree: &SceneTree) {
+        let Some(m) = tree.get(self.target) else {
+            return;
+        };
+        self.start = Some(m.transform);
+        self.pivot = match self.about_point {
+            // `critical_point` answers in the parent's space already (it
+            // materialises through `self.transform` alone), so the default pivot
+            // needs no inverse.
+            None => m.critical_point((0.0, 0.0)),
+            Some(world) => to_parent_space(tree.parent_transform(self.target), world),
+        };
+    }
+
+    fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
+        let (Some(start), Some(pivot)) = (self.start, self.pivot) else {
+            return;
+        };
+        let Some(m) = tree.get_mut(self.target) else {
+            return;
+        };
+        let angle = lerp_scalar(0.0, self.angle, alpha);
+        m.set_transform(Affine2::rotate_about(angle, pivot) * start);
+    }
+}
+
+/// Grows or shrinks an object **in place**.
+///
+/// Manim has no `Scale` animation: scaling is `ScaleInPlace` (`animation/transform.py:562`),
+/// an `ApplyMethod` over `Mobject.scale` (`mobject/mobject.py:1407-1458`), which
+/// interpolates the *factor* — `interpolate(1, factor, alpha)` (`:1454`) — about
+/// the object's own centre. There is no pivot parameter, and that is not an
+/// omission: `ScaleInPlace` is the in-place one and `Scale`-about-a-point is what
+/// `ApplyMethod` or a `Rotate`-style wrapper would give. This is named `Scale`
+/// because that is the name a Manim user reaches for, and it *is* `ScaleInPlace`.
+///
+/// Linear in the factor is the part worth stating, because the intuitive
+/// alternative is exponential: at `alpha = 0.5`, growing by ×4 is ×2.5, not ×2.
+/// Manim's `interpolate(1, factor, alpha)` is arithmetic, and the parameter is the
+/// factor rather than a log of it — so a scale-up and a scale-down of the same
+/// magnitude are *not* mirror images in time. This reproduces that.
+#[derive(Debug, Clone)]
+pub struct Scale {
+    target: NodeId,
+    factor: f64,
+    start: Option<Affine2>,
+    centre: Option<Point>,
+    duration: f64,
+}
+
+impl Scale {
+    /// Scale by `factor` about the object's own centre.
+    pub fn new(target: NodeId, factor: f64) -> Self {
+        Self {
+            target,
+            factor,
+            start: None,
+            centre: None,
+            duration: 1.0,
+        }
+    }
+
+    pub fn with_duration(mut self, seconds: f64) -> Self {
+        self.duration = seconds;
+        self
+    }
+}
+
+impl Animation for Scale {
+    fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    fn begin(&mut self, tree: &SceneTree) {
+        let Some(m) = tree.get(self.target) else {
+            return;
+        };
+        self.start = Some(m.transform);
+        self.centre = m.critical_point((0.0, 0.0));
+    }
+
+    fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
+        let (Some(start), Some(centre)) = (self.start, self.centre) else {
+            return;
+        };
+        let Some(m) = tree.get_mut(self.target) else {
+            return;
+        };
+        let factor = lerp_scalar(1.0, self.factor, alpha);
+        m.set_transform(Affine2::scale_about(factor, centre) * start);
     }
 }
 
@@ -333,6 +575,24 @@ impl Animation for Wait {
 /// formula is this project's rule for anything it ports.
 fn lerp_scalar(a: f64, b: f64, t: f64) -> f64 {
     (1.0 - t) * a + t * b
+}
+
+/// Carry a world point into the frame [`Mobject::rotate_about`] takes its pivot
+/// in, or report that no such frame exists.
+///
+/// `kurbo`'s `Affine::inverse` is infallible (`affine.rs:426`): for a degenerate
+/// matrix it divides by a zero determinant and hands back a transform of
+/// infinities and `NaN`s, which then propagate into every point of the scene and
+/// come out as a blank frame. So the determinant is checked here — zero or
+/// non-finite — and the caller degrades to a no-op. "A scene scaled to nothing"
+/// is a scene with no answer to "rotate about here", the same posture
+/// [`Transform`] takes toward a ragged source.
+fn to_parent_space(parent: Affine2, p: Point) -> Option<Point> {
+    let det = parent.determinant();
+    if !det.is_finite() || det == 0.0 {
+        return None;
+    }
+    Some(parent.inverse() * p)
 }
 
 /// Componentwise interpolation of two affine transforms.
@@ -611,5 +871,300 @@ mod tests {
         let mut anim = Transform::new(id, circle());
         anim.begin(&tree);
         anim.interpolate(0.5, &mut tree);
+    }
+
+    // ---- the three P2 step 5 animations -----------------------------------
+
+    #[test]
+    fn fade_out_drives_opacity_to_zero() {
+        let (mut tree, id) = scene(square());
+        tree.get_mut(id).unwrap().opacity = 0.5;
+        let mut anim = FadeOut::new(id);
+        // From wherever it is, not from 1.0 — an interrupted fade must not jump.
+        anim.begin(&tree);
+        anim.interpolate(0.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().opacity, 0.5);
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().opacity, 0.0);
+    }
+
+    /// **The blanket-impl guard.**
+    ///
+    /// `FadeOut`'s removal happens in [`Animation::finish`], which has a default
+    /// no-op — so if `impl Animation for Box<T>` failed to forward it, every call
+    /// reaching a boxed animation would resolve to that default and the object
+    /// would never leave the tree, while a direct `FadeOut::finish` call in a test
+    /// like this one would still work. The scheduler only ever holds
+    /// `Box<dyn Animation>`, so driving it through `AnimationScheduler::add` — as
+    /// a scene does — is the only way this test can *be* the guard. Copied from
+    /// the `debug_assert!` note in CLAUDE.md: the failure mode is a release-only
+    /// or container-only defect that no unit call can see.
+    #[test]
+    fn fade_out_removes_its_target_when_the_scheduler_finishes_it() {
+        let mut tree = SceneTree::new();
+        let kept = tree.insert(Mobject::new(shapes::circle(1.0)));
+        let group = tree.insert(Mobject::new(shapes::square(2.0, 2.0)));
+        let child = tree.insert(Mobject::new(shapes::circle(0.5)));
+        assert!(tree.reparent(child, group), "the child must be nested");
+
+        let mut sched = crate::AnimationScheduler::new();
+        sched.add(FadeOut::new(group).with_duration(0.5));
+        for _ in 0..40 {
+            sched.update(1.0 / 60.0, &mut tree);
+        }
+
+        assert!(sched.is_empty());
+        assert!(tree.get(group).is_none(), "the faded node must be gone");
+        assert!(
+            tree.get(child).is_none(),
+            "a fade removes the family, not just the group"
+        );
+        assert!(tree.get(kept).is_some(), "the sibling is untouched");
+        assert_eq!(
+            tree.root_ids(),
+            &[kept],
+            "no orphan was promoted to the root"
+        );
+    }
+
+    /// A quarter turn in two halves is a 45° rotation, not the componentwise
+    /// halfway matrix — the difference between a rigid motion and a shear.
+    ///
+    /// The assertion is stated in a way that cannot be satisfied by the matrix
+    /// lerp: every anchor keeps its distance from the pivot (a rotation is an
+    /// isometry), and the counterfactual is computed explicitly below.
+    #[test]
+    fn rotate_interpolates_the_angle_and_not_the_matrix() {
+        let (mut tree, id) = scene(Mobject::new(shapes::square(2.0, 2.0)));
+        let quarter = std::f64::consts::FRAC_PI_2;
+
+        let mut anim = Rotate::new(id, quarter);
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+        let t = tree.get(id).unwrap().transform;
+
+        // The pivot is the square's centre, which for a centred square is the
+        // origin, so the distance from the corner to the pivot is √2.
+        let p = t * Point::new(1.0, 1.0);
+        let r = (p.x * p.x + p.y * p.y).sqrt();
+        assert!(
+            (r - std::f64::consts::SQRT_2).abs() < 1e-12,
+            "a rotation preserves distance from the pivot, got {r}"
+        );
+
+        // The angle at `alpha = 0.5` is exactly a 45° rotation: `0.5 * (π/2)` is
+        // `π/4` to the last bit, so the two transforms are built by the same
+        // constructor from equal inputs.
+        assert_eq!(
+            t,
+            Affine2::rotate_about(std::f64::consts::FRAC_PI_4, Point::new(0.0, 0.0))
+        );
+
+        // ...and this is what the animation is *not* doing. The affine lerp of
+        // the same quarter turn lands the corner at distance 1, inside the arc.
+        let lerped = lerp_affine(Affine2::IDENTITY, Affine2::rotate(quarter), 0.5);
+        let q = lerped * Point::new(1.0, 1.0);
+        let r_lerp = (q.x * q.x + q.y * q.y).sqrt();
+        assert!(
+            (r_lerp - 1.0).abs() < 1e-12,
+            "the counterfactual must really be the shrink; got {r_lerp}"
+        );
+    }
+
+    /// A settled rotation *is* the rotation, at both ends, and composes with the
+    /// transform the object already had rather than replacing it.
+    #[test]
+    fn rotate_endpoints_are_exact_and_compose() {
+        let (mut tree, id) = scene(square());
+        let start = Affine2::translate((3.0, -1.0));
+        tree.get_mut(id).unwrap().set_transform(start);
+        let centre = tree.get(id).unwrap().critical_point((0.0, 0.0)).unwrap();
+
+        let angle = 0.7;
+        let mut anim = Rotate::new(id, angle);
+        anim.begin(&tree);
+
+        anim.interpolate(0.0, &mut tree);
+        assert_eq!(
+            tree.get(id).unwrap().transform,
+            start,
+            "alpha 0 is the start"
+        );
+
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(
+            tree.get(id).unwrap().transform,
+            Affine2::rotate_about(angle, centre) * start,
+            "the rotation composes onto the move rather than undoing it"
+        );
+    }
+
+    /// An explicit pivot is a **world** point, and the animation is an isometry
+    /// about it.
+    ///
+    /// The pivot's preimage under the object's own transform is the local point
+    /// that stays put — here the square sits at `(4, 0)` and the pivot is its own
+    /// centre, whose local preimage is the origin — and every other local point
+    /// keeps its world distance to it. That is what distinguishes "rotate about
+    /// this point" from "rotate about the object's centre and then translate",
+    /// which a single fixed-point assertion would not.
+    #[test]
+    fn rotate_about_a_named_world_point_keeps_that_point_fixed() {
+        let (mut tree, id) = scene(Mobject::new(shapes::square(2.0, 2.0)));
+        tree.get_mut(id)
+            .unwrap()
+            .set_transform(Affine2::translate((4.0, 0.0)));
+        let pivot = Point::new(4.0, 0.0);
+
+        let mut anim = Rotate::new(id, 1.1).about_point(pivot);
+        anim.begin(&tree);
+        for i in 0..=10 {
+            anim.interpolate(i as f64 / 10.0, &mut tree);
+            let t = tree.get(id).unwrap().transform;
+            let fixed = t * Point::new(0.0, 0.0);
+            assert!(
+                (fixed.x - pivot.x).abs() < 1e-9 && (fixed.y - pivot.y).abs() < 1e-9,
+                "the point at the pivot moved to {fixed:?} at alpha {}",
+                i as f64 / 10.0
+            );
+            let corner = t * Point::new(1.0, 1.0);
+            let r = ((corner.x - pivot.x).powi(2) + (corner.y - pivot.y).powi(2)).sqrt();
+            assert!(
+                (r - std::f64::consts::SQRT_2).abs() < 1e-9,
+                "a rotation keeps every distance to the pivot, got {r}"
+            );
+        }
+    }
+
+    /// A nested object's world pivot has to be carried into the parent's space
+    /// through the inverse, and the degenerate case has to degrade to a no-op
+    /// instead of writing `NaN`s through the scene.
+    #[test]
+    fn rotate_of_a_nested_object_uses_the_parents_space() {
+        // Parent at (5, 0); the child's world pivot (5, 0) is its parent-space
+        // origin, so a rotation there spins it about its own centre.
+        let mut tree = SceneTree::new();
+        let parent = tree.insert(Mobject::new(vec![Point::new(0.0, 0.0)]));
+        let child = tree.insert(Mobject::new(shapes::square(2.0, 2.0)));
+        tree.get_mut(parent)
+            .unwrap()
+            .set_transform(Affine2::translate((5.0, 0.0)));
+        assert!(tree.reparent(child, parent));
+
+        let pivot = Point::new(5.0, 0.0);
+        let mut anim = Rotate::new(child, std::f64::consts::FRAC_PI_2).about_point(pivot);
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        // The child's corner (1, 0) is at (6, 0) before; a quarter turn about the
+        // world point (5, 0) lands it at (5, 1).
+        let t = tree.parent_transform(child) * tree.get(child).unwrap().transform;
+        let p = t * Point::new(1.0, 0.0);
+        assert!(
+            (p.x - 5.0).abs() < 1e-9 && (p.y - 1.0).abs() < 1e-9,
+            "expected (5, 1), got {p:?}"
+        );
+
+        // A parent scaled to nothing has no inverse. `kurbo`'s `inverse` would
+        // hand back infinities; the guard makes the whole animation a no-op.
+        let mut tree = SceneTree::new();
+        let parent = tree.insert(Mobject::new(vec![Point::new(0.0, 0.0)]));
+        let child = tree.insert(Mobject::new(shapes::square(2.0, 2.0)));
+        tree.get_mut(parent)
+            .unwrap()
+            .set_transform(Affine2::scale(0.0));
+        assert!(tree.reparent(child, parent));
+
+        let mut anim =
+            Rotate::new(child, std::f64::consts::FRAC_PI_2).about_point(Point::new(0.0, 0.0));
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+        let after = tree.get(child).unwrap().transform;
+        assert_eq!(
+            after,
+            Affine2::IDENTITY,
+            "a degenerate parent makes it a no-op"
+        );
+        assert!(after.as_coeffs().iter().all(|c| c.is_finite()));
+    }
+
+    /// Scaling is about the object's own centre: the centre does not move, the
+    /// extent grows by exactly the factor, and no pivot argument is needed.
+    #[test]
+    fn scale_is_in_place() {
+        let (mut tree, id) = scene(Mobject::new(shapes::square(2.0, 2.0)));
+        tree.get_mut(id)
+            .unwrap()
+            .set_transform(Affine2::translate((3.0, 0.0)));
+        let centre = tree.get(id).unwrap().critical_point((0.0, 0.0)).unwrap();
+        assert_eq!(centre, Point::new(3.0, 0.0));
+        let before = tree.world_bounds(id).unwrap().width();
+
+        let mut anim = Scale::new(id, 2.0);
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        let after = tree.get(id).unwrap();
+        assert_eq!(
+            after.critical_point((0.0, 0.0)).unwrap(),
+            centre,
+            "an in-place scale must not move the centre"
+        );
+        let width = tree.world_bounds(id).unwrap().width();
+        assert!(
+            (width - 2.0 * before).abs() < 1e-9,
+            "extent {before} -> {width}, expected twice"
+        );
+    }
+
+    /// The factor is interpolated **linearly**, so ×4 halfway through is ×2.5 —
+    /// not the ×2 a geometric reading of "halfway between ×1 and ×4" suggests.
+    /// Manim's `interpolate(1, factor, alpha)` is arithmetic in the factor
+    /// (`mobject.py:1454`); the exponential reading is a different animation, and
+    /// this pins which one we ship.
+    #[test]
+    fn scale_interpolates_the_factor_linearly() {
+        let (mut tree, id) = scene(Mobject::new(shapes::square(2.0, 2.0)));
+
+        let mut anim = Scale::new(id, 4.0);
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+
+        let p = tree.get(id).unwrap().transform * Point::new(1.0, 1.0);
+        assert!(
+            (p.x - 2.5).abs() < 1e-12 && (p.y - 2.5).abs() < 1e-12,
+            "×4 at alpha = 0.5 is ×2.5, got {p:?}"
+        );
+        assert!((p.x - 2.0).abs() > 1e-12, "and not the geometric mean ×2");
+
+        anim.interpolate(0.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().transform, Affine2::IDENTITY);
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().transform, Affine2::scale(4.0));
+    }
+
+    /// The posture every animation here shares: a command may name a node that
+    /// has since been deleted, so this has to be a no-op rather than a panic or a
+    /// half-written tree. `FadeOut`'s `finish` is included because it is the one
+    /// that touches the tree's shape rather than a field.
+    #[test]
+    fn the_three_new_animations_are_no_ops_on_a_missing_node() {
+        let (mut tree, id) = scene(square());
+        tree.clear();
+
+        let mut fade = FadeOut::new(id);
+        fade.begin(&tree);
+        fade.interpolate(0.5, &mut tree);
+        fade.finish(&mut tree);
+
+        let mut rotate = Rotate::new(id, 1.0);
+        rotate.begin(&tree);
+        rotate.interpolate(0.5, &mut tree);
+
+        let mut scale = Scale::new(id, 2.0);
+        scale.begin(&tree);
+        scale.interpolate(0.5, &mut tree);
+
+        assert!(tree.is_empty());
     }
 }

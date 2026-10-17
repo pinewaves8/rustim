@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use rustim_anim::{Animation, FadeIn, MoveTo};
-use rustim_math::Affine2;
+use rustim_anim::{Animation, FadeIn, FadeOut, MoveTo, Rotate, Scale};
+use rustim_math::{Affine2, Point};
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree};
 
@@ -76,15 +76,32 @@ pub struct AnimationSpec {
     pub kind: AnimationKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    /// Where a `move_to` ends up, in world units.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<[f64; 2]>,
+    /// How far a `rotate` turns, in radians.
+    ///
+    /// Required by `rotate` and refused when absent, unlike Manim — see
+    /// [`animation_for`]'s doc for why the π/4 default is not one to reproduce.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f64>,
+    /// What a `scale` multiplies the size by. Must be positive and finite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factor: Option<f64>,
+    /// A `rotate`'s pivot, in **world** units. Absent means the object's own
+    /// centre, which is what Manim's `Rotate` defaults to as well.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about_point: Option<[f64; 2]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnimationKind {
     FadeIn,
+    FadeOut,
     MoveTo,
+    Rotate,
+    Scale,
 }
 
 /// Why a command was refused.
@@ -151,7 +168,10 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             if tree.get(*target).is_none() {
                 return Err(CommandError::NoSuchNode { target: *target });
             }
-            remove_subtree(tree, *target);
+            // The walk lives on the tree rather than here, because `FadeOut`'s
+            // finish step needs exactly the same one — and two copies of "delete
+            // this subtree" would eventually disagree about children.
+            tree.remove_subtree(*target);
             diff.removed.push(*target);
         }
         Command::Set { target, property } => {
@@ -193,6 +213,17 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
 /// * `MoveTo` with no `to` — [`CommandError::OutOfRange`], because there is no
 ///   destination and silently doing nothing would teach a model that `to` is
 ///   optional when every `move_to` needs it;
+/// * `Rotate` with no `angle` — [`CommandError::OutOfRange`]. Manim's own default
+///   is `TAU / 4` (`animation/rotation.py:161`), and reproducing it would mean a
+///   bare `{"type":"rotate"}` turning the object a quarter turn. A model that left
+///   the angle out did not mean π/2; it meant to fill it in, and being told so is
+///   cheaper than a scene that turns things nobody asked to turn. A non-finite
+///   angle is refused for the same reason a non-finite duration is.
+/// * `Scale` with a `factor` that is not positive and finite —
+///   [`CommandError::OutOfRange`]. `0` collapses the object to a point where
+///   nothing can reach it again and a negative one mirrors it, neither of which is
+///   what "scale it" means to say. The same posture as [`Property::Scale`], which
+///   refuses the same values.
 /// * a negative or non-finite `duration` — [`CommandError::OutOfRange`]. `0.0` is
 ///   accepted: Manim refuses only `run_time < 0` (`animation/animation.py:175-181`)
 ///   and an instant snap is legitimate — `AnimationScheduler::update` already
@@ -201,6 +232,10 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
 ///   accepted: an infinite one holds the clock forever and a NaN one makes
 ///   `age < duration` false, so the animation vanishes after a single frame.
 ///   Neither is a thing to answer a host with silence about.
+///
+/// `to` and `about_point` are plain coordinate pairs and are not range-checked,
+/// matching each other: they arrive from JSON, which cannot carry a non-finite
+/// float, and every finite point is a legitimate one.
 pub fn animation_for(
     tree: &SceneTree,
     spec: &AnimationSpec,
@@ -222,6 +257,7 @@ pub fn animation_for(
 
     Ok(match spec.kind {
         AnimationKind::FadeIn => Box::new(FadeIn::new(spec.target).with_duration(duration)),
+        AnimationKind::FadeOut => Box::new(FadeOut::new(spec.target).with_duration(duration)),
         AnimationKind::MoveTo => {
             let Some([x, y]) = spec.to else {
                 return Err(CommandError::OutOfRange {
@@ -232,22 +268,41 @@ pub fn animation_for(
             let to = Affine2::translate((x, y));
             Box::new(MoveTo::new(spec.target, to).with_duration(duration))
         }
-    })
-}
-
-fn remove_subtree(tree: &mut SceneTree, root: NodeId) {
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if let Some(m) = tree.get(id) {
-            stack.extend(m.children.iter().copied());
-            if let Some(p) = m.parent
-                && let Some(pm) = tree.get_mut(p)
-            {
-                pm.children.retain(|&c| c != id);
+        AnimationKind::Rotate => {
+            let Some(angle) = spec.angle else {
+                return Err(CommandError::OutOfRange {
+                    property: "angle".into(),
+                    detail: "a rotate needs an angle in radians".into(),
+                });
+            };
+            if !angle.is_finite() {
+                return Err(CommandError::OutOfRange {
+                    property: "angle".into(),
+                    detail: format!("{angle} is not a finite number of radians"),
+                });
             }
+            let mut anim = Rotate::new(spec.target, angle).with_duration(duration);
+            if let Some([x, y]) = spec.about_point {
+                anim = anim.about_point(Point::new(x, y));
+            }
+            Box::new(anim)
         }
-        tree.remove(id);
-    }
+        AnimationKind::Scale => {
+            let Some(factor) = spec.factor else {
+                return Err(CommandError::OutOfRange {
+                    property: "factor".into(),
+                    detail: "a scale needs a factor to multiply the size by".into(),
+                });
+            };
+            if !factor.is_finite() || factor <= 0.0 {
+                return Err(CommandError::OutOfRange {
+                    property: "factor".into(),
+                    detail: format!("{factor} is not a positive, finite scale factor"),
+                });
+            }
+            Box::new(Scale::new(spec.target, factor).with_duration(duration))
+        }
+    })
 }
 
 impl Property {
@@ -293,19 +348,44 @@ impl Property {
                 m.kind = *k;
                 m.dirty.semantic = true;
             }
+            // Absolute, and deliberately the odd one out among the three
+            // transform properties: "put it at (2, 3)" is a statement about where
+            // the object *is*, while scale and rotation below are operations
+            // applied to where it already is. Manim's `move_to` is absolute in the
+            // same way, so a plain `set` and a `play` of `move_to` agree.
             Self::Position(p) => {
                 m.set_transform(rustim_math::Affine::translate((p[0], p[1])));
             }
+            // Both of these **compose** onto the object's transform rather than
+            // replacing it, which is the one behavioural change in P2 step 5.
+            // `set_transform(scale(s))` threw the object's position away: "move it
+            // to the corner, then make it twice as big" silently teleported it back
+            // to the origin, and a caller who scaled after moving had no way to see
+            // why. Manim's `scale`/`rotate` are in-place too, and both take a pivot
+            // that defaults to the object's own centre — `critical_point((0, 0))`,
+            // whose `None` (a mobject with no measurable geometry, such as text)
+            // falls back to the parent-space origin, since an object with no
+            // extent has no other centre to speak of.
             Self::Scale(s) => {
-                if *s <= 0.0 {
+                if *s <= 0.0 || !s.is_finite() {
                     return Err(CommandError::OutOfRange {
                         property: "scale".into(),
-                        detail: format!("{s} is not positive"),
+                        detail: format!("{s} is not a positive, finite factor"),
                     });
                 }
-                m.set_transform(rustim_math::Affine::scale(*s));
+                let pivot = m.critical_point((0.0, 0.0)).unwrap_or(Point::new(0.0, 0.0));
+                m.scale_about(*s, pivot);
             }
-            Self::Rotation(r) => m.set_transform(rustim_math::Affine::rotate(*r)),
+            Self::Rotation(r) => {
+                if !r.is_finite() {
+                    return Err(CommandError::OutOfRange {
+                        property: "rotation".into(),
+                        detail: format!("{r} is not a finite number of radians"),
+                    });
+                }
+                let pivot = m.critical_point((0.0, 0.0)).unwrap_or(Point::new(0.0, 0.0));
+                m.rotate_about(*r, pivot);
+            }
         }
         Ok(())
     }
@@ -336,6 +416,20 @@ mod tests {
             ),
             format!(
                 r#"{{"action":"play","animation":{{"target":{id},"type":"move_to","to":[1.5,-2.0]}}}}"#
+            ),
+            // The three P2 step 5 kinds. `rotate`'s optional pivot is written only
+            // when the caller gave one, so both spellings have to round-trip.
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"fade_out","duration":0.6}}}}"#
+            ),
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"rotate","angle":1.2}}}}"#
+            ),
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"rotate","angle":1.2,"about_point":[1.0,-2.0]}}}}"#
+            ),
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"scale","factor":2.5}}}}"#
             ),
         ];
         for json in cases {
@@ -424,6 +518,9 @@ mod tests {
                     kind: AnimationKind::FadeIn,
                     duration: None,
                     to: None,
+                    angle: None,
+                    factor: None,
+                    about_point: None,
                 },
             },
         )
@@ -441,12 +538,18 @@ mod tests {
         (tree, id)
     }
 
+    /// A spec with everything but its kind left absent — the shape a model
+    /// produces when it names an animation and forgets its parameters, which is
+    /// the case three of the refusals below are about.
     fn spec(id: NodeId, kind: AnimationKind) -> AnimationSpec {
         AnimationSpec {
             target: id,
             kind,
             duration: None,
             to: None,
+            angle: None,
+            factor: None,
+            about_point: None,
         }
     }
 
@@ -484,18 +587,265 @@ mod tests {
     }
 
     /// A duration the command did not give is Manim's `DEFAULT_ANIMATION_RUN_TIME`,
-    /// which is also what `FadeIn::new`/`MoveTo::new` pick — so a command and a
-    /// scene calling the constructor agree without either restating 1.0.
+    /// which is also what the animations' own constructors pick — so a command and
+    /// a scene calling the constructor agree without either restating 1.0.
     #[test]
     fn an_omitted_duration_is_manims_default() {
         let (tree, id) = scene_with_a_blank();
         assert_eq!(DEFAULT_ANIMATION_RUN_TIME, 1.0);
-        for kind in [AnimationKind::FadeIn, AnimationKind::MoveTo] {
+        // Every kind, so a new one cannot quietly acquire a *second* default.
+        for kind in [
+            AnimationKind::FadeIn,
+            AnimationKind::FadeOut,
+            AnimationKind::MoveTo,
+            AnimationKind::Rotate,
+            AnimationKind::Scale,
+        ] {
             let mut what = spec(id, kind);
-            if kind == AnimationKind::MoveTo {
-                what.to = Some([0.0, 0.0]);
+            match kind {
+                AnimationKind::MoveTo => what.to = Some([0.0, 0.0]),
+                AnimationKind::Rotate => what.angle = Some(1.0),
+                AnimationKind::Scale => what.factor = Some(1.5),
+                _ => {}
             }
-            assert_eq!(animation_for(&tree, &what).unwrap().duration(), 1.0);
+            assert_eq!(
+                animation_for(&tree, &what).unwrap().duration(),
+                1.0,
+                "{kind:?}"
+            );
+        }
+    }
+
+    // ---- the three P2 step 5 kinds ----------------------------------------
+
+    #[test]
+    fn a_fade_out_command_builds_a_fade_out() {
+        let (mut tree, id) = scene_with_a_blank();
+        tree.get_mut(id).unwrap().opacity = 1.0;
+
+        let mut what = spec(id, AnimationKind::FadeOut);
+        what.duration = Some(0.25);
+        let mut anim = animation_for(&tree, &what).unwrap();
+        assert_eq!(anim.duration(), 0.25);
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().opacity, 0.0);
+    }
+
+    /// The angle is required, and the refusal says so. Manim's own default is
+    /// `TAU / 4` (`animation/rotation.py:161`), which is not one to reproduce: a
+    /// bare `{"type":"rotate"}` turning the object a quarter turn is a surprise,
+    /// and a model that left the angle out was going to fill it in.
+    #[test]
+    fn a_rotate_command_needs_an_angle() {
+        let (tree, id) = scene_with_a_blank();
+        assert!(matches!(
+            animation_for(&tree, &spec(id, AnimationKind::Rotate)),
+            Err(CommandError::OutOfRange { property, .. }) if property == "angle"
+        ));
+    }
+
+    #[test]
+    fn a_scale_command_needs_a_positive_factor() {
+        let (tree, id) = scene_with_a_blank();
+        assert!(matches!(
+            animation_for(&tree, &spec(id, AnimationKind::Scale)),
+            Err(CommandError::OutOfRange { property, .. }) if property == "factor"
+        ));
+        for bad in [0.0, -2.0, f64::INFINITY, f64::NAN] {
+            let mut what = spec(id, AnimationKind::Scale);
+            what.factor = Some(bad);
+            assert!(
+                matches!(
+                    animation_for(&tree, &what),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == "factor"
+                ),
+                "factor {bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_finite_angle_is_refused() {
+        let (tree, id) = scene_with_a_blank();
+        for bad in [f64::INFINITY, f64::NAN] {
+            let mut what = spec(id, AnimationKind::Rotate);
+            what.angle = Some(bad);
+            assert!(
+                matches!(
+                    animation_for(&tree, &what),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == "angle"
+                ),
+                "angle {bad} must be refused"
+            );
+        }
+    }
+
+    /// The settled rotation is the angle that was asked for, about the object's
+    /// own centre when no pivot was given.
+    #[test]
+    fn a_rotate_command_lands_on_the_named_angle() {
+        let (mut tree, id) = scene_with_a_blank();
+        let mut what = spec(id, AnimationKind::Rotate);
+        what.angle = Some(std::f64::consts::FRAC_PI_2);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        // A centred square's pivot is the origin, so the stored transform is the
+        // bare rotation.
+        assert_eq!(
+            tree.get(id).unwrap().transform,
+            Affine2::rotate(std::f64::consts::FRAC_PI_2)
+        );
+    }
+
+    /// An explicit pivot is a world point, and it stays where it was put.
+    #[test]
+    fn a_rotate_command_honours_its_about_point() {
+        let (mut tree, id) = scene_with_a_blank();
+        tree.get_mut(id)
+            .unwrap()
+            .set_transform(Affine2::translate((3.0, 0.0)));
+        let mut what = spec(id, AnimationKind::Rotate);
+        what.angle = Some(std::f64::consts::FRAC_PI_2);
+        what.about_point = Some([3.0, 0.0]);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        // The local point the pivot sits on has not moved; the square has turned.
+        let m = tree.get(id).unwrap();
+        let fixed = m.transform * Point::new(0.0, 0.0);
+        assert!(
+            (fixed.x - 3.0).abs() < 1e-12 && fixed.y.abs() < 1e-12,
+            "{fixed:?}"
+        );
+        let corner = m.transform * Point::new(1.0, 1.0);
+        assert!(
+            (corner.x - 2.0).abs() < 1e-12 && (corner.y - 1.0).abs() < 1e-12,
+            "{corner:?}"
+        );
+    }
+
+    /// `Scale` is `ScaleInPlace`: the centre does not move and the extent grows by
+    /// exactly the factor.
+    #[test]
+    fn a_scale_command_is_in_place() {
+        let (mut tree, id) = scene_with_a_blank();
+        tree.get_mut(id)
+            .unwrap()
+            .set_transform(Affine2::translate((3.0, 0.0)));
+        let before = tree.world_bounds(id).unwrap().width();
+
+        let mut what = spec(id, AnimationKind::Scale);
+        what.factor = Some(2.0);
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(1.0, &mut tree);
+
+        let after = tree.world_bounds(id).unwrap().width();
+        assert!((after - 2.0 * before).abs() < 1e-9, "{before} -> {after}");
+        // The centre is the pivot, so it is exactly where the move put it.
+        let m = tree.get(id).unwrap();
+        let centre = m.transform * Point::new(0.0, 0.0);
+        assert!(
+            (centre.x - 3.0).abs() < 1e-12 && centre.y.abs() < 1e-12,
+            "{centre:?}"
+        );
+    }
+
+    /// **The behavioural change of P2 step 5, pinned.**
+    ///
+    /// `set`'s transform properties used to *replace* the object's transform, so
+    /// "move it, then rotate it" teleported the object back to the origin. They now
+    /// compose. Both halves are asserted, because either alone is satisfiable by
+    /// the wrong implementation: a rotation that kept the position but did not
+    /// rotate, and one that rotated but threw the position away.
+    #[test]
+    fn setting_rotation_composes_with_the_transform() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        tree.get_mut(id)
+            .unwrap()
+            .set_transform(Affine2::translate((5.0, 0.0)));
+
+        apply(
+            &mut tree,
+            &Command::Set {
+                target: id,
+                property: Property::Rotation(std::f64::consts::FRAC_PI_2),
+            },
+        )
+        .unwrap();
+
+        let m = tree.get(id).unwrap();
+        let centre = m.critical_point((0.0, 0.0)).unwrap();
+        assert!(
+            (centre.x - 5.0).abs() < 1e-12 && centre.y.abs() < 1e-12,
+            "the move was discarded: the centre is {centre:?}"
+        );
+        let corner = m.transform * Point::new(1.0, 1.0);
+        assert!(
+            (corner.x - 4.0).abs() < 1e-12 && (corner.y - 1.0).abs() < 1e-12,
+            "but it did not turn: {corner:?}"
+        );
+    }
+
+    #[test]
+    fn setting_scale_composes_with_the_transform() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        tree.get_mut(id)
+            .unwrap()
+            .set_transform(Affine2::translate((5.0, 0.0)));
+
+        apply(
+            &mut tree,
+            &Command::Set {
+                target: id,
+                property: Property::Scale(3.0),
+            },
+        )
+        .unwrap();
+
+        let m = tree.get(id).unwrap();
+        let centre = m.critical_point((0.0, 0.0)).unwrap();
+        assert!(
+            (centre.x - 5.0).abs() < 1e-12 && centre.y.abs() < 1e-12,
+            "scaling about its own centre must not move it: {centre:?}"
+        );
+        let corner = m.transform * Point::new(1.0, 1.0);
+        assert!(
+            (corner.x - 8.0).abs() < 1e-12 && (corner.y - 3.0).abs() < 1e-12,
+            "a corner one unit from the centre is now three: {corner:?}"
+        );
+    }
+
+    /// A non-finite factor on the `set` path is refused for the same reason it is
+    /// on the animation path — and the object is not half-modified.
+    #[test]
+    fn a_non_finite_scale_property_is_refused() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        let before = tree.get(id).unwrap().transform;
+        for bad in [f64::NAN, f64::INFINITY, 0.0] {
+            assert!(
+                matches!(
+                    apply(
+                        &mut tree,
+                        &Command::Set {
+                            target: id,
+                            property: Property::Scale(bad),
+                        }
+                    ),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == "scale"
+                ),
+                "scale {bad} must be refused"
+            );
+            assert_eq!(tree.get(id).unwrap().transform, before);
         }
     }
 

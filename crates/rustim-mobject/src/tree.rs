@@ -179,6 +179,39 @@ impl Mobject {
         self.dirty.geometry = true;
     }
 
+    /// Rotate by `angle` radians about `pivot`, **composing** with whatever
+    /// transform the object already has.
+    ///
+    /// Manim's `Mobject.rotate(angle, about_point=..)` (`mobject.py:1464-1534`),
+    /// minus the point rewrite: `rotate_about` is a `kurbo` constructor
+    /// (`affine.rs:97`), so this is one multiplication and the local point array
+    /// is not touched. That is what a `Rotate` animation needs and what
+    /// componentwise interpolation of two affines cannot give — see `ops::Rotate`.
+    ///
+    /// # The pivot is in the *parent's* space
+    ///
+    /// Not world space, and not local space: the space `transform` already maps
+    /// into. That is the frame [`Mobject::critical_point`] answers in — it
+    /// materialises through `self.transform` alone, not through ancestors — so
+    /// `m.rotate_about(a, m.critical_point((0.0, 0.0)).unwrap())` is "spin in
+    /// place" with no coordinate conversion at all, for a nested object as much as
+    /// for a root one. A caller holding a *world* point has to bring it here
+    /// first, which is what `ops::Rotate` does with
+    /// [`SceneTree::parent_transform`].
+    pub fn rotate_about(&mut self, angle: f64, pivot: Point) {
+        self.set_transform(Affine2::rotate_about(angle, pivot) * self.transform);
+    }
+
+    /// Scale by `factor` about `pivot`, composing with the existing transform.
+    ///
+    /// `Mobject.scale(scale_factor, about_point=..)` (`mobject.py:1407-1458`), with
+    /// the same parent-space pivot rule as [`Mobject::rotate_about`]. Uniform only:
+    /// a non-uniform scale is not something any caller has asked for, and Manim's
+    /// `scale` is uniform too.
+    pub fn scale_about(&mut self, factor: f64, pivot: Point) {
+        self.set_transform(Affine2::scale_about(factor, pivot) * self.transform);
+    }
+
     /// Produce this mobject's points in world space.
     ///
     /// This is the explicit, cacheable half of the deferred-transform design:
@@ -426,6 +459,33 @@ impl SceneTree {
         self.nodes.get_mut(id)
     }
 
+    /// Remove a node **and everything below it**.
+    ///
+    /// The counterpart of [`SceneTree::remove`], which deliberately stops at the
+    /// node and promotes its children to the root bucket. Two callers need this
+    /// one and neither should have its own copy: the `remove` command, where
+    /// "delete that group" means the group and not its contents emptied out into
+    /// the scene, and `FadeOut`'s finish step, where Manim's `clean_up_from_scene`
+    /// removes `mobject.get_family()` (`animation/fading.py:184-192`). Keeping the
+    /// walk in one place is what stops those two from disagreeing.
+    ///
+    /// Takes children off the parent's list as it goes, so nothing is ever left
+    /// pointing at a node that is gone.
+    pub fn remove_subtree(&mut self, root: NodeId) {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if let Some(m) = self.nodes.get(id) {
+                stack.extend(m.children.iter().copied());
+                if let Some(p) = m.parent
+                    && let Some(pm) = self.nodes.get_mut(p)
+                {
+                    pm.children.retain(|&c| c != id);
+                }
+            }
+            self.remove(id);
+        }
+    }
+
     /// The accumulated transform of `id`'s ancestors. `Affine2::IDENTITY` for a
     /// root node or an unknown id.
     pub fn parent_transform(&self, id: NodeId) -> Affine2 {
@@ -589,6 +649,113 @@ mod tests {
         assert_eq!(m.points[0], Point::new(1.0, 0.0));
         // ...world points moved.
         assert_eq!(m.materialize()[0], Point::new(11.0, 0.0));
+    }
+
+    /// The deferred guarantee, stated for a rotation: the local points are not
+    /// rewritten and the object's own centre — asked for in the frame
+    /// `critical_point` answers in — does not move.
+    ///
+    /// The second half is what makes "spin in place" a one-liner at the call site,
+    /// and it is worth a test precisely because it is easy to get backwards: the
+    /// pivot is *not* a fixed point of the composed transform. `rotate_about(θ, c)`
+    /// rotates whatever the object's transform already produced, so the transform
+    /// that ends up stored maps `c` somewhere else entirely — it is the
+    /// *materialised* centre that stays, and a test that multiplied the stored
+    /// transform by the pivot would be asserting the wrong thing while looking
+    /// perfectly reasonable.
+    #[test]
+    fn rotate_about_keeps_the_pivot_and_leaves_the_points_alone() {
+        let mut m = Mobject::new(crate::shapes::square(2.0, 2.0));
+        m.set_transform(Affine2::translate((2.0, 3.0)));
+        let before = m.points.clone();
+        let pivot = m.critical_point((0.0, 0.0)).unwrap();
+        assert_eq!(pivot, Point::new(2.0, 3.0));
+        m.dirty = Default::default();
+
+        m.rotate_about(std::f64::consts::FRAC_PI_4, pivot);
+
+        assert_eq!(
+            m.points, before,
+            "a rotation must not touch the point array"
+        );
+        assert!(m.dirty.geometry, "but the materialised geometry did change");
+        let after = m.critical_point((0.0, 0.0)).unwrap();
+        assert!(
+            (after.x - pivot.x).abs() < 1e-12 && (after.y - pivot.y).abs() < 1e-12,
+            "the object spun about {pivot:?} but its centre is now {after:?}"
+        );
+    }
+
+    #[test]
+    fn scale_about_keeps_its_pivot() {
+        let mut m = Mobject::new(crate::shapes::square(2.0, 2.0));
+        m.set_transform(Affine2::translate((2.0, 3.0)));
+        let pivot = m.critical_point((0.0, 0.0)).unwrap();
+        let corner = Point::new(1.0, 1.0);
+
+        m.scale_about(3.0, pivot);
+
+        let after = m.critical_point((0.0, 0.0)).unwrap();
+        assert!(
+            (after.x - pivot.x).abs() < 1e-12 && (after.y - pivot.y).abs() < 1e-12,
+            "the centre is the pivot and must not move; it is now {after:?}"
+        );
+        // The local corner is one unit across and one up from the centre, so ×3
+        // puts it three across and three up: (2 + 3, 3 + 3).
+        let c = m.transform * corner;
+        assert!((c.x - 5.0).abs() < 1e-12, "{c:?}");
+        assert!((c.y - 6.0).abs() < 1e-12, "{c:?}");
+    }
+
+    /// Composing, not replacing — the property that makes "move it, then spin it"
+    /// keep the move.
+    ///
+    /// A `set_transform(rotate(θ))` would pass a test that only checked the
+    /// rotation, and would silently teleport every object that had been moved.
+    #[test]
+    fn rotating_an_object_composes_with_its_transform() {
+        let mut m = Mobject::new(crate::shapes::square(2.0, 2.0));
+        m.set_transform(Affine2::translate((5.0, 0.0)));
+
+        m.rotate_about(std::f64::consts::FRAC_PI_2, Point::new(0.0, 0.0));
+
+        let centre = m.critical_point((0.0, 0.0)).unwrap();
+        assert!(
+            centre.x.abs() < 1e-12 && (centre.y - 5.0).abs() < 1e-12,
+            "the move rode around the rotation; centre is {centre:?}"
+        );
+    }
+
+    /// `remove_subtree` takes the descendants with it, and leaves nothing behind
+    /// pointing at a node that is gone.
+    ///
+    /// The contrast with [`SceneTree::remove`] is the whole reason both exist:
+    /// `remove` promotes the children into the root bucket, which for "delete that
+    /// group" would empty the group's contents out into the scene instead of
+    /// deleting them.
+    #[test]
+    fn remove_subtree_takes_the_children_too() {
+        let mut tree = SceneTree::new();
+        let root = tree.insert(Mobject::new(vec![]));
+        let child = tree.insert(Mobject::new(vec![]));
+        let grandchild = tree.insert(Mobject::new(vec![]));
+        let sibling = tree.insert(Mobject::new(vec![]));
+        assert!(tree.reparent(child, root));
+        assert!(tree.reparent(grandchild, child));
+
+        tree.remove_subtree(child);
+
+        assert!(tree.get(child).is_none());
+        assert!(tree.get(grandchild).is_none(), "the walk must recurse");
+        assert!(tree.get(root).is_some(), "the parent outlives its child");
+        assert_eq!(tree.get(root).unwrap().children, vec![], "and forgets it");
+        assert_eq!(tree.root_ids(), &[root, sibling], "nothing was promoted");
+        assert_eq!(tree.len(), 2);
+
+        // Idempotent on an id that is already gone, which is what lets `FadeOut`
+        // and the `remove` command share it without either checking first.
+        tree.remove_subtree(child);
+        assert_eq!(tree.len(), 2);
     }
 
     #[test]

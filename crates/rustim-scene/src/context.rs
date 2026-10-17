@@ -681,6 +681,9 @@ mod tests {
                 kind: command::AnimationKind::FadeIn,
                 duration: Some(0.5),
                 to: None,
+                angle: None,
+                factor: None,
+                about_point: None,
             },
         };
         ctx.handle(&cmd).unwrap();
@@ -704,6 +707,9 @@ mod tests {
                 kind: command::AnimationKind::FadeIn,
                 duration: Some(0.5),
                 to: None,
+                angle: None,
+                factor: None,
+                about_point: None,
             },
         };
 
@@ -738,6 +744,9 @@ mod tests {
                 kind: command::AnimationKind::FadeIn,
                 duration: None,
                 to: None,
+                angle: None,
+                factor: None,
+                about_point: None,
             },
         };
 

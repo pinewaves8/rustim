@@ -20,6 +20,8 @@ pub enum ShapeKind {
     Square,
     Circle,
     RightTriangle,
+    Line,
+    Arrow,
 }
 
 /// Parameters for a shape. Every field is optional so a partial description —
@@ -38,6 +40,10 @@ pub struct ShapeParams {
     pub height: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub radius: Option<f64>,
+    /// How thick a [`ShapeKind::Line`] or [`ShapeKind::Arrow`] is drawn, in world
+    /// units. Ignored by the closed shapes, which are defined by `width`/`height`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thickness: Option<f64>,
     /// World-space position of the shape's anchor, in Manim units (Y up, origin
     /// at the centre of the frame). The viewport maps it to pixels; scene code
     /// never sees pixels.
@@ -59,7 +65,19 @@ impl ShapeParams {
     pub fn radius(&self) -> f64 {
         self.radius.unwrap_or(1.0)
     }
+    pub fn thickness(&self) -> f64 {
+        self.thickness.unwrap_or(DEFAULT_THICKNESS)
+    }
 }
+
+/// How thick a line or an arrow's shaft is when the caller did not say.
+///
+/// Manim's `Line` draws at `stroke_width = 4` px; against `Viewport::default()`'s
+/// 8 world units over 720 px that is `4 · 8 / 720`, or 0.0444 units, rounded here
+/// to 0.045. It is a *scene-side* convention rather than a property of geometry,
+/// which is why it is a constant with this comment and not a derivation: the
+/// px↔unit mapping is the viewport's business and a mobject never learns it.
+pub const DEFAULT_THICKNESS: f64 = 0.045;
 
 /// Build a mobject from a shape description.
 pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
@@ -68,6 +86,8 @@ pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
         ShapeKind::Square => square(w, h),
         ShapeKind::Circle => circle(params.radius()),
         ShapeKind::RightTriangle => right_triangle(w, h),
+        ShapeKind::Line => line(w, params.thickness()),
+        ShapeKind::Arrow => arrow(w, params.thickness()),
     };
 
     let color = params.color.map_or(rustim_color::FG, |[r, g, b]| {
@@ -150,6 +170,79 @@ pub fn right_triangle(w: f64, h: f64) -> Vec<Point> {
         Point::new(w, 0.0),
         Point::new(0.0, h),
         Point::new(0.0, 0.0),
+    ])
+}
+
+/// A straight segment from the origin along `+x`, `length` long and `thickness`
+/// thick.
+///
+/// # A line is drawn as the rectangle a stroke would have painted
+///
+/// A mathematical line has no area, and [`crate::SceneTree`]'s draw walk emits
+/// **fills** — a stroke is a `DrawOp` and a `Style` field that the mobject model
+/// has no way to express yet, which is exactly why the `primitives` scene builds
+/// raw draw lists by hand. So this returns the quad that a stroked line would have
+/// covered, which is the same expansion `rustim-text::formula::filled_shape` makes
+/// for Typst's stroke-only fraction rule. It rotates, scales, morphs and measures
+/// like any other mobject because it *is* one; it is simply a filled outline rather
+/// than a stroke, and it should be replaced by a real stroke when the model grows
+/// one.
+///
+/// Anchored at its **tail**, pointing along `+x` — matching
+/// [`right_triangle`]'s "right angle at the origin" rather than
+/// [`square`]'s "centred on the origin", because the tail is the point a caller
+/// pivots and rotates around.
+pub fn line(length: f64, thickness: f64) -> Vec<Point> {
+    let t = thickness / 2.0;
+    bezier::points_as_corners(&[
+        Point::new(0.0, -t),
+        Point::new(length, -t),
+        Point::new(length, t),
+        Point::new(0.0, t),
+        Point::new(0.0, -t),
+    ])
+}
+
+/// An arrow: a shaft along `+x` from the origin, ending in a triangular head whose
+/// point is at `(length, 0)`.
+///
+/// Drawn as filled geometry for the reason [`line`] gives. It is **one closed
+/// contour of seven corners**, not a shaft and a head, because the head is wider
+/// than the shaft: the union of the two is a single simple polygon, so no subpath
+/// break is needed — and a flat Manim point array cannot express one anyway (see
+/// `shapes::points_from_path` and the welded-glyph note in `CLAUDE.md`). The
+/// consequence is a shape the existing draw walk already renders, with no stroke
+/// and no welding.
+///
+/// The head's proportions are Manim's: `Arrow`'s `tip_length` defaults to `0.25`
+/// and is capped by `max_tip_length_to_length_ratio = 0.25` times the arrow's
+/// length (`animation/mobject/geometry.py`), so the head can never eat a short
+/// arrow. Its *width* is ours — Manim fills a separate `ArrowTriangleFilledTip`
+/// submobject and strokes the shaft, and with neither strokes nor groups in this
+/// module the head is sized here as wide as it is long, which is what a drawn
+/// triangle tip looks like.
+///
+/// The shaft is clamped to the head's width so that a caller asking for an absurd
+/// thickness still gets a simple polygon: past that point the outline would cross
+/// itself and `Fill::NonZero` would paint the overlap as a hole.
+pub fn arrow(length: f64, thickness: f64) -> Vec<Point> {
+    const TIP_LENGTH: f64 = 0.25;
+    const MAX_TIP_TO_LENGTH: f64 = 0.25;
+
+    let head = TIP_LENGTH.min(MAX_TIP_TO_LENGTH * length);
+    let half_head = head / 2.0;
+    let t = (thickness / 2.0).min(half_head);
+    let base = length - head;
+
+    bezier::points_as_corners(&[
+        Point::new(0.0, -t),
+        Point::new(base, -t),
+        Point::new(base, -half_head),
+        Point::new(length, 0.0),
+        Point::new(base, half_head),
+        Point::new(base, t),
+        Point::new(0.0, t),
+        Point::new(0.0, -t),
     ])
 }
 
@@ -382,6 +475,113 @@ mod tests {
     fn params_defaults_are_sane() {
         let p = ShapeParams::default();
         assert_eq!((p.width(), p.height(), p.radius()), (2.0, 2.0, 1.0));
+        assert_eq!(p.thickness(), DEFAULT_THICKNESS);
+    }
+
+    /// A line is the rectangle a stroke would have painted: four corners, exactly
+    /// `length` by `thickness`, anchored at the tail.
+    ///
+    /// Asserted on the **bounds**, not on the point count alone, because the count
+    /// is the same for a line of the right shape in the wrong place — and "anchored
+    /// at the tail" is the half of it a caller pivots on, so `x0 == 0` is the
+    /// assertion that matters rather than `x1 == length`.
+    #[test]
+    fn a_line_is_the_rectangle_a_stroke_would_have_painted() {
+        let (length, thickness) = (3.0, 0.2);
+        let pts = line(length, thickness);
+        assert_eq!(pts.len(), 4 * 4, "four corners, four points per curve");
+
+        let anchors = bezier::anchors(&pts).unwrap();
+        assert_eq!(anchors.len(), 8, "each corner stated twice");
+        let b = bezier::bounds_of(&anchors).unwrap();
+        assert_eq!(b.width(), length);
+        assert_eq!(b.height(), thickness);
+        assert_eq!(
+            (b.x0, b.y0),
+            (0.0, -thickness / 2.0),
+            "the tail is the anchor"
+        );
+    }
+
+    /// An arrow is **one** contour — seven corners — with its point at
+    /// `(length, 0)` and a head wider than its shaft.
+    ///
+    /// The single contour is the point. A shaft and a head as two subpaths would
+    /// need a subpath break, and a flat Manim point array has no way to express
+    /// one; because the head is wider than the shaft, their union is a single
+    /// simple polygon and the question does not arise.
+    #[test]
+    fn an_arrow_is_one_contour_with_its_point_at_the_tip() {
+        let (length, thickness) = (4.0, 0.1);
+        let pts = arrow(length, thickness);
+        assert_eq!(pts.len(), 7 * 4, "seven corners, one contour");
+
+        let anchors = bezier::anchors(&pts).unwrap();
+        assert_eq!(anchors.len(), 14);
+        let b = bezier::bounds_of(&anchors).unwrap();
+        assert_eq!((b.x0, b.x1), (0.0, length));
+        assert!(
+            anchors.contains(&Point::new(length, 0.0)),
+            "the tip must be a corner, not a control point"
+        );
+
+        // Manim's `tip_length` default, and the head is as wide as it is long.
+        assert_eq!(b.height(), 0.25);
+        assert!(b.height() > thickness, "the head must overhang the shaft");
+        // ...and the head starts exactly `tip_length` back from the tip.
+        let base = length - 0.25;
+        assert!(anchors.contains(&Point::new(base, -0.125)));
+        assert!(anchors.contains(&Point::new(base, 0.125)));
+    }
+
+    /// A shaft fatter than the head it enters is clamped to it.
+    ///
+    /// Not a cosmetic guard: past that point the outline's base edge would run
+    /// backwards through the head's own slopes, and `Fill::NonZero` would paint
+    /// the self-overlap as a hole — an arrow with a bite out of it, which reads as
+    /// a rasteriser bug rather than as a shape one.
+    #[test]
+    fn an_arrow_shaft_is_never_fatter_than_its_head() {
+        let length = 4.0;
+        let fat = arrow(length, 1.0);
+        let b = bezier::bounds_of(&bezier::anchors(&fat).unwrap()).unwrap();
+
+        assert_eq!(b.height(), 0.25, "the head's width caps the shaft's");
+        assert!(
+            b.height() < 1.0,
+            "the requested thickness is not the height"
+        );
+
+        // The clamped shaft edge sits exactly on the head's outer corner, so no
+        // pair of consecutive corners crosses.
+        let half = 0.125;
+        assert!(
+            bezier::anchors(&fat)
+                .unwrap()
+                .contains(&Point::new(length - 0.25, -half))
+        );
+    }
+
+    /// On a short arrow the head shrinks with the shaft instead of swallowing it:
+    /// `tip_length` is capped at a quarter of the length, so the head's base never
+    /// runs past the tail and the contour is never reversed.
+    #[test]
+    fn a_tiny_arrow_keeps_its_head_inside_its_length() {
+        for length in [0.4, 0.1, 0.01] {
+            let pts = arrow(length, 0.02);
+            let b = bezier::bounds_of(&bezier::anchors(&pts).unwrap()).unwrap();
+            assert_eq!(b.x1, length, "the tip is still the end");
+            assert_eq!(
+                b.height(),
+                length / 4.0,
+                "head at {length} long, at length {length}"
+            );
+            assert!(b.x0 == 0.0, "and the tail is still the start");
+
+            // The head's base is inside the arrow, strictly, for every length > 0.
+            let base = length - length / 4.0;
+            assert!(base > 0.0 && base < length);
+        }
     }
 
     #[test]

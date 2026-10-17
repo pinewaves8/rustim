@@ -33,10 +33,10 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **279 unit tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **316 unit tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
-`rustim-app` and **not** from `rustim-scene`), all six golden scenes match their checked-in
+`rustim-app` and **not** from `rustim-scene`), all seven golden scenes match their checked-in
 baselines, and `rustim-app --png out.png` reproduces the Manim reference frame with an **identical
 content bounding box** (`343,90,936,629`); only 0.012% of pixels differ by more than 2/255, and none
 by more than 8. See `方案建议.md` §5.2. The count is not decoration — every one of those claims is
@@ -92,6 +92,7 @@ cargo run -p rustim-app -- --frames 300    # run 300 frames then exit
 cargo run -p rustim-app -- --scene primitives  # ...a named scene; `--help` lists them
 cargo run -p rustim-app -- --scene text --png out.png   # CJK + Latin glyph runs
 cargo run -p rustim-app -- --scene formula --png out.png  # Typst → per-glyph outlines
+cargo run -p rustim-app -- --scene rotate --inspect  # rotate + scale, then a FadeOut removal
 cargo run -p rustim-app -- --motion reduced  # ignore the platform "reduce motion" preference
 cargo test --workspace               # unit tests across all crates
 cargo test -p rustim-math ease_in_out       # a single test by name
@@ -205,7 +206,7 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   as the scene happens to need" — otherwise a duration change would silently rebless a golden as a
   capture of a half-faded frame.
 
-The six scenes are there to disagree with each other: `pythagorean` is the one with a Manim
+The seven scenes are there to disagree with each other: `pythagorean` is the one with a Manim
 reference, `composite` covers deferred transforms, alpha and draw order through the mobject tree
 walk, `primitives` pushes strokes and clips as raw `DrawOp`s because nothing in the mobject model
 expresses either yet — without it the baselines would never touch stroke expansion or clip
@@ -213,23 +214,32 @@ rasterisation, the two most intricate things `vello_cpu` does — `text` is the 
 come from a file in this repository rather than from code, so losing `assets/fonts/` fails here
 rather than silently producing a blank frame for a user, `formula` is the only one whose
 geometry comes from a *third-party* typesetting engine, which is what makes the image the only place
-that can see a dropped fraction rule or a filled-in counter (see "P1 step 5"), and `transform` is the
+that can see a dropped fraction rule or a filled-in counter (see "P1 step 5"), `transform` is the
 only one whose still is the *end* of an animation rather than a static arrangement: it morphs a
 3-curve triangle *up* into a circle and a 4-curve square *down* into a triangle, so one image shows
-both directions of the alignment padding and that the style lerp arrived (see "P2 step 2").
+both directions of the alignment padding and that the style lerp arrived (see "P2 step 2"), and
+`rotate` is the only one where an object **leaves the scene**: a `FadeOut` removes its square as its
+third beat, so the still has two objects where the script named three (see "P2 step 5").
 
-Two things about the baselines themselves, both learned the hard way. **`BLESS=1` rewrites every
-baseline**, not just the one under review, because `check()` copies the render unconditionally. Of
-the five older baselines, four come back with different bytes and decode to pixel-identical images
-(`composite`: 28255 against 28688, and the diff bbox is `None`); the fifth, `formula`, matches byte
-for byte. Two renders of one scene from this binary *are* byte-identical, so this is a property of the
-committed files rather than of the encoder run — the cause is not established and does not matter,
-because the suite scores pixels. What does matter is that a bless run always leaves a non-empty diff,
-in which `git checkout`ing the untouched scenes is part of reviewing it, and that **`cmp` between a
-render and its baseline is a false alarm while `compare_png_files` is the honest check.**
+**A baseline's *bytes* are not a property of the image, and `BLESS=1` rewrites all of them** —
+`check()` copies the render unconditionally, not just the one under review. In the step-5 bless run
+four of the six older baselines came back with different bytes and decoded to **pixel-identical**
+images (`composite`: 28255 bytes against 28688, RGBA extrema all `(0, 0)`, diff bbox `None`), while
+`formula` and `transform` matched byte for byte. The cause turned out to be the deflate backend:
+`typst-library` enables `flate2/zlib-rs`, feature unification applies it to the whole graph, and every
+`png` write in the workspace changed its compressed stream. The two that already matched were blessed
+*after* that lock change; the four dated from before it. So a bless run can leave a non-empty diff in
+which nothing moved, **`git checkout`ing the untouched scenes is part of reviewing one**, and **`cmp`
+between a render and its baseline is a false alarm while `compare_png_files` is the honest check.**
+
+**Two tests must not render to the same artifact path.** `render_at`'s file name contains the
+caller's `tag` for exactly this reason: the golden test and the reduced-motion comparison both ask for
+`(scene, "full")`, cargo runs tests in parallel threads, and the reader intermittently got a file the
+other thread had just truncated — `transform-full-linux-aarch64.png: unexpected end of file`, from a
+test whose own two renders were fine.
 
 **Adding a scene means editing two places in `crates/rustim-app/src/main.rs`**, and they are a
-matched pair: the `scene_by_name` match (~:750) and the literal array in `scene_names()` (~:768) that
+matched pair: the `scene_by_name` match (~:997) and the literal array in `scene_names()` (~:1017) that
 `--help` prints. The baseline guarantee above reads `--help`, so a scene wired into the match but not
 into that array is *not* offered by `--help`, and the suite's check cannot see it — it compiles, runs,
 and silently skips its baseline. Register it in both, then bootstrap the baseline for the arch you
@@ -249,13 +259,13 @@ last property.
 |---|---|---|
 | `rustim-math` | Points, `Affine2`, rate functions, the `Viewport` world→screen transform, and literal ports of Manim's `bezier` / `space_ops` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
-| `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree`, stable `NodeId`, shape builders, `critical_point`, `world_anchors` | Real |
-| `rustim-anim` | `Animation` trait, `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `MoveTo`, `Transform`, `Wait` | Real |
+| `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree`, stable `NodeId`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow`), `critical_point`, `world_anchors` | Real |
+| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `FadeOut`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait, `DrawList`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, and the `compare` module that scores two frames | Real; ffmpeg pipe not written |
-| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter and the shaper↔rasteriser bridge (both as a **lib** target), six `--scene` entries, the golden suite | Real |
+| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter and the shaper↔rasteriser bridge (both as a **lib** target), seven `--scene` entries, the golden suite | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead.
@@ -316,10 +326,11 @@ Four things follow, and each is why this is one branch and not a feature:
   snap".
 - **The settled picture is identical**, because a finished animation *is* its end state — Manim's own
   reading (`Animation.finish` forces `interpolate(1)`, `animation/animation.py:216-227`). Measured, not
-  assumed: all six scenes render **byte-identical** stills at `--motion full` and `--motion reduced`,
+  assumed: all seven scenes render **byte-identical** stills at `--motion full` and `--motion reduced`,
   and `--inspect` prints the identical semantic tree, labels and measured sizes included. The suite
-  asserts the transform scene's identity (`reduced_motion_leaves_the_settled_frame_identical`,
-  `max == 0` — not the golden tolerance).
+  asserts two of them (`reduced_motion_leaves_the_settled_frame_identical` and its `rotate` twin,
+  `max == 0` — not the golden tolerance), and the second is not redundant: for a *removal* the reduced
+  path is a different call site (below).
 - **It is cheaper**: one frame of state per beat instead of N.
 
 `Motion` is passed into `SceneContext::new` rather than set afterwards, so a scene that consults it
@@ -362,10 +373,18 @@ first, then react to `!ctx.is_playing()` (it relabels once the morph has *settle
 moment the morph was *queued* — that distinction was a bug in P2 step 2).
 
 `Animation` — `duration()`, `begin(&SceneTree)` (called once at start, so an animation can capture
-where its target actually is), `interpolate(alpha, &mut SceneTree)` with `alpha` in `0.0..=1.0`, and
+where its target actually is), `interpolate(alpha, &mut SceneTree)` with `alpha` in `0.0..=1.0`,
+`finish(&mut SceneTree)` (called once, after the last `interpolate`, when the animation has reached
+its end — Manim's `clean_up_from_scene`; a default no-op keeps the other animations out of it), and
 `rate_func()`. Easing is applied **inside** the animation, never by the scheduler.
 `AnimationScheduler` holds one shared clock and computes each animation's progress independently, so
 durations may differ and the shortest simply finishes first.
+
+`finish` is the hook `FadeOut` removes its target through, and it has **three call sites** — the
+scheduler's completion loop, and `Sequence`'s reduced branch, where a beat's members never reach the
+scheduler at all. It runs only for animations that *complete*: `AnimationScheduler::clear` and
+`Sequence::clear` do not call it, so a dropped script leaves its objects in the tree rather than
+half-removing them.
 
 **The clock is shared; the start is not.** `Running::started_at` records the clock when an animation
 was queued and progress is read as `elapsed - started_at`, so an animation added to a batch already
@@ -401,6 +420,14 @@ square is `side · (cos θ + sin θ)`, so the reference scene's hypotenuse squar
 angle of the 3-4-5 triangle — would be announced as a 4.2-square of area 17.64 when it is a
 3-square of area 9. A blind reader told that has been told the Pythagorean theorem is false, in the
 one scene that exists to demonstrate it.
+
+A **line** and an **arrow** are the same rule applied to figures whose box is not a measurement at
+all — a line's is `3 × 0.045`, the stroke width read out as a dimension. A line's corners *are* its
+rectangle, so its long edge is exact; an arrow's corners are neither its tail nor its tip (the tail
+is two corners, the tip a seventh), so it is measured by the **diameter** of its corner set, which is
+its tail-to-tip length to within `t²/2L`. Both are rotation-invariant. That is not a refinement
+either: read from the box, the `rotate` scene's arrow — turned through 34° — was announced as
+"长度 2.49" when it is 3 long.
 
 A description also **never contains a position**: on macOS and Windows a changed description is an
 accessibility property-change event, and `MoveTo` rewrites the transform every frame of an
@@ -622,6 +649,15 @@ twice; the comment there says so. The **golden suite cannot catch it**: `CARGO_B
 is the *debug* binary, so a release-only defect is invisible to both the unit tests and the
 baselines. Run `cargo test --release` when touching anything with a `debug_assert!` in it.
 
+**A blanket impl that leaves out one method silently disables that method for every caller that goes
+through the box.** `impl<T: Animation + ?Sized> Animation for Box<T>` has to forward `finish`; without
+the forwarding line the default no-op is what `Box<dyn Animation>::finish` resolves to, and since the
+scheduler and `Sequence` *both* hold `Box<dyn Animation>` — the two routes a scene actually plays
+through — the removal never happens, while a direct call on a concrete `FadeOut` still works. The
+symptom is a `FadeOut` that fades out and stays, which no image can see: a fully transparent mobject
+draws nothing either way, so only `--inspect` shows the leftover node. The test therefore drives a
+`FadeOut` through `AnimationScheduler::add`, never through a hand-called `finish`.
+
 **Typst's frame is y-down; its text runs are y-up, and the two are composed, not cancelled.**
 `Frame::items()` gives `(Point, FrameItem)` in frame space (y down, `Abs` = points), while a text
 run's internal cursor is y-up. Following `typst-render`'s own `render_text`, the outline is
@@ -730,7 +766,7 @@ weeks later.
 | | P1 step | State |
 |---|---|---|
 | 1 | Numerical parity against Manim (439 cases at 1e-9) | done — see "Commands" |
-| 2 | Golden-image suite: six scenes, per-platform baselines, CI job | done — see "Golden images" |
+| 2 | Golden-image suite: per-platform baselines, CI job (seven scenes now) | done — see "Golden images" |
 | 3 | Accessibility: structure + full keyboard + throttled announcements | done — see "Accessibility" |
 | 4 | Text: `parley` end to end (string → glyphs → screen), bundled CJK, measured font size | done — see "Text" |
 | 5 | Formulas: Typst → per-glyph outlines via `skrifa::OutlinePen`, never `typst-render` | done — see "P1 step 5", `rustim-text::formula`, the `formula` scene |
@@ -822,7 +858,7 @@ Deferred, deliberately, and reported rather than dropped: `Formula::skipped_shap
 stroker) and any `FrameItem::Image`; per-run colour is not carried over (every glyph takes the
 engine's colour), link annotations are ignored, and `GroupItem::clip` is not applied — math nests
 groups for layout but does not clip them. macOS and Windows `formula` baselines are bootstrapped
-from the CI artifact like the other five scenes'.
+from the CI artifact like the other scenes'.
 
 The two commands that catch the failure modes above are
 `cargo tree -p rustim-text -i skrifa@0.44.0` and `cargo tree -i ttf-parser` — **and the version is
@@ -832,7 +868,8 @@ reads like a mistake. Both, plus "no Typst crate reaches the kernel" and "`rusti
 depends on `rustim-text`", run as the `typst-subtree` CI job.
 
 - **P2** — more mobjects (lines, arrows, axes, function plots) and animations (`Transform`, `Rotate`,
-  `Scale`, `FadeOut`); morph via `align_points`.
+  `Scale`, `FadeOut`); morph via `align_points`. The animations are all in (steps 2 and 5); of the
+  mobjects, lines and arrows are, while axes and function plots wait on the camera.
   **Step 1, the alignment core, is done**: `rustim_math::bezier::align_points` (with `subpaths`)
   is a literal port of `VMobject.align_points`, covered by twelve cases in a new `align_points`
   group in `manim-geometry.json`. It is deliberately **port-ahead-of-consumer** — nothing calls it
@@ -912,6 +949,43 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   out identical under the two modes — the journey moved and the picture and the rhythm did not. Its
   deferred edges: the macOS/Windows probes, a runtime toggle, and re-reading the preference while
   running.
+  **Step 5, the remaining animations — `FadeOut`, `Rotate`, `Scale` — is done**, and the three are
+  not variations on one another. **`FadeOut` is the first animation with an effect *after* its last
+  frame**: it mirrors `FadeIn`'s opacity ramp and then removes its target, which is what forced
+  `Animation::finish` (Manim's `clean_up_from_scene`, `fading.py:184-192`) into the trait, with three
+  call sites and the `Box` forwarding trap — see "Core traits" and "Hard-won facts". **`Rotate` is
+  the animation `MoveTo` cannot express**: Manim's is a `Transform` with `path_arc` (`rotation.py:155-184`)
+  and interpolates the *angle* linearly, so here it freezes `(pivot, start_transform)` in `begin` and
+  writes `rotate_about(angle · alpha, pivot) · start`; the counterfactual is that a componentwise
+  affine lerp of the same quarter turn lands a corner at distance 1 from the pivot where the arc puts
+  it at √2. **`Scale` is `ScaleInPlace`, not `Scale`** — Manim has no `Scale` class (`transform.py:562`)
+  — so it is in place about the object's own centre, factor interpolated linearly, and it takes no
+  pivot. `Mobject::rotate_about` / `scale_about` compose onto the deferred transform in O(1); the
+  pivot lives in the **parent's** space, which is where `critical_point((0.0, 0.0))` already answers,
+  so the default pivot needs no inverse — and the world-space pivot `Rotate::about_point` does take
+  one, guarded, with a degenerate parent making the animation a no-op rather than writing `NaN`.
+  Two shapes came with them, because nothing in `shapes` was interesting to turn: `line` and `arrow`
+  are **filled outlines** (a line has zero area and the draw walk emits fills — the same trade
+  `formula::filled_shape` makes for a fraction's rule), anchored at the tail rather than centred, so
+  "rotate about the tail" means what a caller expects. **The step's own behavioural change is that
+  `set`'s `scale` and `rotation` now compose** onto the object's transform instead of overwriting it,
+  pinned by two tests; `position` stays absolute because Manim's `move_to` is.
+  **The evidence is a bless run that moved nothing.** All six older scenes rendered *pixel-identical*
+  to their committed baselines — the `finish` hook and the composing properties touch running code,
+  and no golden noticed — which is what the four stale-byte files in that run turned out to be
+  (see "Golden images"). The new `rotate` scene carries the two things no unit test can: a still with
+  **two** objects where the script named three, and an `--inspect` tree to match, which is the only
+  assertion in the workspace that can see a `finish` that never ran; the scene needs **no `update`
+  override at all**, which is itself the claim that removing an object is the animation's business
+  and not the script's. **`--inspect` also caught a defect the a11y tests had passed over**: the
+  turned arrow was announced as "长度 2.49" rather than 3, because the measurement fell back to the
+  bounding box — see "Accessibility" for the diameter rule that replaced it, and note that the test
+  now asserts on a *rotated* arrow, since the unrotated one gave the right answer by coincidence.
+  Deferred on purpose: **strokes in the mobject model** (the filled `Line`/`Arrow` are the honest
+  interim, and teaching the draw walk to stroke changes every golden), `Create`/`Uncreate` (needs
+  `pointwise_become_partial`), `Rotating` (an animation that never ends makes `is_playing`
+  permanently true, which every "react when the timeline drains" scene depends on), `path_arc` for a
+  straight move, `FadeIn`'s `shift`/`scale`, and axes and plots.
 - **P3+** — camera (pan/zoom/focus); video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration

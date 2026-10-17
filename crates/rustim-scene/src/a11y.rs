@@ -71,7 +71,14 @@ pub enum SemanticRole {
 impl SemanticRole {
     pub fn from_kind(kind: NodeKind) -> Self {
         match kind {
-            NodeKind::Square | NodeKind::Circle | NodeKind::RightTriangle => Self::Image,
+            // A line and an arrow are pictures too. What distinguishes them is
+            // their *kind*, which the description reads; the role a reader's
+            // navigation acts on is the same for every figure here.
+            NodeKind::Square
+            | NodeKind::Circle
+            | NodeKind::RightTriangle
+            | NodeKind::Line
+            | NodeKind::Arrow => Self::Image,
             NodeKind::Axes | NodeKind::Plot => Self::Image,
             NodeKind::Group => Self::Group,
             NodeKind::Text => Self::Label,
@@ -226,6 +233,8 @@ pub fn default_name(kind: NodeKind) -> &'static str {
         NodeKind::Square => "方形",
         NodeKind::Circle => "圆",
         NodeKind::RightTriangle => "直角三角形",
+        NodeKind::Line => "线段",
+        NodeKind::Arrow => "箭头",
         NodeKind::Group => "组合",
         NodeKind::Text => "文本",
         NodeKind::Heading => "标题",
@@ -309,6 +318,7 @@ pub fn describe(kind: NodeKind, label: Option<&str>, shape: Option<&Shape>) -> S
                     }
                     NodeKind::Square => rectangle_sentence(s, w, h, !named),
                     NodeKind::RightTriangle => triangle_sentence(s, w, h, !named),
+                    NodeKind::Line | NodeKind::Arrow => line_sentence(kind, s, w, h, !named),
                     _ if named => format!("{} × {}", num(w), num(h)),
                     _ => format!("{} × {} 的{}", num(w), num(h), default_name(kind)),
                 }
@@ -384,6 +394,57 @@ fn triangle_sentence(s: &Shape, w: f64, h: f64, with_noun: bool) -> String {
     } else {
         format!("{legs}，面积 {area}")
     }
+}
+
+/// A line or an arrow: its **length**.
+///
+/// The one thing about either that a reader can act on, and the thing the
+/// fallback below cannot say: a line is drawn as a filled rectangle (it has no
+/// area, and the draw walk emits fills — see `rustim_mobject::shapes::line`), so a
+/// box-based sentence would announce one as "3 × 0.045 的图形" — the stroke width
+/// read out as if it were a dimension.
+///
+/// Neither is measured from the box, and for the line that is the same reason
+/// [`rectangle_sentence`] reads edges: a rotated line's box is
+/// `(L cos θ + t sin θ) × …`, so its "length" would shrink as the figure turned.
+/// A line's corners are its rectangle, so its long edge is available and exact.
+///
+/// An arrow's corners are **not** its endpoints — its tail is two corners and its
+/// tip is a seventh — so there is no edge that spans it and the measurement is the
+/// corner set's **diameter**. That is the arrow's tail-to-tip length to within
+/// `t² / 2L` (a part in ten thousand at the default thickness); the alternative,
+/// measuring a rotated arrow by its box, reported a 3-unit arrow as 2.49 the first
+/// time this scene ran with one turned through 34°.
+///
+/// The thickness is deliberately not reported: it is a rendering width rather than
+/// a property of the figure, and "长 3、粗 0.05 的线段" is a sentence no listener
+/// asked for.
+fn line_sentence(kind: NodeKind, s: &Shape, w: f64, h: f64, with_noun: bool) -> String {
+    // The corners of this outline are in order, so a rectangle's first two edges
+    // are its length and its thickness, in some order.
+    let length = match quad_edges(s) {
+        Some(e) if same(e[0], e[2]) && same(e[1], e[3]) => e[0].max(e[1]),
+        _ => diameter(s).unwrap_or(w.max(h)),
+    };
+    if with_noun {
+        format!("长度 {} 的{}", num(length), default_name(kind))
+    } else {
+        format!("长度 {}", num(length))
+    }
+}
+
+/// The greatest distance between any two of a shape's corners.
+///
+/// `None` for fewer than two corners, and for a set that is all one point — a
+/// figure with no extent has no length to report, and caller falls back to its box.
+fn diameter(s: &Shape) -> Option<f64> {
+    let mut best = 0.0_f64;
+    for (i, a) in s.corners.iter().enumerate() {
+        for b in &s.corners[i + 1..] {
+            best = best.max(distance(a, b));
+        }
+    }
+    (best > 0.0).then_some(best)
 }
 
 /// The four edge lengths of a quadrilateral, in order, or `None` if the shape
@@ -764,6 +825,88 @@ mod tests {
         assert_eq!(num(-0.001), "0");
     }
 
+    /// The world-space shape of a built mobject, as the layer would measure it.
+    fn shape_of(m: &rustim_mobject::Mobject) -> Shape {
+        let anchors = rustim_math::bezier::anchors(&m.materialize()).unwrap();
+        Shape::of(&anchors).unwrap()
+    }
+
+    /// A line is described by its **length**.
+    ///
+    /// The `Line`/`Arrow` arms are the point of this edit rather than a
+    /// formality: `describe`'s match has a `_` fallback, so omitting them
+    /// compiles, every other test still passes, and a 3-unit line is announced as
+    /// "3 × 0.045 的图形" — the stroke width read out as if it were a dimension,
+    /// which is exactly the kind of confident nonsense a fallback branch produces.
+    /// The last assertion is the one a box-based sentence cannot pass.
+    #[test]
+    fn a_line_is_described_by_its_length() {
+        let params = ShapeParams {
+            width: Some(3.0),
+            thickness: Some(0.045),
+            ..Default::default()
+        };
+        let line = rustim_mobject::shapes::build(ShapeKind::Line, &params);
+        let s = shape_of(&line);
+        assert_eq!(describe(NodeKind::Line, None, Some(&s)), "长度 3 的线段");
+        assert_eq!(
+            describe(NodeKind::Line, Some("边 a"), Some(&s)),
+            "边 a，长度 3"
+        );
+
+        // Turned, the length is still 3 — while the box the fallback would have
+        // read is a good deal shorter, because a rotated segment's box is its
+        // projection onto both axes rather than its extent along its own.
+        let mut turned = line;
+        turned.set_transform(Affine::rotate(0.7));
+        let s = shape_of(&turned);
+        assert!(
+            s.bounds.width() < 2.5,
+            "the box really is the overestimate here: {:?}",
+            s.bounds
+        );
+        assert_eq!(describe(NodeKind::Line, None, Some(&s)), "长度 3 的线段");
+    }
+
+    #[test]
+    fn an_arrow_is_described_by_its_length() {
+        let params = ShapeParams {
+            width: Some(3.0),
+            thickness: Some(0.045),
+            ..Default::default()
+        };
+        let arrow = rustim_mobject::shapes::build(ShapeKind::Arrow, &params);
+        let s = shape_of(&arrow);
+        // Seven corners — the tail is *two* of them and the tip is a seventh — so
+        // no single edge spans the arrow and the measurement is the corner set's
+        // diameter, not the box. It comes out a ten-thousandth over 3, because the
+        // tail corners sit half a thickness off the axis; the sentence rounds.
+        assert_eq!(s.corners.len(), 7, "an arrow is one 7-corner contour");
+        assert!(diameter(&s).unwrap() > 3.0 && diameter(&s).unwrap() < 3.001);
+        assert_eq!(describe(NodeKind::Arrow, None, Some(&s)), "长度 3 的箭头");
+        assert_eq!(
+            describe(NodeKind::Arrow, Some("位移"), Some(&s)),
+            "位移，长度 3"
+        );
+
+        // The case the box cannot survive, and the reason this test has a second
+        // half: `--inspect` on the `rotate` scene announced a turned arrow as
+        // "长度 2.49". The diameter is invariant under the rotation; the box is its
+        // projection onto both axes.
+        let mut turned = arrow;
+        turned.set_transform(Affine::rotate(0.6));
+        let s = shape_of(&turned);
+        assert!(
+            s.bounds.width() < 2.6,
+            "the box really is the underestimate here: {:?}",
+            s.bounds
+        );
+        assert_eq!(
+            describe(NodeKind::Arrow, Some("位移"), Some(&s)),
+            "位移，长度 3"
+        );
+    }
+
     #[test]
     fn roles_do_not_change_without_someone_noticing() {
         // The mapping is a decision, not a default, so it is pinned rather than
@@ -781,6 +924,13 @@ mod tests {
             SemanticRole::Group
         );
         assert_eq!(SemanticRole::from_kind(NodeKind::Text), SemanticRole::Label);
+        // A line and an arrow are figures like the rest: the kind is what the
+        // *description* distinguishes, not the role.
+        assert_eq!(SemanticRole::from_kind(NodeKind::Line), SemanticRole::Image);
+        assert_eq!(
+            SemanticRole::from_kind(NodeKind::Arrow),
+            SemanticRole::Image
+        );
         assert_eq!(
             SemanticRole::from_kind(NodeKind::Formula),
             SemanticRole::Math
