@@ -7,24 +7,27 @@
 //! to be written down as data and executed a beat at a time. That is all this type
 //! is: the script, with one method that hands the next beat to the scheduler.
 //!
-//! # Why this is not `Succession`
+//! # Why this queue is still here, now that `Succession` exists
 //!
 //! Manim expresses sequence by *composing* animations — `Succession` is an
 //! `AnimationGroup` with `lag_ratio = 1` (`animation/composition.py:198-236`), one
 //! animation whose `alpha` sweeps a rescaled internal timeline
-//! (`composition.py:157-168`). Two things follow, and both are why the port stops
-//! here:
+//! (`composition.py:157-168`). That composition now exists here
+//! ([`crate::Succession`]), and the queue did not go away with it, because the two
+//! answer different questions:
 //!
-//! * A group is a *different feature*: `lag_ratio` staggers children that all
-//!   belong to one alpha sweep, which is what `LaggedStart` needs and what neither
-//!   of this workspace's scenes does.
-//! * A group's explicit `run_time` **rescales** its children rather than changing
-//!   their durations (`composition.py:162-168`). Sequential playback here is a
-//!   driver concept — beat *k+1* starts when beat *k* has drained — with no
-//!   rescaling anywhere, so a beat's own duration always means what it says.
+//! * **The queue is the scene's structure.** Beat *k+1* starts when beat *k* has
+//!   drained, its duration means exactly what it says, and its members are begun
+//!   when their beat begins. A scene scripted this way can be inspected one beat
+//!   at a time, and `is_playing` is meaningful between beats.
+//! * **A `Succession` is one animation.** It has one duration and one entry in a
+//!   beat, so it can be nested in a parallel beat or restated as a whole ("the
+//!   same three steps, but over 4 seconds" — which *rescales* its members,
+//!   `composition.py:162-168`), and its members cannot be addressed separately.
 //!
-//! What ships covers `play(a, b)` (one beat, in parallel) and `play(a); play(b)`
-//! (two beats, in order), which is the whole authoring surface the scenes need.
+//! The scenes here are written with the queue. Use a composed animation when the
+//! steps are one thing that happens and the beat is not a place a viewer or a host
+//! should be able to see; use the queue when the steps are the scene's structure.
 
 use std::collections::VecDeque;
 

@@ -852,13 +852,15 @@ mod tests {
         let id = invisible_square(&mut ctx);
         let cmd = Command::Play {
             animation: command::AnimationSpec {
-                target: id,
+                target: Some(id),
                 kind: command::AnimationKind::FadeIn,
                 duration: Some(0.5),
                 to: None,
                 angle: None,
                 factor: None,
                 about_point: None,
+                animations: None,
+                lag_ratio: None,
             },
         };
         ctx.handle(&cmd).unwrap();
@@ -878,13 +880,15 @@ mod tests {
         let id = invisible_square(&mut ctx);
         let cmd = Command::Play {
             animation: command::AnimationSpec {
-                target: id,
+                target: Some(id),
                 kind: command::AnimationKind::FadeIn,
                 duration: Some(0.5),
                 to: None,
                 angle: None,
                 factor: None,
                 about_point: None,
+                animations: None,
+                lag_ratio: None,
             },
         };
 
@@ -915,13 +919,15 @@ mod tests {
         ctx.tree.remove(ghost);
         let cmd = Command::Play {
             animation: command::AnimationSpec {
-                target: ghost,
+                target: Some(ghost),
                 kind: command::AnimationKind::FadeIn,
                 duration: None,
                 to: None,
                 angle: None,
                 factor: None,
                 about_point: None,
+                animations: None,
+                lag_ratio: None,
             },
         };
 

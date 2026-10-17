@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use rustim_anim::{Animation, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Uncreate};
+use rustim_anim::{
+    Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Succession, Uncreate,
+};
 use rustim_math::{Affine2, Camera, Point, Viewport};
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree};
@@ -100,7 +102,17 @@ pub enum Property {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnimationSpec {
-    pub target: NodeId,
+    /// The node this animation acts on.
+    ///
+    /// **Optional**, and absent for `group` and `succession`: those name their
+    /// members in `animations` and have no target of their own — the group is a
+    /// timeline, not a node. Making it optional was the honest spelling: the
+    /// alternative was making a host invent an id that the animation would ignore,
+    /// which teaches a model that a meaningless field is part of the protocol. A
+    /// non-group kind with no target is a refusal, not a parse error, so the model
+    /// gets told what is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<NodeId>,
     #[serde(rename = "type")]
     pub kind: AnimationKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,6 +133,20 @@ pub struct AnimationSpec {
     /// centre, which is what Manim's `Rotate` defaults to as well.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub about_point: Option<[f64; 2]>,
+    /// A `group`'s or `succession`'s member animations, each a spec of its own.
+    ///
+    /// Nested rather than flat because a group is a tree: a member may itself be a
+    /// group, and a flat list would need a second structure saying which member
+    /// belongs to which parent. `serde_json`'s own recursion limit bounds the
+    /// depth, and `animation_for` walks each node once, so a hostile log cannot do
+    /// worse than a deep tree it had to write out in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animations: Option<Vec<AnimationSpec>>,
+    /// A `group`'s or `succession`'s stagger, as a fraction of the previous
+    /// member's duration. Absent means Manim's default for the kind: `0.0` for
+    /// `group`, `1.0` for `succession`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +161,10 @@ pub enum AnimationKind {
     Create,
     /// Erase the path from its end and remove the object.
     Uncreate,
+    /// Play the `animations` list in parallel, staggered by `lag_ratio`.
+    Group,
+    /// Play the `animations` list one after another, as one animation.
+    Succession,
 }
 
 /// Why a command was refused.
@@ -435,6 +465,9 @@ pub fn camera_duration(duration: Option<f64>) -> Result<Option<f64>, CommandErro
 ///
 /// The refusals, each a value rather than a panic:
 ///
+/// * a kind other than `group`/`succession` with **no** `target` —
+///   [`CommandError::OutOfRange`]. Every animation but a composition acts on
+///   exactly one node, and "which node?" is a question the reply can answer;
 /// * a target that is not in the tree — [`CommandError::NoSuchNode`];
 /// * `MoveTo` with no `to` — [`CommandError::OutOfRange`], because there is no
 ///   destination and silently doing nothing would teach a model that `to` is
@@ -466,10 +499,22 @@ pub fn animation_for(
     tree: &SceneTree,
     spec: &AnimationSpec,
 ) -> Result<Box<dyn Animation>, CommandError> {
-    if tree.get(spec.target).is_none() {
-        return Err(CommandError::NoSuchNode {
-            target: spec.target,
+    match spec.kind {
+        AnimationKind::Group | AnimationKind::Succession => return composed_for(tree, spec),
+        _ => {}
+    }
+    let Some(target) = spec.target else {
+        return Err(CommandError::OutOfRange {
+            property: "target".into(),
+            detail: format!(
+                "a {:?} names the node it acts on; only group and succession name none",
+                spec.kind
+            )
+            .to_lowercase(),
         });
+    };
+    if tree.get(target).is_none() {
+        return Err(CommandError::NoSuchNode { target });
     }
     if let Some(d) = spec.duration
         && (!d.is_finite() || d < 0.0)
@@ -482,8 +527,10 @@ pub fn animation_for(
     let duration = spec.duration.unwrap_or(DEFAULT_ANIMATION_RUN_TIME);
 
     Ok(match spec.kind {
-        AnimationKind::FadeIn => Box::new(FadeIn::new(spec.target).with_duration(duration)),
-        AnimationKind::FadeOut => Box::new(FadeOut::new(spec.target).with_duration(duration)),
+        // Answered above, before the target is required.
+        AnimationKind::Group | AnimationKind::Succession => unreachable!(),
+        AnimationKind::FadeIn => Box::new(FadeIn::new(target).with_duration(duration)),
+        AnimationKind::FadeOut => Box::new(FadeOut::new(target).with_duration(duration)),
         AnimationKind::MoveTo => {
             let Some([x, y]) = spec.to else {
                 return Err(CommandError::OutOfRange {
@@ -492,7 +539,7 @@ pub fn animation_for(
                 });
             };
             let to = Affine2::translate((x, y));
-            Box::new(MoveTo::new(spec.target, to).with_duration(duration))
+            Box::new(MoveTo::new(target, to).with_duration(duration))
         }
         AnimationKind::Rotate => {
             let Some(angle) = spec.angle else {
@@ -507,7 +554,7 @@ pub fn animation_for(
                     detail: format!("{angle} is not a finite number of radians"),
                 });
             }
-            let mut anim = Rotate::new(spec.target, angle).with_duration(duration);
+            let mut anim = Rotate::new(target, angle).with_duration(duration);
             if let Some([x, y]) = spec.about_point {
                 anim = anim.about_point(Point::new(x, y));
             }
@@ -526,10 +573,95 @@ pub fn animation_for(
                     detail: format!("{factor} is not a positive, finite scale factor"),
                 });
             }
-            Box::new(Scale::new(spec.target, factor).with_duration(duration))
+            Box::new(Scale::new(target, factor).with_duration(duration))
         }
-        AnimationKind::Create => Box::new(Create::new(spec.target).with_duration(duration)),
-        AnimationKind::Uncreate => Box::new(Uncreate::new(spec.target).with_duration(duration)),
+        AnimationKind::Create => Box::new(Create::new(target).with_duration(duration)),
+        AnimationKind::Uncreate => Box::new(Uncreate::new(target).with_duration(duration)),
+    })
+}
+
+/// Build a `group` or a `succession`: the half of [`animation_for`] that names no
+/// node of its own.
+///
+/// The refusals are the ones a tree-shaped spec makes possible, and each is a
+/// message a model can act on:
+///
+/// * a `target`, which a group does not have — refused rather than ignored, because
+///   a silently dropped field teaches the model to keep sending it;
+/// * no `animations`, or an empty list — Manim raises `ValueError` for the same
+///   case (`composition.py:114-118`) and a beat that plays nothing is worse than a
+///   refusal: the driver waits for it to drain;
+/// * a `lag_ratio` that is negative or non-finite. Manim accepts any number, but a
+///   non-finite one poisons every start time with `NaN` and a negative one starts a
+///   member before the one it is meant to follow — neither is a stagger;
+/// * a bad `duration`, by the same rule [`animation_for`] applies to every kind.
+///
+/// A member is itself validated by recursing through [`animation_for`], so a bad
+/// node id inside a group is reported as `NoSuchNode` naming *that* id.
+fn composed_for(
+    tree: &SceneTree,
+    spec: &AnimationSpec,
+) -> Result<Box<dyn Animation>, CommandError> {
+    if spec.target.is_some() {
+        return Err(CommandError::OutOfRange {
+            property: "target".into(),
+            detail: "a group names its members in `animations`, not a node of its own".into(),
+        });
+    }
+    let Some(members) = spec.animations.as_deref() else {
+        return Err(CommandError::OutOfRange {
+            property: "animations".into(),
+            detail: "a group needs at least one member animation".into(),
+        });
+    };
+    if members.is_empty() {
+        return Err(CommandError::OutOfRange {
+            property: "animations".into(),
+            detail: "a group with no members plays nothing".into(),
+        });
+    }
+    let lag = match (spec.kind, spec.lag_ratio) {
+        (_, Some(r)) => r,
+        // Manim's own defaults: `AnimationGroup` 0 and `Succession` 1.
+        (AnimationKind::Succession, None) => 1.0,
+        (_, None) => 0.0,
+    };
+    if !lag.is_finite() || lag < 0.0 {
+        return Err(CommandError::OutOfRange {
+            property: "lag_ratio".into(),
+            detail: format!("{lag} is not a non-negative, finite fraction"),
+        });
+    }
+    if let Some(d) = spec.duration
+        && (!d.is_finite() || d < 0.0)
+    {
+        return Err(CommandError::OutOfRange {
+            property: "duration".into(),
+            detail: format!("{d} is not a finite, non-negative number of seconds"),
+        });
+    }
+
+    let mut children = Vec::with_capacity(members.len());
+    for member in members {
+        children.push(animation_for(tree, member)?);
+    }
+    Ok(match spec.kind {
+        AnimationKind::Group => {
+            let mut group = AnimationGroup::new(children).with_lag_ratio(lag);
+            if let Some(d) = spec.duration {
+                group = group.with_duration(d);
+            }
+            Box::new(group)
+        }
+        AnimationKind::Succession => {
+            let mut succession = Succession::new(children).with_lag_ratio(lag);
+            if let Some(d) = spec.duration {
+                succession = succession.with_duration(d);
+            }
+            Box::new(succession)
+        }
+        // Only reachable through `animation_for`, which dispatches these two here.
+        _ => unreachable!("composed_for is called for group and succession only"),
     })
 }
 
@@ -694,6 +826,14 @@ mod tests {
             format!(
                 r#"{{"action":"play","animation":{{"target":{id},"type":"uncreate","duration":0.7}}}}"#
             ),
+            // A composed animation is a tree: no target of its own, members of
+            // their own kind, and a lag. Both defaults have to survive too — a
+            // `succession` with no `lag_ratio` must not gain one on the way out.
+            format!(
+                r#"{{"action":"play","animation":{{"type":"group","animations":[{{"target":{id},"type":"fade_in"}},{{"target":{id},"type":"rotate","angle":1.2}}],"lag_ratio":0.2}}}}"#
+            ),
+            r#"{"action":"play","animation":{"type":"succession","duration":2.0,"animations":[{"target":4294967296,"type":"create"},{"target":4294967296,"type":"fade_out","duration":0.5}]}}"#
+                .to_owned(),
             // The camera command, in its full and partial spellings. The full
             // one exercises every optional field at once; the partial one is what
             // a host sends to "zoom in", and it has to survive without gaining
@@ -937,13 +1077,15 @@ mod tests {
             &mut tree,
             &Command::Play {
                 animation: AnimationSpec {
-                    target: id,
+                    target: Some(id),
                     kind: AnimationKind::FadeIn,
                     duration: None,
                     to: None,
                     angle: None,
                     factor: None,
                     about_point: None,
+                    animations: None,
+                    lag_ratio: None,
                 },
             },
         )
@@ -966,13 +1108,15 @@ mod tests {
     /// the case three of the refusals below are about.
     fn spec(id: NodeId, kind: AnimationKind) -> AnimationSpec {
         AnimationSpec {
-            target: id,
+            target: Some(id),
             kind,
             duration: None,
             to: None,
             angle: None,
             factor: None,
             about_point: None,
+            animations: None,
+            lag_ratio: None,
         }
     }
 
@@ -1016,7 +1160,9 @@ mod tests {
     fn an_omitted_duration_is_manims_default() {
         let (tree, id) = scene_with_a_blank();
         assert_eq!(DEFAULT_ANIMATION_RUN_TIME, 1.0);
-        // Every kind, so a new one cannot quietly acquire a *second* default.
+        // Every single-node kind, so a new one cannot quietly acquire a *second*
+        // default. `group` and `succession` are absent on purpose: their default
+        // duration is the timeline their members lay out, not one second.
         for kind in [
             AnimationKind::FadeIn,
             AnimationKind::FadeOut,
@@ -1220,6 +1366,155 @@ mod tests {
         anim.interpolate(1.0, &mut tree);
         anim.finish(&mut tree);
         assert!(tree.get(id).is_none(), "the object outlived its uncreate");
+    }
+
+    // ---- the P3 composition kinds -----------------------------------------
+
+    /// A spec that names no node and carries a member list: the shape a model
+    /// produces for `{"type":"group",...}`.
+    fn composed(kind: AnimationKind, members: Vec<AnimationSpec>) -> AnimationSpec {
+        AnimationSpec {
+            target: None,
+            kind,
+            duration: None,
+            to: None,
+            angle: None,
+            factor: None,
+            about_point: None,
+            animations: Some(members),
+            lag_ratio: None,
+        }
+    }
+
+    /// The timeline, as the one number the wire can carry: `max(end)`, and the
+    /// stagger really did move it. Both lag values are asserted so the difference
+    /// cannot be an accident of the member durations.
+    #[test]
+    fn a_group_command_builds_a_composed_animation() {
+        let (tree, id) = scene_with_a_blank();
+        let one = |seconds: f64| {
+            let mut s = spec(id, AnimationKind::FadeIn);
+            s.duration = Some(seconds);
+            s
+        };
+
+        let group = composed(AnimationKind::Group, vec![one(2.0), one(2.0)]);
+        assert_eq!(animation_for(&tree, &group).unwrap().duration(), 2.0);
+
+        let mut staggered = group.clone();
+        staggered.lag_ratio = Some(0.5);
+        assert_eq!(animation_for(&tree, &staggered).unwrap().duration(), 3.0);
+
+        // `succession`'s default is Manim's 1.0, so two members simply add up.
+        let succession = composed(AnimationKind::Succession, vec![one(1.0), one(2.0)]);
+        assert_eq!(animation_for(&tree, &succession).unwrap().duration(), 3.0);
+    }
+
+    /// Not just the duration: the members really are at different points of their
+    /// own curves at the same moment, which is the feature.
+    #[test]
+    fn a_group_command_staggers_its_members() {
+        let mut tree = SceneTree::new();
+        let a = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        let b = tree.insert(Mobject::new(rustim_mobject::shapes::square(2.0, 2.0)));
+        for id in [a, b] {
+            tree.get_mut(id).unwrap().opacity = 0.0;
+        }
+        let fade = |id| {
+            let mut s = spec(id, AnimationKind::FadeIn);
+            s.duration = Some(1.0);
+            s
+        };
+        let mut what = composed(AnimationKind::Group, vec![fade(a), fade(b)]);
+        what.lag_ratio = Some(0.5);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree); // t = 0.75 of a 1.5 s group
+
+        // The group's own rate is linear, so the members are 0.75 and 0.25 of the
+        // way through their own curves — and each eases itself from there.
+        assert_eq!(
+            tree.get(a).unwrap().opacity,
+            rustim_anim::rate::ease_in_out(0.75)
+        );
+        assert_eq!(
+            tree.get(b).unwrap().opacity,
+            rustim_anim::rate::ease_in_out(0.25)
+        );
+    }
+
+    #[test]
+    fn a_composition_command_names_no_target() {
+        let (tree, id) = scene_with_a_blank();
+        let mut what = composed(AnimationKind::Group, vec![spec(id, AnimationKind::FadeIn)]);
+        what.target = Some(id);
+        assert!(matches!(
+            animation_for(&tree, &what),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "target"
+        ));
+    }
+
+    #[test]
+    fn a_composition_command_needs_members() {
+        let (tree, _) = scene_with_a_blank();
+        let mut missing = composed(AnimationKind::Group, vec![]);
+        missing.animations = None;
+        assert!(matches!(
+            animation_for(&tree, &missing),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "animations"
+        ));
+        assert!(matches!(
+            animation_for(&tree, &composed(AnimationKind::Succession, vec![])),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "animations"
+        ));
+    }
+
+    #[test]
+    fn a_composition_command_refuses_a_bad_lag_ratio() {
+        let (tree, id) = scene_with_a_blank();
+        for bad in [-0.5, f64::NAN, f64::INFINITY] {
+            let mut what = composed(AnimationKind::Group, vec![spec(id, AnimationKind::FadeIn)]);
+            what.lag_ratio = Some(bad);
+            assert!(
+                matches!(
+                    animation_for(&tree, &what),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == "lag_ratio"
+                ),
+                "lag_ratio {bad} must be refused"
+            );
+        }
+    }
+
+    /// A member is validated by the same function, so the refusal names the id the
+    /// member gave — not the group, which has none.
+    #[test]
+    fn a_composition_command_validates_its_members() {
+        let (mut tree, id) = scene_with_a_blank();
+        let ghost = tree.insert(Mobject::new(vec![]));
+        tree.remove(ghost);
+        let what = composed(
+            AnimationKind::Succession,
+            vec![
+                spec(id, AnimationKind::FadeIn),
+                spec(ghost, AnimationKind::FadeIn),
+            ],
+        );
+        assert!(matches!(
+            animation_for(&tree, &what),
+            Err(CommandError::NoSuchNode { target }) if target == ghost
+        ));
+    }
+
+    #[test]
+    fn a_single_node_kind_needs_a_target() {
+        let (tree, _) = scene_with_a_blank();
+        let mut what = spec(NodeId::from_raw(1), AnimationKind::FadeIn);
+        what.target = None;
+        assert!(matches!(
+            animation_for(&tree, &what),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "target"
+        ));
     }
 
     /// **The behavioural change of P2 step 5, pinned.**

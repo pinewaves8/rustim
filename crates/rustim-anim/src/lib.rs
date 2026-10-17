@@ -50,11 +50,13 @@
 //! *data naming a node*, so that a command can start, inspect, or cancel an
 //! animation without holding a Rust reference to it.
 
+pub mod composition;
 pub mod ops;
 pub mod sequence;
 
 use rustim_mobject::{NodeId, SceneTree};
 
+pub use composition::{AnimationGroup, DEFAULT_LAGGED_START_LAG_RATIO, Succession};
 pub use ops::{
     CameraMove, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Transform, Uncreate, Wait,
 };

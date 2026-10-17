@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **423 tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **442 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
@@ -273,7 +273,7 @@ last property.
 | `rustim-math` | Points, `Affine2`, rate functions, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`), stable `NodeId`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
-| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `CameraMove`, `Wait` | Real |
+| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `CameraMove`, `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
@@ -503,10 +503,51 @@ animations" uniform — no separate gap type, and `is_playing` stays true *acros
 
 `AnimationScheduler`'s "one flat list, total `max(run_time)`, each child at `alpha = t /
 its own run_time`" (`scene.py:1017-1026`, `:1184-1186`, `:1714-1724`) **is** Manim's `play(*args)`
-semantics, so a beat reimplements nothing. What is not ported is `AnimationGroup` / `Succession`:
-Manim expresses sequence by *composing* animations into one whose `alpha` sweeps a rescaled internal
-timeline (`animation/composition.py:198-236`), which is a different feature (`lag_ratio` staggering)
-and would rescale the durations of the beats this engine plays at face value.
+semantics, so a beat reimplements nothing.
+
+### Composition: a fourth layer, inside the first
+
+`AnimationGroup` / `Succession` (`rustim-anim/src/composition.rs`) are the port of
+`animation/composition.py`, and they are **one animation built from a list** — not a fourth driver.
+That placement is the whole design: a beat can hold a composed timeline without the scheduler or the
+queue knowing it exists, a composed animation can be nested inside another, and `Sequence` keeps
+meaning what its doc says (one beat at a time; a beat's duration is `max(duration)` over its members,
+not something an inner layout can rescale).
+
+The layout is Manim's, verbatim: `start[0] = 0`, `start[i] = start[i-1] + d[i-1] · lag_ratio`,
+`end[i] = start[i] + d[i]`, duration `max(end)` unless `with_duration` rescales the internal timeline
+(which changes the speed, not the shape). The group's own `rate_func` is **`linear`** — its alpha is
+a position on the timeline, and every member eases itself from its own sliced alpha
+(`child.ease(alpha)`), so an ease applied to the group would ease the timeline itself.
+
+Three behaviours differ between the two kinds, all pinned in `composition.rs`:
+
+- **A group begins every member eagerly**, at the group's `begin`, so each member's `begin` sees the
+  tree as it is before the group starts. That is Manim's own choice, and it is why a `MoveTo` inside
+  a group captures the *pre-group* position.
+- **A succession begins a member when its turn arrives** and calls that member's `finish` as it is
+  left behind, so "scale, then rotate" composes: the rotate's `begin` sees the scaled transform.
+  A group instead `finish`es every member at the group's end, whether or not it had finished its own
+  curve — the same reason its `finish` first forces `interpolate(1)` on each child
+  (`Animation.finish`'s own first line).
+- **`finish` reaches the children**, which is what makes a `FadeOut` *inside* a group or succession
+  actually remove its target. This is a new route into `Animation::finish`, beside the scheduler and
+  `Sequence`'s reduced branch, and it inherits the `Box` forwarding trap: `AnimationGroup::finish`
+  holds `Box<dyn Animation>`, so the blanket impl has to forward.
+
+One deliberate difference, forced by the trait: Manim's `Animation.begin` ends with
+`interpolate(0)`, and our `begin` only has `&SceneTree`. A member that begins at alpha 0 therefore
+first hears from the group on the next frame, at its own small alpha. The settled frame is unaffected
+(both ends clamp), and the alternative — making `begin` take `&mut SceneTree` — would change every
+animation's signature to reproduce one redundant write.
+
+On the wire a group is `{"type":"group"|"succession", "animations":[...], "lag_ratio":0.2,
+"duration":2.0}` with **no `target` of its own** (that is why `AnimationSpec::target` is optional;
+a group names members, not a node). An explicit `duration` rescales the layout; an absent one is the
+layout itself, so `succession`'s default (lag 1.0) makes two one-second members a two-second
+animation. The refusals say which field is wrong: a `target` on a group, no members, an empty member
+list, a non-finite or negative `lag_ratio`, and any member's own refusal (a missing target, an
+unknown node, a bad duration) is reported under the *member's* id.
 
 ### Reduced motion
 
@@ -913,6 +954,34 @@ symptom is a `FadeOut` that fades out and stays, which no image can see: a fully
 draws nothing either way, so only `--inspect` shows the leftover node. The test therefore drives a
 `FadeOut` through `AnimationScheduler::add`, never through a hand-called `finish`.
 
+**A group begins every member before its first frame, so a member's `begin` sees the tree as it was
+*before the group* — and a succession's does not.** This is not an optimisation detail: `MoveTo` and
+`Rotate` capture their start in `begin`, so the two kinds of composition produce different motions
+from the same members. In "scale, then rotate" the rotate begins after the scale and composes on top
+of it; put the same two in a group and the rotate captures the *unscaled* transform, then both
+members write their own capture each frame and the later writer wins — which is exactly Manim's
+semantics, and why a group is for parallel effects on *different* objects rather than competing ones
+on the same object. The recording-`Probe` tests assert it — `Begin("b")` is already in the log by the
+time the group has delivered its first `At("a")`, and a succession at the same moment has not begun
+`b` at all — because it cannot be seen in a still.
+
+**A composed animation's `finish` must drive each child to `ease(1.0)` and `interpolate` *before*
+calling the child's `finish`.** `Animation.finish` (`animation/animation.py:216-227`) opens with
+`interpolate(1)` for the same reason: `finish` is a hook that acts on the object's *end* state, and a
+`FadeOut`'s hook deletes the object. Call `child.finish` on a half-interpolated member and the
+removal happens from an opacity it never reached — invisible in a still (the object is gone either
+way), visible as a wrong end state for any member whose `finish` reads its geometry. The same applies
+to `Succession`, which must finish a member at the moment it leaves it behind, not only at the very
+end.
+
+**`serde` writes struct fields in declaration order, so a hand-written round-trip fixture must match
+it.** `AnimationSpec` declares `target, type, duration, to, angle, factor, about_point, animations,
+lag_ratio`; writing the nested-succession case as `{"type":"succession","animations":[...],
+"duration":2.0}` parses fine and then serialises back with `duration` first, so the byte-for-byte
+round-trip test fails on a command the engine understood. The fixture is not wrong about JSON — JSON
+objects are unordered — it is wrong about the protocol's canonical spelling, which is the thing the
+test exists to pin.
+
 **Typst's frame is y-down; its text runs are y-up, and the two are composed, not cancelled.**
 `Frame::items()` gives `(Point, FrameItem)` in frame space (y down, `Abs` = points), while a text
 run's internal cursor is y-up. Following `typst-render`'s own `render_text`, the outline is
@@ -1224,10 +1293,11 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   the scheduler is empty for every frame a beat spends queued — including the frame right after
   `construct` — so the `ANIMATION_DONE` announcement would have fired before the scene began.
   **`AnimationScheduler` gained a per-animation `started_at`**, which fixed a real off-by-one frame
-  (see "Core traits"). Deliberately not ported: `AnimationGroup` / `Succession` / `lag_ratio` (a
-  *group* is one animation whose alpha sweeps a rescaled child timeline — sequential playback here is
-  a driver concept, and a beat's duration means what it says), and interrupting a running beat (a
-  command can only append; "stop that and do this instead" is a different, explicit command).
+  (see "Core traits"). Deliberately not ported at this step: `AnimationGroup` / `Succession` /
+  `lag_ratio`, and interrupting a running beat (a command can only append; "stop that and do this
+  instead" is a different, explicit command). Composition landed later — see "Composition" above and
+  the P3 bullet below — and it did not change this layer: it is an `Animation`, and the queue is
+  still the driver.
   **Step 4, reduced motion, is done**, and step 3 is what made it small: `play` / `play_all` / `wait`
   are now the only route a beat takes to the scheduler, so there is exactly one place to consult the
   preference — `Sequence::start_next`, which is handed a `Motion`. The rule, the four consequences,
@@ -1347,6 +1417,24 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   `Sequence`'s reduced branch calls `finish` too. Deferred: `Create` over a *group* (each child would
   need its own prefix, which is `align_submobjects` territory), and Manim's per-submobject
   `rate_func` staggering, which is the `lag_ratio` item.
+- **P3's `AnimationGroup` / `Succession` / `lag_ratio` are done** — the same `lag_ratio` item, at the
+  *animation* granularity rather than Manim's submobject granularity. `rustim-anim::composition`
+  holds both kinds, the wire takes `group` / `succession` with nested `animations`, and
+  `AnimationSpec::target` became optional because a group is a timeline, not a node (a non-group
+  with no target is still a refusal, so the change is a better error, not a looser protocol).
+  **No new golden, on purpose**: composition is a scheduling feature, and every static frame it can
+  produce is already reachable with separate beats — the evidence is the twelve recording-`Probe`
+  tests (which assert *when* each member was begun, interpolated and finished), the command-layer
+  tests, and a manual `--inspect` run of “scale, then rotate” through a succession.
+  Deferred: per-submobject `rate_func` staggering (the `Create`-over-a-group note above),
+  `AnimationGroup`'s `lag_ratio` for a *group of groups* beyond the nesting already allowed, and
+  interrupting a running composed animation. **One defect surfaced while verifying this step and is
+  deliberately not fixed here**: a wire `move_to` replaces the whole transform with a translation,
+  so a `succession` of "scale, then move_to" ends *unscaled* — `MoveTo`'s target is a full affine
+  built at command time, and the honest fix is begin-time resolution of the point (Manim's
+  `move_to` is a `shift`, preserving the rest of the matrix) with the same treatment for
+  `set position`. It needs its own tests and a golden review, so it is the next item rather than
+  part of this one.
 - **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration
