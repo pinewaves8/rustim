@@ -9,23 +9,36 @@
 //!
 //! # Where this sits
 //!
-//! Above `rustim-mobject` and `rustim-anim`, beside `rustim-scene`, and below
+//! Above `rustim-mobject` and `rustim-anim`, below `rustim-scene`, and below
 //! every host:
 //!
 //! ```text
 //! hosts (rustim-app / rustim-daemon / rustim-mcp / rustim-web)
 //!   → rustim-scene   (the protocol: commands, replies, semantics)
-//!   → rustim-director (layout, annotation, attention, templates, linter)
+//!   → rustim-director (layout, annotation, attention, linter)
 //!   → rustim-anim / rustim-mobject / rustim-math
 //! ```
+//!
+//! `rustim-scene` depends on this crate because the layout functions are
+//! **pure tree geometry** — they read `SceneTree` and write transforms, name no
+//! font and open no file — so the three wire actions (`next_to`, `arrange`,
+//! `fit`) call straight into them from [`apply`](rustim_scene::command::apply)
+//! rather than going through a host-installed trait. A trait would have been a
+//! seam with nothing behind it: there is only one implementation, and an
+//! uninstalled one would make the actions refuse in a build that clearly has
+//! the geometry to run them.
+//!
+//! The dependency is also what keeps the guard honest, not what threatens it:
+//! this crate depends only on `rustim-math` and `rustim-mobject`, so it is
+//! wasm-clean, and `rustim-scene` is in the six-crate wasm guard. **Anything
+//! added here that needs `rustim-text` (a template that typesets) must go in a
+//! crate above `rustim-scene` instead** — Typst must never reach the kernel.
 //!
 //! Nothing here does I/O, opens a font, or names a model. The functions take a
 //! [`SceneTree`](rustim_mobject::SceneTree) and node ids and either mutate
 //! transforms or read the tree; a host decides when to call them. That is what
 //! lets the same layout be a protocol action, an MCP tool and a Rust API
-//! without three implementations — the seam is deliberate, because the tier
-//! will grow to compile formulas (`rustim-text`) and that must never reach the
-//! six wasm kernel crates.
+//! without three implementations.
 //!
 //! # What is here now
 //!
@@ -35,7 +48,9 @@
 //! viewer sees rather than by its untransformed side. Placement is a
 //! translation composed onto the node's deferred transform (never a rewritten
 //! point array), and every refusal is a value: an unmeasurable node, a
-//! collapsed parent transform, a box with no extent.
+//! collapsed parent transform, a box with no extent. The same three functions
+//! are the wire's `next_to` / `arrange` / `fit` actions; the protocol's
+//! spelling and refusal mapping live in `rustim-scene`.
 //!
 //! Deferred, deliberately, and named so they are not rediscovered as gaps:
 //! annotation (labels that follow their subject), attention animations

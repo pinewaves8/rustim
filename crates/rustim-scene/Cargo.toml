@@ -16,6 +16,11 @@ rustim-color.workspace = true
 rustim-render = { workspace = true, default-features = false }
 rustim-mobject.workspace = true
 rustim-anim.workspace = true
+# The teaching tier's layout, reached from three wire actions. `rustim-director`
+# depends only on `rustim-math` and `rustim-mobject`, so this edge does not
+# bring a font, an I/O binding or a rasteriser into the wasm kernel — what it
+# must never become is a path to `rustim-text` (see the director's crate docs).
+rustim-director.workspace = true
 serde = { version = "1", features = ["derive"] }
 # `float_roundtrip`: see the workspace manifest — the a11y snapshot round-trip
 # test compares whole trees for equality, and a one-ULP parse difference would

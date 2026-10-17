@@ -135,6 +135,12 @@ impl std::error::Error for LayoutError {}
 ///
 /// Returns the ids that actually moved; an already-correct placement returns an
 /// empty list and writes nothing, so a diff reports no change.
+///
+/// A **reference inside the target** is refused ([`LayoutError::Nested`] naming
+/// the reference): moving the target moves the reference with it, so the gap
+/// between the two boxes cannot change and the request has no answer. The
+/// reverse — a target inside its reference — is fine and is how a label is
+/// placed beside the shape it belongs to.
 pub fn next_to(
     tree: &mut SceneTree,
     target: NodeId,
@@ -148,6 +154,16 @@ pub fn next_to(
             field: "reference",
             detail: "a node cannot be placed next to itself".into(),
         });
+    }
+    // The other nesting order is not a usable request either: the reference is
+    // *inside* the target, so moving the target moves the reference with it and
+    // the gap between the two boxes is exactly the one they started with. The
+    // computed delta would move the pair and leave the separation unchanged,
+    // which is a silent "succeeded" that did not do what it said. (The reverse —
+    // target inside reference — is legitimate: a label child placed next to the
+    // axis it belongs to.)
+    if tree.is_ancestor_of(target, reference) {
+        return Err(LayoutError::Nested(reference));
     }
     let t = bounds(tree, target)?;
     let r = bounds(tree, reference)?;
@@ -185,6 +201,9 @@ pub fn next_to(
 ///
 /// Equal ids are collapsed (first occurrence wins): placing one node twice in
 /// the same arrangement is a caller mistake with no meaningful answer.
+///
+/// Every target is checked before the first move, so a refusal leaves the group
+/// exactly as it was rather than half-arranged.
 pub fn arrange(
     tree: &mut SceneTree,
     targets: &[NodeId],
@@ -221,6 +240,16 @@ pub fn arrange(
         Axis::Column => centre.y + total / 2.0,
     };
 
+    // Every target is checked for a representable world→parent map before the
+    // first write. `place_centre` can fail on nothing else, and a half-arranged
+    // group is the one outcome a bulk placement must not produce: the caller
+    // gets a refusal and a picture that is neither the old one nor the new one.
+    for &id in &targets {
+        if tree.to_parent_space(id, Point::ZERO).is_none() {
+            return Err(LayoutError::Singular(id));
+        }
+    }
+
     let mut moved = Vec::new();
     for (id, b) in targets.iter().zip(&boxes) {
         let desired = match axis {
@@ -254,6 +283,10 @@ pub fn arrange(
 /// A group with no extent along an axis is fitted by the other axis; one with
 /// no extent at all is left alone. A factor of exactly `1.0` writes nothing, so
 /// a fit that changes nothing reports nothing.
+///
+/// The pivots are resolved for every target before the first scale, so a
+/// refusal leaves the group at its original size — never stretched by part of
+/// a factor.
 pub fn fit(
     tree: &mut SceneTree,
     targets: &[NodeId],
@@ -299,11 +332,19 @@ pub fn fit(
         return Ok(Vec::new());
     }
 
+    // The pivots are resolved for every target *before* the first scale, for
+    // `arrange`'s reason: a `Singular` halfway through a fit would leave the
+    // group stretched by part of a factor, which is neither state a caller can
+    // reason about.
+    let pivots = targets
+        .iter()
+        .map(|&id| {
+            tree.to_parent_space(id, centre)
+                .ok_or(LayoutError::Singular(id))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut moved = Vec::new();
-    for id in targets {
-        let pivot = tree
-            .to_parent_space(id, centre)
-            .ok_or(LayoutError::Singular(id))?;
+    for (id, pivot) in targets.into_iter().zip(pivots) {
         if let Some(m) = tree.get_mut(id) {
             m.scale_about(factor, pivot);
         }
@@ -637,6 +678,61 @@ mod tests {
         );
         let third = square(&mut tree, 1.0, (6.0, 0.0));
         assert!(arrange(&mut tree, &[other, third], Axis::Row, 0.2).is_ok());
+    }
+
+    #[test]
+    fn a_reference_inside_the_target_is_refused_but_the_reverse_is_placed() {
+        let mut tree = SceneTree::new();
+        let parent = square(&mut tree, 4.0, (0.0, 0.0));
+        let child = square(&mut tree, 1.0, (0.0, 0.0));
+        assert!(tree.reparent(child, parent));
+
+        // The reference is the target's own child, so the target's move carries
+        // the reference with it: the separation after the move is exactly the
+        // one the two boxes already had, whatever `buff` asked for. A silent
+        // "moved" that could not produce the requested gap is worse than a
+        // refusal, and the tree is not touched.
+        let before = bounds_of(&tree, child);
+        assert_eq!(
+            next_to(&mut tree, parent, child, Direction::Right, 0.5),
+            Err(LayoutError::Nested(child))
+        );
+        assert_eq!(bounds_of(&tree, child), before);
+
+        // The reverse is the legitimate spelling — a label beside the shape it
+        // names — because the parent does not move when the child does. The gap
+        // is exact.
+        next_to(&mut tree, child, parent, Direction::Right, 0.5).unwrap();
+        close(
+            bounds_of(&tree, child).x0 - bounds_of(&tree, parent).x1,
+            0.5,
+        );
+    }
+
+    #[test]
+    fn a_bulk_placement_refuses_before_it_moves_anything() {
+        let mut tree = SceneTree::new();
+        let other = square(&mut tree, 1.0, (0.0, 0.0));
+        let group = tree.insert(Mobject::new(vec![]));
+        let child = square(&mut tree, 1.0, (5.0, 0.0));
+        assert!(tree.reparent(child, group));
+        // A collapsed parent means the child has no world→parent map, which is
+        // only discovered when the placement tries to write.
+        tree.get_mut(group)
+            .unwrap()
+            .set_transform(Affine2::scale(0.0));
+
+        assert_eq!(
+            arrange(&mut tree, &[other, child], Axis::Row, 0.2),
+            Err(LayoutError::Singular(child))
+        );
+        close(bounds_of(&tree, other).center().x, 0.0);
+
+        assert_eq!(
+            fit(&mut tree, &[other, child], 4.0, 4.0),
+            Err(LayoutError::Singular(child))
+        );
+        close(bounds_of(&tree, other).center().x, 0.0);
     }
 
     #[test]

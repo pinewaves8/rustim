@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **818 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **826 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -385,9 +385,10 @@ last property.
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead. `rustim-director`
-sits between the kernel crates and the hosts and depends only on `rustim-math` and `rustim-mobject`;
-it must never pull `rustim-text` into that position, because the seam that puts the teaching tier
-behind the protocol has to be a trait, not a dependency (see "The teaching tier"). `rustim-web` sits
+sits below `rustim-scene` (which depends on it for the three layout actions) and above the kernel
+crates, depending only on `rustim-math` and `rustim-mobject`; it must never pull `rustim-text` into
+that position — anything that typesets belongs in a crate above `rustim-scene` (see "The teaching
+tier"). `rustim-web` sits
 beside `rustim-app`, not under it: both are hosts of the same kernel, and neither depends on the
 other. `rustim-daemon` is a third host on the same shelf — it depends on `rustim-scene`,
 `rustim-scenes` and `rustim-text`, never on `rustim-app` or `rustim-web`, and it names no
@@ -1915,10 +1916,28 @@ circle stays a circle.
 
 Deferred, and named so they are not rediscovered as gaps: annotation that follows its subject,
 attention animations (`highlight` / `point_at`), the six `explain.*` templates, the linter
-(out of frame, overlap, size, contrast, pacing) and `ScenePlan`. When a teaching-tier **wire action**
-lands (`compose`), the seam is a trait in `rustim-scene` that a host installs — the `Typesetter`
-pattern — not a dependency from `rustim-scene` to `rustim-director`: templates will compile formulas,
-and `rustim-text` must never reach the six wasm kernel crates.
+(out of frame, overlap, size, contrast, pacing) and `ScenePlan`.
+
+**The three functions are the wire's `next_to` / `arrange` / `fit` actions, and `rustim-scene`
+depends on `rustim-director` directly rather than installing a trait.** The earlier plan was the
+`Typesetter` pattern — a seam a host installs — and it was the wrong shape here: layout is pure tree
+geometry (reads `SceneTree`, writes transforms, names no font, opens no file), there is only one
+implementation, and an uninstalled seam would make a build refuse actions it clearly has the geometry
+to run. The guard is not weakened: the director depends only on `rustim-math` and `rustim-mobject`,
+so it is wasm-clean and the six-crate wasm build passes with the edge in place. What the edge does
+mean is that **anything needing `rustim-text` (a template that typesets) belongs in a crate above
+`rustim-scene`**, never here — Typst must not reach the kernel. The protocol spelling is in
+`rustim-scene::command`: `{"action":"next_to","target":…,"reference":…,"direction":"left|right|up|down","buff"?}`,
+`{"action":"arrange","targets":[…],"axis":"row|column","buff"?}`,
+`{"action":"fit","targets":[…],"width":…,"height":…}`, with defaults `0.1` (`SMALL_BUFF`) and `0.25`
+(`MED_SMALL_BUFF`) — not the `0.5` the plan assumed; all three are **pure** `apply` arms, so a `batch`
+or `validate` carries them with no host involvement. `compose` is therefore not a separate verb: it
+is a `batch` containing these and primitive commands.
+
+Two hardening rules were added with the wire: **`next_to` refuses a reference that is inside the
+target** (moving the target carries the reference, so the requested gap is unreachable; the reverse
+nesting — a label beside its parent — stays legal), and **bulk placements check every target before
+the first write**, so a refusal never leaves a half-arranged tree.
 
 Evidence: fifteen layout tests over real `SceneTree`s — all four directions and the perpendicular
 centring, a negative buff, a self-placement refusal, row and column arrangements with equal gaps and a
@@ -1926,9 +1945,13 @@ preserved group centre, duplicate collapsing, `fit` by the tighter axis with the
 kept, an identity fit writing nothing, refusals for a degenerate box and an unmeasurable node, nested
 targets refused in both orders, a child of a translated parent placed by its world box, a child of a
 **scaled** parent moved by a world-space delta (the `to_parent_space` conversion), a rotated square
-placed by its 2√2 box with its rotation intact, and a point-less node placed by its declared box.
-**All eight goldens are unchanged** — the crate draws nothing and no scene calls it yet — and the
-count moved 803 → 818.
+placed by its 2√2 box with its rotation intact, and a point-less node placed by its declared box —
+plus two atomicity tests (the nested-reference refusal leaves the child where it was; an `arrange`
+and a `fit` over a collapsed parent refuse with `Singular` before moving anything), four
+`command.rs` apply tests and five round-trip fixtures for the wire spellings, and one end-to-end
+`--script`/`--reply` conformance case that arranges by label and reads the pixel gaps back from a
+`query`. **All eight goldens are unchanged** — nothing draws through this crate and no compiled scene
+calls it — and the count moved 818 → 826.
 
 ## Roadmap
 
@@ -2713,10 +2736,21 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   (that method) and added a crate; no wire action, no host, no scene. Evidence: fifteen layout tests
   over real trees, including a child of a **scaled** parent (the parent-space conversion) and a
   rotated square placed by its 2√2 world box with its rotation intact. **All eight goldens are
-  unchanged** — nothing draws through this crate yet — and the count moved 803 → 818. Deliberately
-  deferred: the `compose` wire action (which will arrive through a `Typesetter`-style trait in
-  `rustim-scene`, never a dependency — templates will compile formulas), annotation, attention
-  animations, the `explain.*` templates, the linter and `ScenePlan`.
+  unchanged** — nothing draws through this crate yet — and the count moved 803 → 818.
+- **Phase 2's second slice — the layout actions on the wire — is done.** `next_to` / `arrange` /
+  `fit` are now protocol actions (`ACTIONS` 19 → 22) implemented as pure `apply` arms in
+  `rustim-scene`, which depends on `rustim-director` **directly** — the earlier `Typesetter`-style
+  trait seam was dropped, because layout is pure tree geometry with one implementation and the
+  director's dependency set keeps the wasm kernel clean. Two hardening rules came with the wire: a
+  `next_to` whose reference is *inside* its target is refused (the gap is unreachable; the reverse
+  nesting stays legal), and bulk placements check every target before the first write. The arrange
+  default is `0.25` (`MED_SMALL_BUFF`), not the planned `0.5`. `compose` is not a verb — it is a
+  `batch` containing these and primitive commands. Evidence: two new director tests, four `apply`
+  tests, five round-trip fixtures, and an end-to-end conformance case that arranges three labelled
+  squares and reads the pixel gaps back through `query` — plus the six-crate wasm build passing
+  with the new edge. **All eight goldens are unchanged**, and the count moved 818 → 826.
+  Deliberately deferred: annotation, attention animations, the `explain.*` templates, the linter and
+  `ScenePlan`.
 
 ## AI integration
 

@@ -31,6 +31,20 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// construction rather than by two people picking 1.0.
 const DEFAULT_ANIMATION_RUN_TIME: f64 = 1.0;
 
+/// The gap [`Command::NextTo`] uses when the command did not name one.
+///
+/// Manim's `SMALL_BUFF` (`constants.py:169`), in world units — the same 8-unit
+/// frame the rest of the engine measures in, so the number carries over
+/// unchanged.
+const DEFAULT_NEXT_TO_BUFF: f64 = 0.1;
+
+/// The gap [`Command::Arrange`] uses when the command did not name one.
+///
+/// Manim's `DEFAULT_MOBJECT_TO_MOBJECT_BUFFER` (`constants.py:174`), which is
+/// `MED_SMALL_BUFF = 0.25` (`:170`). Measured rather than assumed: the value
+/// is a quarter of a world unit, not the half a first guess suggests.
+const DEFAULT_ARRANGE_BUFF: f64 = 0.25;
+
 /// A mutation requested from outside the engine.
 ///
 /// Internally tagged (`"action": "..."`) so the wire form matches the sketch in
@@ -98,6 +112,77 @@ pub enum Command {
     Set { target: Target, property: Property },
     /// Delete an object and its subtree.
     Remove { target: Target },
+    /// Place an object `buff` away from a reference, in a direction.
+    ///
+    /// The teaching tier's first sentence, and the one a model reaches for
+    /// instead of computing coordinates: "put the caption under the triangle"
+    /// is true whatever the triangle's size, wherever the camera is, and
+    /// whoever wrote the script. Both boxes are measured in **world space**
+    /// (every ancestor transform folded in), so a rotated object is placed by
+    /// the box a viewer sees; the near edges are separated by exactly `buff`
+    /// and the perpendicular centres are aligned — Manim's
+    /// `Mobject.next_to(reference, direction, buff)` with its default
+    /// `aligned_edge=ORIGIN`.
+    ///
+    /// `buff` defaults to [`DEFAULT_NEXT_TO_BUFF`] (0.1) and may be negative —
+    /// overlapping a label with its arrow is a real design. Both node fields
+    /// take a [`Target`], so a label works on either side.
+    ///
+    /// The move composes a translation onto the target's deferred transform
+    /// (O(1), and a rotation or scale already on the object survives), which is
+    /// the same contract `set position` has; `modified` lists the target only
+    /// when it actually moved. Refusals are values under `OutOfRange`: a node
+    /// with no measurable geometry, a collapsed parent transform, a
+    /// non-finite `buff`, and a reference that is a **descendant of the
+    /// target** — moving the target moves the reference with it, so the gap
+    /// the caller asked for cannot be produced. (The reverse nesting is the
+    /// legitimate one: a label placed beside the shape it belongs to.)
+    NextTo {
+        target: Target,
+        reference: Target,
+        direction: Direction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        buff: Option<f64>,
+    },
+    /// Arrange several objects in a row or column with equal gaps.
+    ///
+    /// Gaps are equal, not widths — three objects of different sizes in a row
+    /// have the same space between neighbours, which is what reads as an
+    /// arrangement — and the arrangement is centred on the group's original
+    /// union box, so rearranging in place does not move the group across the
+    /// frame. `axis` is `"row"` (left to right, reading order) or `"column"`
+    /// (top to bottom, i.e. decreasing world y). `buff` defaults to
+    /// [`DEFAULT_ARRANGE_BUFF`] (0.25).
+    ///
+    /// Every target is resolved and checked before the first move, so a refusal
+    /// never leaves the group half-arranged. Duplicate ids are collapsed; two
+    /// targets nested inside one another are refused, because placing both
+    /// would move the child twice. `modified` is the ids that actually moved.
+    Arrange {
+        targets: Vec<Target>,
+        axis: Axis,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        buff: Option<f64>,
+    },
+    /// Scale several objects uniformly about their common centre to fit a box.
+    ///
+    /// One operation for Manim's `scale_to_fit_width` / `scale_to_fit_height`
+    /// (`mobject.py:1613,1641`): when both extents are given the **tighter**
+    /// axis decides the factor, so the group is fitted rather than stretched —
+    /// a circle stays a circle. The group's centre does not move. A group with
+    /// no extent on one axis is fitted by the other (a horizontal line is a
+    /// legitimate subject); one with no extent at all is left alone. A factor
+    /// of exactly `1.0` writes nothing, so a fit that changes nothing reports
+    /// nothing.
+    ///
+    /// `width` and `height` are world units and must be positive and finite.
+    /// Same nesting refusal and the same "checked before the first write"
+    /// promise as [`Command::Arrange`].
+    Fit {
+        targets: Vec<Target>,
+        width: f64,
+        height: f64,
+    },
     /// Play an animation that names its subject by id or label.
     Play { animation: AnimationSpec },
     /// Interrupt the timeline: drop every queued beat and every running animation.
@@ -395,13 +480,16 @@ pub enum Command {
 /// handshake.
 pub const ACTIONS: &[&str] = &[
     "add",
+    "arrange",
     "batch",
     "camera",
     "checkpoint",
     "events",
+    "fit",
     "hello",
     "motion",
     "narrate",
+    "next_to",
     "pause",
     "play",
     "query",
@@ -429,6 +517,9 @@ impl Command {
             Self::Add { .. } => "add",
             Self::Set { .. } => "set",
             Self::Remove { .. } => "remove",
+            Self::NextTo { .. } => "next_to",
+            Self::Arrange { .. } => "arrange",
+            Self::Fit { .. } => "fit",
             Self::Play { .. } => "play",
             Self::Stop => "stop",
             Self::Pause => "pause",
@@ -600,6 +691,57 @@ impl From<MotionMode> for rustim_anim::Motion {
         match mode {
             MotionMode::Full => Self::Full,
             MotionMode::Reduced => Self::Reduced,
+        }
+    }
+}
+
+/// The wire spelling of [`rustim_director::Direction`]: which way
+/// [`Command::NextTo`] places its target.
+///
+/// A separate enum for [`MotionMode`]'s reason — the protocol's names are its
+/// own, and `rustim-director` is a kernel crate with no wire vocabulary — and
+/// because this is where the definition is documented for a client. World
+/// space is y-up, so `"up"` increases y; the four names are exactly the
+/// directions a viewer would say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl From<Direction> for rustim_director::Direction {
+    fn from(direction: Direction) -> Self {
+        match direction {
+            Direction::Left => Self::Left,
+            Direction::Right => Self::Right,
+            Direction::Up => Self::Up,
+            Direction::Down => Self::Down,
+        }
+    }
+}
+
+/// The wire spelling of [`rustim_director::Axis`]: the line [`Command::Arrange`]
+/// places its targets along.
+///
+/// Reading order, not a direction vector: `"row"` runs left to right and
+/// `"column"` runs **top to bottom** (decreasing y), because that is what a
+/// writer means by "a column of equations". Manim's `arrange(direction)`
+/// spells the same two layouts as `RIGHT` and `DOWN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Axis {
+    Row,
+    Column,
+}
+
+impl From<Axis> for rustim_director::Axis {
+    fn from(axis: Axis) -> Self {
+        match axis {
+            Axis::Row => Self::Row,
+            Axis::Column => Self::Column,
         }
     }
 }
@@ -847,9 +989,12 @@ pub struct Limits {
 /// * `"primitive"` — the §3 command surface: the vocabulary in this struct.
 /// * `"teaching"` — the batch layer, i.e. `batch` and `validate` are accepted,
 ///   which is the tier a model that wants fewer round trips and cheap trial and
-///   error asks for. `rustim-director`'s tools (`compose`, `explain.*`, …) will
-///   widen this tier later; the meaning only grows, and a client that needs one
-///   of those checks `actions`, where it is absent today.
+///   error asks for. The layout actions (`next_to`, `arrange`, `fit`) are in
+///   `actions` for **every** build, because they are pure tree geometry and
+///   need no provider; the rest of `rustim-director`'s tools (`explain.*`,
+///   `check`, `point_at`) will widen this tier later. The meaning only grows,
+///   and a client that needs one of those checks `actions`, where it is absent
+///   today.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     /// The protocol version this reply describes — the same
@@ -1246,6 +1391,54 @@ pub fn reply_line(seq: u64, outcome: Result<CommandOutcome, CommandError>) -> St
     serde_json::to_string(&reply).expect("a reply is serialisable by construction")
 }
 
+/// Resolve every target in a list, before anything is touched.
+///
+/// A bulk placement names a group, and the whole group has to be valid before
+/// the first member moves: a refusal at the third label must not leave the
+/// first two already placed. Resolution is the half that can fail on the
+/// *names*; the geometry refusals happen inside `rustim-director`, which makes
+/// the same promise for its own checks.
+fn resolve_all(tree: &SceneTree, targets: &[Target]) -> Result<Vec<NodeId>, CommandError> {
+    targets.iter().map(|target| target.resolve(tree)).collect()
+}
+
+/// Map a placement refusal onto the protocol's vocabulary.
+///
+/// The director's `OutOfRange.field` is carried through as the property name,
+/// because it names the wire field at fault (`buff`, `width`, `reference`, …).
+/// The node-level failures are reported under the field that named the nodes,
+/// with the id in the detail — a caller can act on both without a second read.
+/// `Unknown` cannot normally reach here (resolution checked the name first),
+/// but it is mapped rather than dropped so this function is total.
+fn layout_error(property: &'static str, error: rustim_director::LayoutError) -> CommandError {
+    use rustim_director::LayoutError as Layout;
+    match error {
+        Layout::Unknown(target) => CommandError::NoSuchNode { target },
+        Layout::OutOfRange { field, detail } => CommandError::OutOfRange {
+            property: field.to_owned(),
+            detail,
+        },
+        Layout::Unmeasurable(id) => CommandError::OutOfRange {
+            property: property.to_owned(),
+            detail: format!("node {} has no measurable geometry", id.raw()),
+        },
+        Layout::Nested(id) => CommandError::OutOfRange {
+            property: property.to_owned(),
+            detail: format!(
+                "node {} is inside another target; place one subtree at a time",
+                id.raw()
+            ),
+        },
+        Layout::Singular(id) => CommandError::OutOfRange {
+            property: property.to_owned(),
+            detail: format!(
+                "node {} has a collapsed parent transform, so it has no placement",
+                id.raw()
+            ),
+        },
+    }
+}
+
 /// Apply a command to the tree.
 ///
 /// Pure with respect to everything except `tree`: no clock, no I/O, no renderer.
@@ -1315,6 +1508,52 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // this subtree" would eventually disagree about children.
             tree.remove_subtree(target);
             diff.removed.push(target);
+        }
+        Command::NextTo {
+            target,
+            reference,
+            direction,
+            buff,
+        } => {
+            // Both nodes resolve before either box is measured: a reference
+            // that is missing or ambiguous must not leave the target moved on
+            // its way to being refused.
+            let target = target.resolve(tree)?;
+            let reference = reference.resolve(tree)?;
+            let moved = rustim_director::next_to(
+                tree,
+                target,
+                reference,
+                (*direction).into(),
+                buff.unwrap_or(DEFAULT_NEXT_TO_BUFF),
+            )
+            .map_err(|error| layout_error("target", error))?;
+            diff.modified.extend(moved);
+        }
+        Command::Arrange {
+            targets,
+            axis,
+            buff,
+        } => {
+            let targets = resolve_all(tree, targets)?;
+            let moved = rustim_director::arrange(
+                tree,
+                &targets,
+                (*axis).into(),
+                buff.unwrap_or(DEFAULT_ARRANGE_BUFF),
+            )
+            .map_err(|error| layout_error("targets", error))?;
+            diff.modified.extend(moved);
+        }
+        Command::Fit {
+            targets,
+            width,
+            height,
+        } => {
+            let targets = resolve_all(tree, targets)?;
+            let moved = rustim_director::fit(tree, &targets, *width, *height)
+                .map_err(|error| layout_error("targets", error))?;
+            diff.modified.extend(moved);
         }
         Command::Set { target, property } => {
             let target = target.resolve(tree)?;
@@ -2186,6 +2425,18 @@ mod tests {
                 .to_owned(),
             r#"{"action":"camera","focus":"方块"}"#.to_owned(),
             r#"{"action":"query","target":"方块"}"#.to_owned(),
+            // The teaching tier's three layout actions. `buff` is optional and
+            // omitted when absent, so neither spelling may gain it; `direction`
+            // and `axis` are the wire's own vocabulary, and each action takes
+            // nodes in the same two spellings as every other target field.
+            format!(
+                r#"{{"action":"next_to","target":{id},"reference":"leg a","direction":"right","buff":0.2}}"#
+            ),
+            r#"{"action":"next_to","target":"标签","reference":"leg a","direction":"down"}"#
+                .to_owned(),
+            format!(r#"{{"action":"arrange","targets":[{id},"leg a"],"axis":"row"}}"#),
+            r#"{"action":"arrange","targets":["a","b"],"axis":"column","buff":0.5}"#.to_owned(),
+            format!(r#"{{"action":"fit","targets":[{id}],"width":4.0,"height":2.0}}"#),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for json in cases {
@@ -3937,6 +4188,195 @@ mod tests {
                 "{bad} must be refused"
             );
         }
+    }
+
+    // ---- the teaching tier's layout actions -------------------------------
+
+    fn square_at(tree: &mut SceneTree, size: f64, at: [f64; 2]) -> NodeId {
+        tree.insert(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams {
+                width: Some(size),
+                height: Some(size),
+                position: Some(at),
+                ..Default::default()
+            },
+        ))
+    }
+
+    /// The three actions reach the same placement the director's own tests
+    /// measure, through the wire: labels resolve on both node fields, an
+    /// already-correct placement reports nothing, and the reported `modified`
+    /// is exactly what moved.
+    #[test]
+    fn next_to_places_by_label_and_reports_only_a_real_move() {
+        let mut tree = SceneTree::new();
+        let reference = square_at(&mut tree, 2.0, [0.0, 0.0]);
+        let target = square_at(&mut tree, 1.0, [7.0, -5.0]);
+        tree.get_mut(target).unwrap().label = Some("标签".into());
+        tree.get_mut(reference).unwrap().label = Some("方块".into());
+
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"next_to","target":"标签","reference":"方块","direction":"right","buff":0.25}"#,
+        )
+        .unwrap();
+        let diff = apply(&mut tree, &cmd).unwrap();
+        assert_eq!(diff.modified, [target]);
+
+        let t = tree.world_bounds(target).unwrap();
+        let r = tree.world_bounds(reference).unwrap();
+        assert!((t.x0 - r.x1 - 0.25).abs() < 1e-12, "{t:?} {r:?}");
+        assert!((t.center().y - r.center().y).abs() < 1e-12);
+
+        // Reasserting a placement that already holds must not claim a change:
+        // a replay that reported a modified id every frame would make a host
+        // redraw a still scene.
+        assert!(apply(&mut tree, &cmd).unwrap().is_empty());
+    }
+
+    /// A reference inside the target cannot be placed away from it — the move
+    /// carries the reference along — and the refusal names the field that
+    /// carried the nodes. The reverse nesting is what "a label beside its
+    /// shape" uses and must keep working.
+    #[test]
+    fn next_to_refuses_a_reference_inside_its_target() {
+        let mut tree = SceneTree::new();
+        let parent = square_at(&mut tree, 4.0, [0.0, 0.0]);
+        let child = square_at(&mut tree, 1.0, [0.0, 0.0]);
+        assert!(tree.reparent(child, parent));
+
+        let nested = Command::NextTo {
+            target: parent.into(),
+            reference: child.into(),
+            direction: Direction::Right,
+            buff: None,
+        };
+        assert!(
+            matches!(
+                apply(&mut tree, &nested),
+                Err(CommandError::OutOfRange { ref property, ref detail })
+                    if property == "target" && detail.contains(&child.raw().to_string())
+            ),
+            "{:?}",
+            apply(&mut tree, &nested)
+        );
+
+        let reverse = Command::NextTo {
+            target: child.into(),
+            reference: parent.into(),
+            direction: Direction::Right,
+            buff: Some(0.5),
+        };
+        assert_eq!(apply(&mut tree, &reverse).unwrap().modified, [child]);
+    }
+
+    #[test]
+    fn arrange_puts_equal_gaps_in_a_row_and_refuses_nested_targets() {
+        let mut tree = SceneTree::new();
+        let a = square_at(&mut tree, 1.0, [-4.0, 3.0]);
+        let b = square_at(&mut tree, 2.0, [0.0, -2.0]);
+        let c = square_at(&mut tree, 0.5, [4.0, 1.0]);
+
+        let row = Command::Arrange {
+            targets: vec![a.into(), b.into(), c.into()],
+            axis: Axis::Row,
+            buff: Some(0.5),
+        };
+        assert_eq!(apply(&mut tree, &row).unwrap().modified, [a, b, c]);
+
+        let ba = tree.world_bounds(a).unwrap();
+        let bb = tree.world_bounds(b).unwrap();
+        let bc = tree.world_bounds(c).unwrap();
+        // Equal gaps between neighbours, not equal widths.
+        assert!((bb.x0 - ba.x1 - 0.5).abs() < 1e-12);
+        assert!((bc.x0 - bb.x1 - 0.5).abs() < 1e-12);
+        // A row is a row even though its members started at three heights.
+        assert!((ba.center().y - bb.center().y).abs() < 1e-12);
+        assert!((bc.center().y - bb.center().y).abs() < 1e-12);
+
+        // A parent and its child would each be moved by the arrangement, and
+        // the child twice; the refusal is under the list's own field.
+        let parent = square_at(&mut tree, 2.0, [0.0, 0.0]);
+        let child = square_at(&mut tree, 1.0, [0.0, 0.0]);
+        assert!(tree.reparent(child, parent));
+        let nested = Command::Arrange {
+            targets: vec![parent.into(), child.into()],
+            axis: Axis::Column,
+            buff: None,
+        };
+        assert!(matches!(
+            apply(&mut tree, &nested),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "targets"
+        ));
+    }
+
+    #[test]
+    fn fit_scales_to_the_tighter_axis_and_refuses_a_bad_box() {
+        let mut tree = SceneTree::new();
+        let a = square_at(&mut tree, 1.0, [-1.0, 0.0]);
+        let b = square_at(&mut tree, 1.0, [1.0, 0.0]);
+
+        // The union box is 3 × 1, so a 6 × 2 target fits it at exactly 2 on
+        // both axes; the fit is uniform and the centre does not move.
+        let fit = Command::Fit {
+            targets: vec![a.into(), b.into()],
+            width: 6.0,
+            height: 2.0,
+        };
+        assert_eq!(apply(&mut tree, &fit).unwrap().modified, [a, b]);
+        let union = tree
+            .world_bounds(a)
+            .unwrap()
+            .union(tree.world_bounds(b).unwrap());
+        assert!((union.width() - 6.0).abs() < 1e-12);
+        assert!((union.height() - 2.0).abs() < 1e-12);
+        assert!(union.center().x.abs() < 1e-12);
+
+        // A degenerate box is a payload error, named by its field.
+        let bad = Command::Fit {
+            targets: vec![a.into()],
+            width: 0.0,
+            height: 2.0,
+        };
+        assert!(matches!(
+            apply(&mut tree, &bad),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "width"
+        ));
+
+        // A non-finite gap is the same kind of payload error, in the other
+        // command's vocabulary.
+        let nan = Command::NextTo {
+            target: a.into(),
+            reference: b.into(),
+            direction: Direction::Left,
+            buff: Some(f64::NAN),
+        };
+        assert!(matches!(
+            apply(&mut tree, &nan),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "buff"
+        ));
+    }
+
+    /// Resolution happens for the whole list before the first move: a bad name
+    /// at the end must not leave the objects before it placed.
+    #[test]
+    fn a_bulk_placement_that_names_a_missing_node_moves_nothing() {
+        let mut tree = SceneTree::new();
+        let a = square_at(&mut tree, 1.0, [-3.0, 0.0]);
+        let before = tree.world_bounds(a).unwrap();
+
+        let missing = Command::Arrange {
+            targets: vec![a.into(), "无".into()],
+            axis: Axis::Row,
+            buff: None,
+        };
+        assert_eq!(
+            apply(&mut tree, &missing),
+            Err(CommandError::NoSuchLabel {
+                label: "无".into()
+            })
+        );
+        assert_eq!(tree.world_bounds(a).unwrap(), before);
     }
 
     // ---- the camera -------------------------------------------------------

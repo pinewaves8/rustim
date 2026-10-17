@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (19 actions, 11 shapes, 11 animations, 10
+//!    the build actually has (22 actions, 11 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -155,7 +155,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 19, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 22, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -305,6 +305,75 @@ fn batch_and_validate_answer_through_the_wire() {
         .expect("a refusal is a reply");
     let error = reply.error.expect("a query cannot live in a list");
     assert!(format!("{error}").contains("commands[0]"), "{error}");
+
+    finish(client, &png);
+}
+
+/// The teaching tier's layout actions are ordinary commands: they run through
+/// the same wire, inside a `batch`, and the placement they produce is visible
+/// in the tree's measured bounds — which is the only way to prove the action
+/// reached the real protocol rather than only the crate that defines it.
+#[test]
+fn layout_actions_place_objects_through_the_wire() {
+    let (mut client, png) = client("layout");
+
+    // Three squares of different sizes, created and arranged in one round trip
+    // — the shape a teaching client actually sends.
+    let diff = expect_diff(
+        &mut client,
+        r#"{"action":"batch","commands":[{"action":"add","type":"square","params":{"width":1.0,"label":"甲"}},{"action":"add","type":"square","params":{"width":2.0,"label":"乙"}},{"action":"add","type":"square","params":{"width":0.5,"label":"丙"}},{"action":"arrange","targets":["甲","乙","丙"],"axis":"row","buff":0.5}]}"#,
+    );
+    // `created` is the net change of the list: the three adds. The arrangement
+    // moved nodes the same list created, so the net diff does not repeat them
+    // in `modified`.
+    assert_eq!(diff.created.len(), 3, "{diff:?}");
+    assert!(diff.modified.is_empty(), "{diff:?}");
+
+    let query = |client: &mut StdioClient, label: &str| {
+        client
+            .send_raw(&format!(r#"{{"action":"query","target":"{label}"}}"#))
+            .expect("a query is a reply")
+            .tree
+            .expect("a tree")
+    };
+    let (a, b, c) = (
+        query(&mut client, "甲"),
+        query(&mut client, "乙"),
+        query(&mut client, "丙"),
+    );
+    // A query reports **pixel** bounds, so the world-space `buff` has to be
+    // converted through the snapshot's own camera rather than assumed to be
+    // 90 px/unit — the test is about the placement, not the projection.
+    let px_per_unit = f64::from(a.camera.frame[1]) / a.camera.visible[1];
+    let gap = 0.5 * px_per_unit;
+    let (ba, bb, bc) = (
+        a.nodes[0].bounds.expect("a measurable node"),
+        b.nodes[0].bounds.expect("a measurable node"),
+        c.nodes[0].bounds.expect("a measurable node"),
+    );
+    assert!((bb.x0 - ba.x1 - gap).abs() < 1e-6, "{ba:?} {bb:?}");
+    assert!((bc.x0 - bb.x1 - gap).abs() < 1e-6, "{bb:?} {bc:?}");
+    assert!(
+        (ba.center().y - bb.center().y).abs() < 1e-6,
+        "a row is a row: {ba:?} {bb:?}"
+    );
+
+    // `next_to` defaults its gap (Manim's `SMALL_BUFF`) when the field is
+    // absent, and reports the id it moved.
+    let moved = expect_diff(
+        &mut client,
+        r#"{"action":"next_to","target":"甲","reference":"乙","direction":"left"}"#,
+    )
+    .modified;
+    assert_eq!(moved.len(), 1, "one object moved");
+
+    // `fit` is the third action, and its refusals are the protocol's: a plain
+    // payload error naming the field, not a transport failure.
+    let reply = client
+        .send_raw(r#"{"action":"fit","targets":["甲"],"width":0.0,"height":1.0}"#)
+        .expect("a refusal is a reply");
+    let error = reply.error.expect("a zero extent is refused");
+    assert!(format!("{error}").contains("width"), "{error}");
 
     finish(client, &png);
 }
