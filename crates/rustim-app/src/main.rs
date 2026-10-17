@@ -1352,6 +1352,111 @@ fn settle(scene: &mut dyn Scene, ctx: &mut SceneContext, list: &mut DrawList) {
     }
 }
 
+/// Render a timeline into a sink and return the narration track it timed.
+///
+/// One loop, shared by both video modes, so an `.mp4` and a PNG sequence are
+/// the *same frames* — the sink is the only difference, which is what the
+/// `VideoSink` seam is for.
+///
+/// **Every frame is a `build_frame` of one [`STEP`], exactly what `settle`
+/// does**, so a video of `STILL_SECONDS` worth of frames ends on the frame the
+/// `--png` still captures: the last frame of the sequence and the still are the
+/// same image, not two renders that agree. Nothing reads the wall clock — the
+/// subtitle cues are timed off the context's virtual clock, and a frame's
+/// caption expires by how far the timeline has run, not by how long the machine
+/// took to draw it.
+///
+/// The caption band is drawn **after** the scene's own list, at the same place
+/// the windowed path appends it, so an exported frame and a displayed one agree.
+fn export_timeline(
+    scene: &mut dyn Scene,
+    ctx: &mut SceneContext,
+    frames: u64,
+    sink: &mut dyn rustim_export::VideoSink,
+    mut caption: Option<&mut rustim_app::caption::Caption>,
+    include_summary: bool,
+    scene_name: &str,
+) -> std::io::Result<Vec<rustim_export::Cue>> {
+    let mut list = DrawList::default();
+    let mut renderer = CpuRenderer::new(WIDTH, HEIGHT);
+    let mut cues: Vec<rustim_export::Cue> = Vec::new();
+    // The line currently on screen and when it became due. One slot, like the
+    // live region: a caption shows one sentence.
+    let mut open: Option<(f64, String)> = None;
+    let mut summary_pending = include_summary;
+
+    let total = frames as f64 * STEP;
+    for frame in 0..frames {
+        build_frame(scene, ctx, &mut list, STEP);
+        let now = ctx.clock();
+
+        let mut due = ctx.take_narration_timed();
+        // The opening summary arrives through the same channel as a scripted
+        // line, on the first frame, and only when nothing was already due —
+        // the windowed pipeline's rule (`summary_pending`), kept identical so a
+        // video and a window describe the same scene.
+        if frame == 0 && std::mem::take(&mut summary_pending) && due.is_empty() {
+            let objects = ctx.semantic_tree(None).nodes.len().saturating_sub(1);
+            due.push((now, rustim_app::caption::scene_summary(scene_name, objects)));
+        }
+        for (at, text) in due {
+            // A new line replaces whatever is on screen, so it ends that cue at
+            // the same instant the band changes text.
+            if let Some((start, words)) = open.take() {
+                let end = (start + rustim_app::caption::hold_seconds(&words)).min(at);
+                if end > start {
+                    cues.push(rustim_export::Cue {
+                        start,
+                        end,
+                        text: words,
+                    });
+                }
+            }
+            open = Some((at, text));
+        }
+        // Expiry, on virtual time. `now` is at most one frame past the expiry,
+        // so the cue ends where the band would have vanished rather than on the
+        // frame boundary the detector happened to land on.
+        if let Some((start, words)) = &open {
+            let expiry = start + rustim_app::caption::hold_seconds(words);
+            if now >= expiry {
+                let (start, words) = open.take().expect("just matched `Some`");
+                if expiry > start {
+                    cues.push(rustim_export::Cue {
+                        start,
+                        end: expiry,
+                        text: words,
+                    });
+                }
+            }
+        }
+
+        if let Some(caption) = caption.as_mut() {
+            match &open {
+                Some((_, text)) => caption.set_text(text.as_str()),
+                None => caption.clear(),
+            }
+            caption.push_ops(&mut list);
+        }
+        renderer.render(&list).expect("render");
+        sink.write_frame(renderer.pixels(), u32::from(WIDTH), u32::from(HEIGHT))?;
+    }
+
+    // The last line is still on screen when the timeline ends; its cue stops
+    // with the frame rather than running past the end of the file.
+    if let Some((start, words)) = open {
+        let end = total.min(start + rustim_app::caption::hold_seconds(&words));
+        if end > start {
+            cues.push(rustim_export::Cue {
+                start,
+                end,
+                text: words,
+            });
+        }
+    }
+    Ok(cues)
+}
+
 /// Print a human-facing line on stdout — or on stderr when stdout is a protocol
 /// stream.
 ///
@@ -2008,6 +2113,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut max_frames: Option<u64> = None;
     let mut png: Option<String> = None;
+    let mut video: Option<String> = None;
+    let mut video_png: Option<String> = None;
+    let mut srt: Option<String> = None;
     let mut inspect = false;
     let mut scene_name = DEFAULT_SCENE.to_string();
     let mut scene_given = false;
@@ -2026,6 +2134,21 @@ fn main() {
             }
             "--png" => {
                 png = args.get(i + 1).cloned();
+                i += 2;
+            }
+            // The three export flags take a value and say so when it is
+            // missing: a bare `--video` that fell through to the windowed path
+            // would look like a successful export that wrote nothing.
+            "--video" | "--video-png" | "--srt" => {
+                let Some(value) = args.get(i + 1).cloned() else {
+                    eprintln!("{} takes a path", args[i]);
+                    std::process::exit(2);
+                };
+                match args[i].as_str() {
+                    "--video" => video = Some(value),
+                    "--video-png" => video_png = Some(value),
+                    _ => srt = Some(value),
+                }
                 i += 2;
             }
             "--inspect" => {
@@ -2084,9 +2207,10 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "rustim-app [--frames N] [--png OUT.png | --inspect | --a11y-probe] \
-                     [--scene NAME] [--motion full|reduced] [--script PATH|-] [--reply] \
-                     [--captions] [--speak]"
+                    "rustim-app [--frames N] \
+                     [--png OUT.png | --video OUT.mp4 | --video-png DIR | --inspect | --a11y-probe] \
+                     [--srt OUT.srt] [--scene NAME] [--motion full|reduced] \
+                     [--script PATH|-] [--reply] [--captions] [--speak]"
                 );
                 println!("scenes: {}", scene_names());
                 println!("--inspect: print the accessibility tree as JSON to stdout");
@@ -2097,6 +2221,18 @@ fn main() {
                 println!(
                     "--script: apply one JSON command per line (JSONL); `-` reads stdin, \
                      and without --scene the script gets an empty one"
+                );
+                println!(
+                    "--video: render the timeline to an mp4 by piping raw frames to \
+                     `ffmpeg` on PATH (600 frames at 60 fps if --frames is absent)"
+                );
+                println!(
+                    "--video-png: ...or write numbered PNGs into a directory, which needs \
+                     no external program and is byte-reproducible"
+                );
+                println!(
+                    "--srt: with either video mode, also write the narration track as \
+                     SubRip subtitles"
                 );
                 println!("--reply: answer each command with one JSON line on stdout");
                 println!(
@@ -2150,6 +2286,25 @@ fn main() {
         std::process::exit(2);
     }
 
+    // One headless retirement per run: a still and a timeline are different
+    // answers to the same scene, and a run asked for both would have to pick.
+    let exporting_video = video.is_some() || video_png.is_some();
+    if video.is_some() && video_png.is_some() {
+        eprintln!("--video and --video-png are mutually exclusive");
+        std::process::exit(2);
+    }
+    if exporting_video && (inspect || png.is_some()) {
+        eprintln!("--video and --png/--inspect are mutually exclusive");
+        std::process::exit(2);
+    }
+    // A subtitle track is a pair with the frames it times. Writing one from a
+    // run that produced no frames would give a host a file whose cue times
+    // match nothing.
+    if srt.is_some() && !exporting_video {
+        eprintln!("--srt needs --video or --video-png: it times the frames they write");
+        std::process::exit(2);
+    }
+
     // The other two ways to ask for something this binary cannot do, both of
     // them reported rather than silently ignored — a host that sent `--reply`
     // and got no stream would conclude the engine was refusing its commands.
@@ -2174,7 +2329,7 @@ fn main() {
     // Speech takes seconds and a headless run has no time axis: the still is
     // captured in microseconds and the process exits, so every sentence would
     // be cut off. Same discipline as `--a11y-probe`.
-    if speak && (inspect || png.is_some()) {
+    if speak && (inspect || png.is_some() || exporting_video) {
         eprintln!("--speak needs the window; a headless run has no time to speak during");
         std::process::exit(2);
     }
@@ -2183,9 +2338,10 @@ fn main() {
     // ask a platform backend a question, and that backend exists only in the
     // windowed path. Combining it with a headless flag would answer a different
     // question, so it is a refusal rather than a precedence rule.
-    if probe && (inspect || png.is_some() || reply) {
+    if probe && (inspect || png.is_some() || reply || exporting_video) {
         eprintln!(
-            "--a11y-probe needs the window and cannot be combined with --inspect, --png or --reply"
+            "--a11y-probe needs the window and cannot be combined with --inspect, --png, \
+             --reply or a video export"
         );
         std::process::exit(2);
     }
@@ -2195,6 +2351,19 @@ fn main() {
     // allows; an explicit `--frames` still wins.
     if probe && max_frames.is_none() {
         max_frames = Some(600);
+    }
+    // An export defaults to the same ten seconds the still captures, so
+    // `--video out.mp4` and `--png out.png` describe the same span of the scene
+    // and the last exported frame is the still. Zero is a refusal rather than a
+    // technically-empty file.
+    if exporting_video {
+        if max_frames == Some(0) {
+            eprintln!("--frames 0 would write a video with no frames in it");
+            std::process::exit(2);
+        }
+        if max_frames.is_none() {
+            max_frames = Some((STILL_SECONDS / STEP) as u64);
+        }
     }
 
     let viewport = Viewport {
@@ -2206,7 +2375,17 @@ fn main() {
     // rather than in `SceneContext` because a preference is a platform question and
     // the context lives in the wasm kernel — see `rustim_app::motion` for exactly
     // which platforms answer and which do not.
-    let motion = motion.unwrap_or_else(rustim_app::motion::from_platform);
+    // An export is an artifact, so it must not depend on the desktop that made
+    // it: reduced motion is a *player's* preference, and a video rendered on a
+    // machine with it enabled would be a different film from the same command on
+    // another machine. The same reason the golden suite passes `--motion full`.
+    let motion = motion.unwrap_or_else(|| {
+        if exporting_video {
+            Motion::Full
+        } else {
+            rustim_app::motion::from_platform()
+        }
+    });
 
     // A script with no `--scene` runs against an empty scene rather than the
     // default one: a host that builds the picture out of commands did not ask
@@ -2309,6 +2488,129 @@ fn main() {
             reply,
             format_args!("wrote {path} ({}x{})", renderer.width(), renderer.height()),
         );
+        return;
+    }
+
+    if exporting_video {
+        let mut ctx = SceneContext::new(viewport, motion);
+        scene.construct(&mut ctx);
+        if let Some(script) = &script {
+            apply_script(script, &mut *scene, &mut ctx, reply);
+        }
+        let frames = max_frames.unwrap_or((STILL_SECONDS / STEP) as u64);
+
+        // Built once, before the first frame: a provider per frame would reload
+        // the bundled face 600 times. A missing font disables the band and
+        // leaves the export itself intact, exactly as the `--png` path does.
+        let mut caption = if captions {
+            match rustim_app::caption::Caption::new() {
+                Ok(caption) => Some(caption),
+                Err(e) => {
+                    eprintln!("captions: {e} (exporting without them)");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let fps = (1.0 / STEP).round() as u32;
+        let mut sink: Box<dyn rustim_export::VideoSink> = if let Some(path) = &video {
+            // Resolved before the render, not on the first frame: "ffmpeg is
+            // not installed" is one clear line, and the run has not spent ten
+            // seconds rasterising by the time it is reported.
+            let program = rustim_app::speech::find("ffmpeg");
+            let Some(program) = program else {
+                eprintln!(
+                    "--video {path}: no `ffmpeg` on PATH; `--video-png DIR` writes the \
+                     same frames without one"
+                );
+                std::process::exit(2);
+            };
+            match rustim_export::FfmpegSink::spawn(
+                program,
+                path,
+                u32::from(WIDTH),
+                u32::from(HEIGHT),
+                fps,
+            ) {
+                Ok(sink) => Box::new(sink),
+                Err(e) => {
+                    eprintln!("--video {path}: {e}");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            let dir = video_png.as_deref().expect("one of the two video modes");
+            // A shorter export into a directory a longer one already filled
+            // leaves the tail behind, and the directory then reads as a longer
+            // sequence than the run produced. Reported rather than deleted: the
+            // path came from the caller and may hold anything.
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                let stale = entries
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        let name = e.file_name();
+                        let name = name.to_string_lossy();
+                        name.starts_with("frame-") && name.ends_with(".png")
+                    })
+                    .count();
+                if stale > 0 {
+                    eprintln!(
+                        "--video-png {dir}: it already holds {stale} frame-*.png; \
+                         frames past this run's end will stay"
+                    );
+                }
+            }
+            match rustim_export::PngSequenceSink::new(dir, u32::from(WIDTH), u32::from(HEIGHT)) {
+                Ok(sink) => Box::new(sink),
+                Err(e) => {
+                    eprintln!("--video-png {dir}: {e}");
+                    std::process::exit(2);
+                }
+            }
+        };
+
+        let cues = export_timeline(
+            &mut *scene,
+            &mut ctx,
+            frames,
+            sink.as_mut(),
+            caption.as_mut(),
+            captions || srt.is_some(),
+            &scene_name,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("export: {e}");
+            std::process::exit(2);
+        });
+        if let Err(e) = sink.finish() {
+            eprintln!("export: {e}");
+            std::process::exit(2);
+        }
+
+        match (&video, &video_png) {
+            (Some(path), _) => note(
+                reply,
+                format_args!("wrote {path} ({frames} frames at {fps} fps)"),
+            ),
+            (_, Some(dir)) => note(
+                reply,
+                format_args!("wrote {frames} frames into {dir} ({fps} fps)"),
+            ),
+            _ => {}
+        }
+        if let Some(path) = &srt {
+            let mut cues = cues;
+            cues.sort_by(|a, b| a.start.total_cmp(&b.start));
+            match rustim_export::srt::write(path, &cues) {
+                Ok(()) => note(reply, format_args!("wrote {path} ({} cues)", cues.len())),
+                Err(e) => {
+                    eprintln!("--srt {path}: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         return;
     }
 

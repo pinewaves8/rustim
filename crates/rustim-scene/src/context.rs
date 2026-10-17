@@ -232,6 +232,16 @@ impl SceneContext {
         !self.animations.is_empty() || !self.playback.is_empty()
     }
 
+    /// Virtual seconds since this context was constructed.
+    ///
+    /// The same clock narration is scheduled against, and the only one an
+    /// exporter may time a subtitle cue by: wall-clock time in a headless run is
+    /// how long the *machine* took to rasterise, which is exactly what a
+    /// deterministic artifact must not record.
+    pub fn clock(&self) -> f64 {
+        self.clock
+    }
+
     /// Take every narration line whose time has come, oldest first.
     ///
     /// Draining rather than reading: a line is said once, and a frame that
@@ -246,6 +256,19 @@ impl SceneContext {
     /// Returns an empty vector **without allocating** when nothing is due, the
     /// common case for every frame without a script.
     pub fn take_narration(&mut self) -> Vec<String> {
+        self.take_narration_timed()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    /// [`SceneContext::take_narration`], keeping each line's due time.
+    ///
+    /// An exporter needs the time as well as the words: a subtitle cue is a
+    /// `(start, end)` pair, and the start is exactly the instant the line became
+    /// due. Draining has the same once-only semantics, so an export must choose
+    /// one of the two methods per line, never both.
+    pub fn take_narration_timed(&mut self) -> Vec<(f64, String)> {
         if self.narration.iter().all(|(due, _)| *due > self.clock) {
             return Vec::new();
         }
@@ -261,7 +284,7 @@ impl SceneContext {
         self.narration = later;
         // Stable, so equal due times keep arrival order.
         due.sort_by(|a, b| a.0.total_cmp(&b.0));
-        due.into_iter().map(|(_, text)| text).collect()
+        due
     }
 
     /// Insert a mobject at the root.
@@ -1342,6 +1365,24 @@ mod tests {
 
         assert_eq!(ctx.take_narration(), ["first", "second", "third"]);
         assert!(ctx.take_narration().is_empty());
+    }
+
+    /// The timed drain is the same drain: the words and their order agree, and
+    /// each start is the instant the line became due — what a subtitle cue needs.
+    #[test]
+    fn the_timed_drain_keeps_the_due_time() {
+        let mut ctx = scene();
+        narrate(&mut ctx, "third", Some(2.0)).unwrap();
+        narrate(&mut ctx, "first", None).unwrap();
+        narrate(&mut ctx, "second", Some(1.0)).unwrap();
+        tick(&mut ctx, 180);
+
+        let due = ctx.take_narration_timed();
+        let words: Vec<&str> = due.iter().map(|(_, text)| text.as_str()).collect();
+        assert_eq!(words, ["first", "second", "third"]);
+        let times: Vec<f64> = due.iter().map(|(at, _)| *at).collect();
+        assert_eq!(times, [0.0, 1.0, 2.0]);
+        assert!(ctx.take_narration_timed().is_empty());
     }
 
     #[test]
