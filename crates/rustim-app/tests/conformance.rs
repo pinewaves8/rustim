@@ -333,6 +333,45 @@ fn play_is_an_empty_diff_and_stop_is_idempotent() {
     finish(client, &png);
 }
 
+/// The playback controls move the clock, not the tree: each answers with a
+/// present-but-empty diff, and an impossible value is a refusal naming its field.
+#[test]
+fn playback_controls_answer_with_empty_diffs() {
+    let (mut client, png) = client("playback");
+
+    for line in [
+        r#"{"action":"pause"}"#,
+        r#"{"action":"resume"}"#,
+        r#"{"action":"pause"}"#,
+        r#"{"action":"seek","to":1.0}"#,
+        r#"{"action":"resume"}"#,
+        r#"{"action":"tempo","factor":2.0}"#,
+        r#"{"action":"tempo","factor":1.0}"#,
+    ] {
+        assert!(expect_diff(&mut client, line).is_empty(), "{line}");
+    }
+
+    // A backward seek needs a checkpoint, and zero tempo is `pause` misspelt.
+    // Both are refused under the field that carried the bad value.
+    for (line, field) in [
+        (r#"{"action":"seek","to":0.5}"#, "to"),
+        (r#"{"action":"tempo","factor":0.0}"#, "factor"),
+    ] {
+        let reply = client.send_raw(line).expect("a refusal is a reply");
+        let error = reply.error.expect("an impossible value is refused");
+        let text = format!("{error}");
+        assert!(text.contains(field), "{line}: {text}");
+    }
+
+    // The feed continues, and the process still ends cleanly.
+    let diff = expect_diff(
+        &mut client,
+        r#"{"action":"add","type":"circle","params":{"radius":1.0}}"#,
+    );
+    assert_eq!(diff.created.len(), 1);
+    finish(client, &png);
+}
+
 /// A refusal is a value: it names what was wrong, it does not stop the feed, and
 /// it does not fail the run.
 #[test]

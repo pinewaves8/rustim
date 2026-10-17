@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **688 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **707 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -2490,6 +2490,37 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   properties in one beat (use the dedicated animations), non-linear channel curves per property
   beyond `rate`, and animating a group's inherited appearance (children must be addressed, or
   `fade_out` used).
+- **Phase 1's third slice — the playback controls `pause` / `resume` / `seek` / `tempo` — is
+  done**, and they are the first commands in the protocol that act on the **clock** rather than on
+  the tree. `SceneContext` gained `paused: bool` and `tempo: f64` (private, with
+  `pause()`/`resume()`/`is_paused()`/`tempo()`/`set_tempo()`/`seek()`); `advance` now returns
+  early when paused and otherwise calls a private `advance_clock(dt * tempo)`, which is the old
+  body verbatim. The split is what lets `seek` drive the timeline without temporarily touching the
+  pause flag: it steps `advance_clock` on a 1/60 grid, so the beats it crosses are played and
+  `finish`ed exactly as if the wall clock had reached them — a crossed `fade_out` really removes
+  its target — and then assigns `self.clock = to` so the landing point is exact rather than
+  accumulated. Four behaviours are decisions. **A pause freezes both clocks** (the scheduler's and
+  the lecture/narration clock) but does **not** touch `is_playing`, so a scene watching for its
+  timeline to drain sees a stall and not an ending; `stop` deliberately leaves the pause in place
+  (a viewer's hold is not content's to undo), and `reset` returns to playing at 1×. **Seek is
+  forward-only** — a backward jump needs the state a beat already destroyed, which is what
+  `checkpoint`/`undo` is for — and is capped at `MAX_SEEK_SECONDS = 600.0` so one command cannot
+  spin the scheduler for an unbounded time; `to` is lecture time, so `tempo` does not rescale it,
+  and a paused timeline can seek (dragging the scrubber). Narration the jump crosses is dropped
+  rather than spoken in a burst. **Tempo is clamped to `0.05..=16.0`** by `set_tempo` (a
+  programmatic caller) and refused outside it on the wire (`out_of_range` under `factor`); `0` is
+  `pause`, not a tempo. Evidence: 15 `playback_control_tests` in `context.rs` (freeze, a `play`
+  accepted during a pause waiting for `resume`, `is_playing` during a pause, `stop` not lifting it,
+  both clocks scaled by tempo, the refusal's field and range, programmatic clamping, `reset`,
+  seek finishing crossed beats, exact landing, forward-only, impossible targets, narration crossed
+  vs. ahead, seeking while paused, and the empty diff), one conformance arm (all four answer with
+  empty diffs, and backward `seek` / zero `tempo` are refusals naming their field), and three
+  `--script` end-to-end stills: a paused `fade_out` is pixel-identical to never playing it, a
+  `seek` past the pause finishes the fade and removes the square, and `tempo 0.05` leaves the
+  square mid-fade at 10 s where full speed has removed it. **All eight goldens are unchanged** —
+  the controls change what time does, not what a settled frame is — and the count moved 688 → 707.
+  Deferred, deliberately: backward seek (checkpoints), pause/position in the semantic tree (they
+  are session state, not nodes), per-beat tempo ramps, and stepping frame-by-frame from the wire.
 
 ## AI integration
 
@@ -2567,8 +2598,21 @@ opposite of what "stop" means to a viewer. The lecture clock and the narration t
 sees an ending rather than a stall, and the command is idempotent: stopping a stopped scene succeeds
 and changes nothing.
 
-`stop`, `camera`, `motion` and `narrate` are the commands intercepted by `SceneContext::handle`
-rather than by the pure `command::apply`, and all four return an **empty** `StateDiff` for `play`'s
+**`pause`** / **`resume`** / **`seek`** / **`tempo`** are the playback controls, and they act on
+time rather than on the tree. `pause` freezes the animation scheduler and the lecture clock — the
+picture holds, queued narration does not fire, a queued beat does not start — while `set`, `add`
+and `camera` still apply, so "pause, edit, resume" is a usable gesture; `is_playing` stays true
+through a pause, and a pause outlives `stop` (a viewer's hold is not content's to undo). `seek` is
+**forward-only** and absolute in lecture time: it runs the timeline it crosses on the 1/60 grid, so
+beats play and `finish` (a crossed `fade_out` removes its target), then lands exactly on `to`;
+backward motion is what `checkpoint`/`undo` is for. `tempo` rescales both clocks (so narration
+stays in sync) within `0.05..=16.0`; zero is `pause`, and out-of-range values are `out_of_range`
+under `factor`. Both `pause` and `tempo` are session state, deliberately absent from the semantic
+tree; `reset` returns to playing at 1×.
+
+`stop`, `pause`, `resume`, `seek`, `tempo`, `camera`, `motion` and `narrate` are the commands
+intercepted by `SceneContext::handle`
+rather than by the pure `command::apply`, and all eight return an **empty** `StateDiff` for `play`'s
 reason — the timeline, the view, the motion policy and a spoken line are not nodes. `camera` writes the view now or queues a
 `CameraMove`; `motion` (`{"action":"motion","mode":"full"|"reduced"}`) writes the policy the **next
 beat started** will be given, without touching the beat already running; `narrate` queues a line on

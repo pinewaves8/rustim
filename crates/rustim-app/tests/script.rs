@@ -532,6 +532,162 @@ fn a_stop_drops_a_beat_before_it_starts() {
     );
 }
 
+/// **A pause holds a beat for the whole run**, which is a claim a still frame can
+/// make after all: the settle runs ten virtual seconds, and a paused scene does
+/// not spend one of them. The still is therefore exactly the script without the
+/// beat, while the same script unpaused removes its square.
+#[test]
+fn a_pause_holds_a_beat_for_the_whole_run() {
+    let add = r#"{"action":"add","type":"square","params":{"width":2.0,"label":"方块"}}"#;
+    let fade =
+        r#"{"action":"play","animation":{"target":"方块","type":"fade_out","duration":1.0}}"#;
+
+    let plain = scratch("pause-plain", &format!("{add}\n"));
+    let held = scratch(
+        "pause-held",
+        &format!("{add}\n{fade}\n{{\"action\":\"pause\"}}\n"),
+    );
+    let played = scratch("pause-played", &format!("{add}\n{fade}\n"));
+
+    let held_png = out_path("pause-held");
+    let ran = run(&[
+        "--script",
+        held.to_str().unwrap(),
+        "--reply",
+        "--png",
+        held_png.to_str().unwrap(),
+    ]);
+    ran.ok("--script … --reply --png with a pause");
+    let replies = ran.replies();
+    assert_eq!(replies.len(), 3);
+    let diff = replies[2].diff.as_ref().expect("a pause is applied");
+    assert!(diff.created.is_empty() && diff.modified.is_empty() && diff.removed.is_empty());
+    assert!(replies.iter().all(|r| r.error.is_none()));
+
+    let plain_png = out_path("pause-plain");
+    let played_png = out_path("pause-played");
+    for (script, png) in [(&plain, &plain_png), (&played, &played_png)] {
+        run(&[
+            "--script",
+            script.to_str().unwrap(),
+            "--png",
+            png.to_str().unwrap(),
+        ])
+        .ok("--script … --png");
+    }
+
+    let tolerance = Tolerance::default();
+    let same = compare_png_files(&held_png, &plain_png, &tolerance).expect("both files are frames");
+    assert_eq!(
+        same.max,
+        0,
+        "a paused timeline advanced.\n{}",
+        same.report(&tolerance)
+    );
+    assert!(same.diff_bbox.is_none());
+    let moved =
+        compare_png_files(&played_png, &plain_png, &tolerance).expect("both files are frames");
+    assert!(
+        moved.max > 0,
+        "the counterfactual is broken: an unpaused fade-out should remove the square"
+    );
+}
+
+/// **A seek runs the beats it passes**, including while the timeline is paused:
+/// the same script with and without the jump differs by a square, because the
+/// seek drove the fade-out to its end (and its `finish`, which removes the
+/// target) rather than just moving a clock.
+#[test]
+fn a_seek_finishes_what_a_pause_is_holding() {
+    let add = r#"{"action":"add","type":"square","params":{"width":2.0,"label":"方块"}}"#;
+    let fade =
+        r#"{"action":"play","animation":{"target":"方块","type":"fade_out","duration":1.0}}"#;
+
+    let held = scratch(
+        "seek-held",
+        &format!("{add}\n{fade}\n{{\"action\":\"pause\"}}\n"),
+    );
+    let jumped = scratch(
+        "seek-jumped",
+        &format!("{add}\n{fade}\n{{\"action\":\"pause\"}}\n{{\"action\":\"seek\",\"to\":5.0}}\n"),
+    );
+
+    let held_png = out_path("seek-held");
+    let jumped_png = out_path("seek-jumped");
+    let ran = run(&[
+        "--script",
+        jumped.to_str().unwrap(),
+        "--reply",
+        "--png",
+        jumped_png.to_str().unwrap(),
+    ]);
+    ran.ok("--script … --reply --png with a seek");
+    let replies = ran.replies();
+    assert_eq!(replies.len(), 4);
+    let diff = replies[3].diff.as_ref().expect("a seek is applied");
+    assert!(diff.removed.is_empty(), "the seek reports no tree change");
+    assert!(replies.iter().all(|r| r.error.is_none()));
+
+    run(&[
+        "--script",
+        held.to_str().unwrap(),
+        "--png",
+        held_png.to_str().unwrap(),
+    ])
+    .ok("--script … --png without the seek");
+
+    let tolerance = Tolerance::default();
+    let diff =
+        compare_png_files(&jumped_png, &held_png, &tolerance).expect("both files are one frame");
+    assert!(
+        diff.max > 0,
+        "the seek left the paused square exactly where it was"
+    );
+}
+
+/// **A tempo scales the run**, so ten seconds of frames are fewer lecture
+/// seconds: at 0.05 the one-second fade has only travelled half way, and the
+/// still holds a half-transparent square where the default run holds none.
+#[test]
+fn a_tempo_slows_the_still_into_mid_fade() {
+    let add = r#"{"action":"add","type":"square","params":{"width":2.0,"label":"方块"}}"#;
+    let fade =
+        r#"{"action":"play","animation":{"target":"方块","type":"fade_out","duration":1.0}}"#;
+
+    let normal = scratch("tempo-normal", &format!("{add}\n{fade}\n"));
+    let slow = scratch(
+        "tempo-slow",
+        &format!("{add}\n{fade}\n{{\"action\":\"tempo\",\"factor\":0.05}}\n"),
+    );
+
+    let normal_png = out_path("tempo-normal");
+    let slow_png = out_path("tempo-slow");
+    let ran = run(&[
+        "--script",
+        slow.to_str().unwrap(),
+        "--reply",
+        "--png",
+        slow_png.to_str().unwrap(),
+    ]);
+    ran.ok("--script … --reply --png with a tempo");
+    assert!(ran.replies().iter().all(|r| r.error.is_none()));
+    run(&[
+        "--script",
+        normal.to_str().unwrap(),
+        "--png",
+        normal_png.to_str().unwrap(),
+    ])
+    .ok("--script … --png at full speed");
+
+    let tolerance = Tolerance::default();
+    let diff =
+        compare_png_files(&slow_png, &normal_png, &tolerance).expect("both files are one frame");
+    assert!(
+        diff.max > 0,
+        "at 0.05× ten seconds are half a second of the fade, so the square must still be visible"
+    );
+}
+
 /// A refused command is answered, and the session continues.
 ///
 /// This is the whole posture of the command layer — a refusal is a value, never a

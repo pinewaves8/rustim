@@ -88,6 +88,21 @@ pub struct SceneContext {
     /// the change to go through the command layer gets it announced as a
     /// [`Command::Motion`] would.
     pub motion: Motion,
+    /// Whether [`SceneContext::advance`] moves time at all.
+    ///
+    /// Private because every route in and out of it is a command or a named
+    /// method ([`SceneContext::pause`], [`SceneContext::resume`],
+    /// [`SceneContext::is_paused`]); a host that wrote the flag directly would
+    /// bypass nothing, but it *would* make the pause state one more thing a
+    /// caller has to remember to keep consistent with the reply it sent.
+    paused: bool,
+    /// Virtual seconds per frame, if the run is not paused.
+    ///
+    /// Multiplies the `dt` `advance` is handed, so both the scheduler and the
+    /// lecture clock run at the same speed. Clamped by
+    /// [`SceneContext::set_tempo`]; `1.0` unless a [`Command::Tempo`] said
+    /// otherwise.
+    tempo: f64,
     /// The scripted beats not yet started — deliberately private.
     ///
     /// The fields above are public because a scene may read and write them
@@ -137,6 +152,8 @@ impl SceneContext {
             animations: AnimationScheduler::new(),
             viewport,
             motion,
+            paused: false,
+            tempo: 1.0,
             playback: Sequence::new(),
             clock: 0.0,
             narration: Vec::new(),
@@ -242,6 +259,27 @@ impl SceneContext {
     /// not this method, not [`SceneContext::is_playing`], not a scene reacting to
     /// the timeline having drained — needs to know the mode to stay correct.
     pub fn advance(&mut self, dt: f64) {
+        // Two host controls act on the `dt` and nothing else, which is the whole
+        // reason they are two fields instead of two more branches deeper in: a
+        // pause is zero time, and a tempo is time scaled. Both must move the
+        // lecture clock and the scheduler together — narration timed against a
+        // clock that kept running through a pause would speak over a frozen
+        // picture, and a tempo that scaled only the animations would drift the
+        // subtitles off the beats.
+        if self.paused {
+            return;
+        }
+        self.advance_clock(dt * self.tempo);
+    }
+
+    /// [`SceneContext::advance`] with the playback controls bypassed.
+    ///
+    /// `dt` is lecture seconds, scaled by nobody. The split exists for
+    /// [`SceneContext::seek`], whose target is an absolute time on this clock:
+    /// running a fast-forward through `advance` would scale it by the tempo and
+    /// land somewhere the caller did not ask for. A pause does not stop this
+    /// either — scrubbing a paused timeline is the point of a seek.
+    fn advance_clock(&mut self, dt: f64) {
         // The clock is the one time base narration is scheduled against. It
         // never goes below zero: `,` steps a frame backwards, and a negative
         // `at` is refused at the wire, so a rewind is a debug gesture and not a
@@ -253,6 +291,131 @@ impl SceneContext {
                 .start_next(&mut self.animations, &mut self.tree, self.motion);
         }
         self.animations.update(dt, &mut self.tree);
+    }
+
+    /// Freeze the timeline where it is.
+    ///
+    /// Both clocks stop: [`SceneContext::advance`] returns before touching the
+    /// scheduler or the lecture clock, so a beat in flight holds its current
+    /// alpha and narration due during the pause waits. The queue is untouched, so
+    /// [`SceneContext::resume`] continues from the same place and a `play`
+    /// accepted while paused starts on the resume rather than now.
+    ///
+    /// [`SceneContext::is_playing`] stays true: a pause is not the end of the
+    /// timeline, and a scene that relabels when its morph settles must not
+    /// relabel because a viewer held the picture.
+    pub fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    /// Let a paused timeline run again. Idempotent.
+    pub fn resume(&mut self) {
+        self.paused = false;
+    }
+
+    /// Is the timeline held? See [`SceneContext::pause`].
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// The current playback speed. See [`SceneContext::set_tempo`].
+    pub fn tempo(&self) -> f64 {
+        self.tempo
+    }
+
+    /// The slowest speed a command may select.
+    ///
+    /// At `0.05` a one-second beat takes twenty — still playback, if a slow one.
+    pub const MIN_TEMPO: f64 = 0.05;
+
+    /// The fastest speed a command may select.
+    ///
+    /// At `16` a one-second beat is four frames. Past that a frame skips beats
+    /// rather than playing them, which is [`SceneContext::seek`]'s job: a speed
+    /// that cannot be watched is not a speed.
+    pub const MAX_TEMPO: f64 = 16.0;
+
+    /// The grid [`SceneContext::seek`] fast-forwards on.
+    ///
+    /// The same `1/60` the desktop frame loop, the browser session and the
+    /// golden capture use, so a seek leaves the tree a run would actually have
+    /// produced rather than a sample on a second, invisible grid.
+    pub const SEEK_STEP: f64 = 1.0 / 60.0;
+
+    /// The longest span one seek may skip, in lecture seconds.
+    ///
+    /// A cap rather than a warning: the fast-forward is bounded work at
+    /// `SEEK_STEP`, and a model that asks to skip an hour must be told no in
+    /// one reply instead of holding the connection while 216 000 frames run.
+    pub const MAX_SEEK_SECONDS: f64 = 600.0;
+
+    /// Play the timeline at a different speed from now on.
+    ///
+    /// `factor` multiplies the `dt` [`SceneContext::advance`] is handed, for the
+    /// scheduler and the lecture clock alike. A non-finite or non-positive value
+    /// is ignored (the current tempo stands) and a value outside
+    /// [`SceneContext::MIN_TEMPO`]..=[`SceneContext::MAX_TEMPO`] is clamped: a
+    /// programmatic caller has no error channel, and the command layer validates
+    /// and refuses before it gets here, so the clamp is the guard rather than
+    /// the contract.
+    pub fn set_tempo(&mut self, factor: f64) {
+        if factor.is_finite() && factor > 0.0 {
+            self.tempo = factor.clamp(Self::MIN_TEMPO, Self::MAX_TEMPO);
+        }
+    }
+
+    /// Jump the lecture clock forward to `to`, finishing what lies in between.
+    ///
+    /// The playback machine is driven on [`SceneContext::SEEK_STEP`] until the
+    /// clock reaches `to`, so the result is what a run would have had at that
+    /// time: passed beats are played and `finish`ed, a beat in flight advances,
+    /// and the next queued beat is ready to start. The final step is shortened
+    /// to land exactly on `to`, and the clock is then **assigned**, because
+    /// `a + (b - a)` is not `b` for every float pair and "seek to 6.5 s" should
+    /// mean 6.5 s.
+    ///
+    /// `tempo` does not scale the jump (the target is lecture time), and a pause
+    /// does not stop it (scrubbing a paused timeline is a normal thing to do).
+    /// Narration the jump crosses is **dropped** rather than said in a burst on
+    /// the next frame.
+    ///
+    /// Refusals, all values: a negative or non-finite `to`; a `to` behind the
+    /// clock (a rewind needs a snapshot — the checkpoint/undo step); and a span
+    /// longer than [`SceneContext::MAX_SEEK_SECONDS`].
+    pub fn seek(&mut self, to: f64) -> Result<(), CommandError> {
+        if !to.is_finite() || to < 0.0 {
+            return Err(CommandError::OutOfRange {
+                property: "to".to_owned(),
+                detail: format!("{to} is not a finite, non-negative time"),
+            });
+        }
+        if to < self.clock {
+            return Err(CommandError::OutOfRange {
+                property: "to".to_owned(),
+                detail: format!("the clock is at {} s; seek moves forward only", self.clock),
+            });
+        }
+        let span = to - self.clock;
+        if span > Self::MAX_SEEK_SECONDS {
+            return Err(CommandError::OutOfRange {
+                property: "to".to_owned(),
+                detail: format!(
+                    "{span} s is longer than the {} s one seek will fast-forward",
+                    Self::MAX_SEEK_SECONDS
+                ),
+            });
+        }
+        if span == 0.0 {
+            return Ok(());
+        }
+        while self.clock < to {
+            self.advance_clock((to - self.clock).min(Self::SEEK_STEP));
+        }
+        self.clock = to;
+        // Draining rather than reading: every line whose due time the jump
+        // passed is gone. Lines still ahead of the clock stay queued.
+        self.take_narration();
+        Ok(())
     }
 
     /// Interrupt the timeline: drop every queued beat and every running
@@ -378,16 +541,25 @@ impl SceneContext {
         // over for the same reason — the new scene's `at: 0` means *its* zero.
         self.clock = 0.0;
         self.narration.clear();
+        // A fresh run plays: a scene rewritten while the previous one was held
+        // must not come up frozen at a speed nobody asked for. The pause and the
+        // tempo belong to the *run*, like the clock they scale.
+        self.paused = false;
+        self.tempo = 1.0;
     }
 
     /// Apply a command from outside the engine.
     ///
     /// [`Command::Hello`], [`Command::Play`], [`Command::Stop`],
-    /// [`Command::Camera`], [`Command::Motion`], [`Command::Narrate`] and
-    /// [`Command::Query`] are answered **here** rather than in `command::apply`:
+    /// [`Command::Pause`], [`Command::Resume`], [`Command::Tempo`],
+    /// [`Command::Seek`], [`Command::Camera`], [`Command::Motion`],
+    /// [`Command::Narrate`] and [`Command::Query`] are answered **here** rather
+    /// than in `command::apply`:
     /// a hello answers with capabilities rather than a diff — a shape `apply`
     /// cannot return — a play needs the playback machine, a stop needs it *and*
-    /// the scheduler, a camera command needs the playback machine *or* the
+    /// the scheduler, the playback controls name fields on this context beside
+    /// the clock they scale (a seek additionally drives the machine), a camera
+    /// command needs the playback machine *or* the
     /// viewport's aspect ratio (for `focus`), a motion command names a field on
     /// this context rather than in the tree, a narration needs the virtual clock
     /// and its own track, a query needs the viewport to project bounds — and
@@ -477,6 +649,40 @@ impl SceneContext {
         }
         if let Command::Stop = cmd {
             self.stop();
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Pause = cmd {
+            self.pause();
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Resume = cmd {
+            self.resume();
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Tempo { factor } = cmd {
+            if !factor.is_finite() || *factor <= 0.0 {
+                return Err(CommandError::OutOfRange {
+                    property: "factor".to_owned(),
+                    detail: format!(
+                        "{factor} is not a finite, positive speed (pause is its own command)"
+                    ),
+                });
+            }
+            if !(Self::MIN_TEMPO..=Self::MAX_TEMPO).contains(factor) {
+                return Err(CommandError::OutOfRange {
+                    property: "factor".to_owned(),
+                    detail: format!(
+                        "{factor} is outside the playback range {}..={}",
+                        Self::MIN_TEMPO,
+                        Self::MAX_TEMPO
+                    ),
+                });
+            }
+            self.set_tempo(*factor);
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Seek { to } = cmd {
+            self.seek(*to)?;
             return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Motion { mode } = cmd {
@@ -2369,5 +2575,348 @@ mod tests {
                 detail: "only a group takes children".to_owned()
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod playback_control_tests {
+    //! `pause` / `resume` / `seek` / `tempo`, the four commands that act on the
+    //! *clock* rather than on the tree.
+    //!
+    //! None of them can be seen in a still frame, which is why every claim here
+    //! is about the state a run passes through: the scheduler's delivery, the
+    //! lecture clock, `is_playing`, and the narration track.
+
+    use super::*;
+    use rustim_anim::{FadeIn, FadeOut};
+
+    const DT: f64 = 1.0 / 60.0;
+
+    fn scene() -> SceneContext {
+        SceneContext::new(Viewport::default(), Motion::Full)
+    }
+
+    fn tick(ctx: &mut SceneContext, frames: usize) {
+        for _ in 0..frames {
+            ctx.advance(DT);
+        }
+    }
+
+    fn invisible_square(ctx: &mut SceneContext) -> NodeId {
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        ctx.tree.get_mut(id).unwrap().opacity = 0.0;
+        id
+    }
+
+    fn opacity(ctx: &SceneContext, id: NodeId) -> f64 {
+        ctx.tree.get(id).unwrap().opacity
+    }
+
+    fn applied(ctx: &mut SceneContext, cmd: &Command) {
+        ctx.handle(cmd).expect("a well-formed command");
+    }
+
+    /// A pause stops the beat and the clock together, and a resume continues
+    /// from exactly where they stopped — not from where the pause began, and not
+    /// from where the timeline would have been had nobody paused it.
+    #[test]
+    fn a_pause_freezes_both_clocks_and_the_beat() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(1.0));
+
+        tick(&mut ctx, 15);
+        let held = opacity(&ctx, id);
+        let clock = ctx.clock();
+        assert!(held > 0.0 && held < 1.0, "half a second into a 1 s fade");
+
+        ctx.pause();
+        tick(&mut ctx, 600);
+        assert_eq!(opacity(&ctx, id), held, "a pause advanced the beat");
+        assert_eq!(ctx.clock(), clock, "a pause advanced the lecture clock");
+
+        ctx.resume();
+        tick(&mut ctx, 1);
+        assert!(opacity(&ctx, id) > held, "the resume did not restart time");
+        tick(&mut ctx, 60);
+        assert_eq!(opacity(&ctx, id), 1.0);
+        assert!(!ctx.is_playing());
+    }
+
+    /// A beat accepted while paused waits for the resume rather than consuming a
+    /// frozen frame — which is what makes "pause, add, play, resume" a lecture.
+    #[test]
+    fn a_play_accepted_during_a_pause_waits_for_the_resume() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.pause();
+        ctx.play(FadeIn::new(id).with_duration(0.5));
+
+        tick(&mut ctx, 120);
+        assert_eq!(opacity(&ctx, id), 0.0, "the beat ran while paused");
+        assert!(ctx.is_playing(), "it is queued, and the queue is not empty");
+
+        ctx.resume();
+        tick(&mut ctx, 40);
+        assert_eq!(opacity(&ctx, id), 1.0);
+    }
+
+    /// Pausing is not the end of the timeline: a scene that relabels when its
+    /// morph settles must not relabel because a viewer held the picture.
+    #[test]
+    fn a_pause_is_not_the_end_of_the_timeline() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(1.0));
+        tick(&mut ctx, 5);
+        ctx.pause();
+        assert!(ctx.is_playing());
+    }
+
+    /// `stop` and `pause` are orthogonal: a content command must not undo a
+    /// viewer's hold. `resume` is the only way back.
+    #[test]
+    fn stop_does_not_lift_a_pause() {
+        let mut ctx = scene();
+        ctx.pause();
+        ctx.stop();
+        assert!(ctx.is_paused());
+        ctx.resume();
+        assert!(!ctx.is_paused());
+    }
+
+    /// A tempo scales the beat and the lecture clock by the same factor, so
+    /// narration written against the clock stays on the beats.
+    #[test]
+    fn tempo_scales_the_timeline_and_the_lecture_clock() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(1.0));
+
+        applied(&mut ctx, &Command::Tempo { factor: 2.0 });
+        assert_eq!(ctx.tempo(), 2.0);
+        tick(&mut ctx, 30);
+        assert!(
+            (ctx.clock() - 1.0).abs() < 1e-12,
+            "30 frames at 2× are one lecture second, got {}",
+            ctx.clock()
+        );
+        assert_eq!(opacity(&ctx, id), 1.0, "a 1 s beat at 2× is over in 0.5 s");
+        // `ease` can round to exactly 1.0 one frame before the raw age reaches
+        // the duration, so completion is checked on the next tick rather than on
+        // the same one — the beat is over either way, and the extra frame is the
+        // scheduler's own completion predicate, not the tempo's.
+        tick(&mut ctx, 1);
+        assert!(!ctx.is_playing());
+    }
+
+    /// The command refuses what a speed cannot mean, and names the field. The
+    /// four refusals are distinct fixes: `0` is the pause command, a negative
+    /// factor would run time backwards, and the two bounds are the playback
+    /// range.
+    #[test]
+    fn a_tempo_refusal_names_the_field_and_the_range() {
+        let mut ctx = scene();
+        for factor in [0.0, -2.0, f64::NAN, f64::INFINITY] {
+            let err = ctx
+                .handle(&Command::Tempo { factor })
+                .expect_err("not a speed");
+            assert!(
+                matches!(
+                    err,
+                    CommandError::OutOfRange {
+                        ref property,
+                        ..
+                    } if property == "factor"
+                ),
+                "{factor} was refused as {err:?}"
+            );
+        }
+        for factor in [0.01, 100.0] {
+            let err = ctx
+                .handle(&Command::Tempo { factor })
+                .expect_err("outside the range");
+            let CommandError::OutOfRange { property, detail } = err else {
+                panic!("wrong refusal");
+            };
+            assert_eq!(property, "factor");
+            assert!(detail.contains("0.05") && detail.contains("16"), "{detail}");
+        }
+        assert_eq!(ctx.tempo(), 1.0, "a refused tempo changed the speed");
+    }
+
+    /// A programmatic caller has no error channel, so the setter clamps and
+    /// ignores impossible values rather than writing one into the clock's
+    /// multiplier.
+    #[test]
+    fn set_tempo_clamps_for_a_programmatic_caller() {
+        let mut ctx = scene();
+        ctx.set_tempo(100.0);
+        assert_eq!(ctx.tempo(), SceneContext::MAX_TEMPO);
+        ctx.set_tempo(f64::NAN);
+        assert_eq!(ctx.tempo(), SceneContext::MAX_TEMPO);
+        ctx.set_tempo(-1.0);
+        assert_eq!(ctx.tempo(), SceneContext::MAX_TEMPO);
+        ctx.set_tempo(1.0);
+        assert_eq!(ctx.tempo(), 1.0);
+    }
+
+    /// A fresh run plays: a scene rewritten while the previous one was held must
+    /// not come up frozen, nor at a speed nobody asked for.
+    #[test]
+    fn reset_returns_to_full_speed_and_play() {
+        let mut ctx = scene();
+        ctx.pause();
+        ctx.set_tempo(4.0);
+        ctx.reset();
+        assert!(!ctx.is_paused());
+        assert_eq!(ctx.tempo(), 1.0);
+    }
+
+    /// A seek plays what it passes *for real*: a `FadeOut` in the skipped span
+    /// removes its target, because `finish` runs — a jump is not a fast-forward
+    /// of the queue, it is the run itself, coarser in wall time only.
+    #[test]
+    fn a_seek_finishes_the_beats_it_passes() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(0.5));
+        ctx.play(FadeOut::new(id).with_duration(0.5));
+
+        ctx.seek(5.0).expect("a forward seek");
+        assert!(
+            ctx.tree.get(id).is_none(),
+            "the skipped FadeOut left its target behind"
+        );
+        assert!(!ctx.is_playing());
+        assert_eq!(ctx.clock(), 5.0, "the clock lands exactly on the target");
+    }
+
+    /// The target is a time, not a grid point: the clock is assigned, because
+    /// `a + (b - a)` is not `b` for every float pair.
+    #[test]
+    fn a_seek_lands_exactly_on_its_target() {
+        let mut ctx = scene();
+        ctx.seek(6.5).expect("a forward seek");
+        assert_eq!(ctx.clock(), 6.5);
+    }
+
+    /// Seeking backwards needs a snapshot of everything an animation may have
+    /// deleted or overwritten; that is the checkpoint/undo step, and this
+    /// command says so instead of pretending.
+    #[test]
+    fn a_seek_is_forward_only() {
+        let mut ctx = scene();
+        ctx.seek(5.0).unwrap();
+        let err = ctx.seek(4.0).expect_err("a rewind");
+        let CommandError::OutOfRange { property, detail } = err else {
+            panic!("wrong refusal");
+        };
+        assert_eq!(property, "to");
+        assert!(detail.contains("forward only"), "{detail}");
+        assert_eq!(ctx.clock(), 5.0, "a refused seek moved the clock");
+    }
+
+    /// Three impossible targets, one field named.
+    #[test]
+    fn a_seek_refuses_impossible_targets() {
+        let mut ctx = scene();
+        for to in [-1.0, f64::NAN, f64::INFINITY] {
+            let err = ctx.seek(to).expect_err("not a time");
+            let CommandError::OutOfRange { property, .. } = err else {
+                panic!("wrong refusal for {to}");
+            };
+            assert_eq!(property, "to");
+        }
+        let err = ctx
+            .seek(SceneContext::MAX_SEEK_SECONDS + 1.0)
+            .expect_err("an unbounded fast-forward");
+        let CommandError::OutOfRange { property, detail } = err else {
+            panic!("wrong refusal");
+        };
+        assert_eq!(property, "to");
+        assert!(detail.contains("600"), "{detail}");
+        assert_eq!(ctx.clock(), 0.0, "a refused seek moved the clock");
+    }
+
+    /// A jump is a jump: a line the seek crossed is dropped rather than said
+    /// eight-at-once on the next frame, while a line still ahead stays queued.
+    #[test]
+    fn a_seek_drops_the_narration_it_crosses_and_keeps_what_is_ahead() {
+        let mut ctx = scene();
+        applied(
+            &mut ctx,
+            &Command::Narrate {
+                text: "早".to_owned(),
+                at: Some(0.5),
+            },
+        );
+        applied(
+            &mut ctx,
+            &Command::Narrate {
+                text: "晚".to_owned(),
+                at: Some(100.0),
+            },
+        );
+
+        ctx.seek(1.0).unwrap();
+        assert!(
+            ctx.take_narration().is_empty(),
+            "the crossed line was still queued"
+        );
+
+        // A jump that stops before the line must leave it queued — the drop is
+        // "what the seek crossed", not "everything on the track".
+        ctx.seek(99.5).unwrap();
+        assert!(
+            ctx.take_narration().is_empty(),
+            "the seek said a line it did not reach"
+        );
+        ctx.advance(0.5);
+        assert_eq!(
+            ctx.take_narration(),
+            vec!["晚".to_owned()],
+            "the line ahead was lost by the earlier seeks"
+        );
+    }
+
+    /// A seek is a scrub: it works on a held timeline and leaves it held, so a
+    /// caller can look ahead without letting the lecture run on.
+    #[test]
+    fn a_seek_works_on_a_paused_timeline() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(0.5));
+        ctx.pause();
+
+        ctx.seek(2.0).expect("scrubbing a paused timeline");
+        assert_eq!(opacity(&ctx, id), 1.0);
+        assert!(ctx.is_paused(), "the seek resumed the paused timeline");
+        let clock = ctx.clock();
+        tick(&mut ctx, 10);
+        assert_eq!(ctx.clock(), clock, "the tick ran while paused");
+    }
+
+    /// The four controls are reported as empty diffs through the one apply
+    /// point, and they round-trip through JSON exactly as they arrived.
+    #[test]
+    fn the_playback_controls_answer_with_an_empty_diff() {
+        let mut ctx = scene();
+        for cmd in [
+            Command::Pause,
+            Command::Resume,
+            Command::Seek { to: 1.0 },
+            Command::Tempo { factor: 2.0 },
+        ] {
+            let json = serde_json::to_string(&cmd).unwrap();
+            assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+            match ctx.handle(&cmd).expect("a well-formed control") {
+                CommandOutcome::Applied(diff) => assert!(diff.is_empty(), "{cmd:?}"),
+                _ => panic!("a control is not a read"),
+            }
+        }
     }
 }

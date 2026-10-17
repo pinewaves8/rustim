@@ -124,6 +124,67 @@ pub enum Command {
     /// interrupt. Answered by [`crate::SceneContext::handle`], because only the
     /// playback machine and the scheduler together are "the timeline".
     Stop,
+    /// Freeze the timeline where it is.
+    ///
+    /// The lecture clock stops with it, so narration due during the pause is not
+    /// spoken while the picture is held — a caption over a frozen scene would be
+    /// describing something the viewer cannot see moving. Everything else still
+    /// works: an instant camera command, a `set`, an `add`, or a `play` that
+    /// queues a beat to start on [`Command::Resume`] are all accepted, which is
+    /// what makes "pause, edit, resume" a usable lecture gesture.
+    ///
+    /// **A paused timeline is still playing** ([`crate::SceneContext::is_playing`]),
+    /// so a scene reacting to its timeline draining does not treat a pause as an
+    /// ending. Pausing is idempotent; `stop` deliberately does **not** un-pause,
+    /// because a viewer's hold must not be undone by a content command — call
+    /// [`Command::Resume`] for that.
+    ///
+    /// Answered by [`crate::SceneContext::handle`] (the flag lives there, not in
+    /// the tree) with an empty [`StateDiff`], for `play`'s reason.
+    Pause,
+    /// Let a paused timeline run again.
+    ///
+    /// Idempotent, and a no-op on a timeline that never paused. Resuming does
+    /// not replay anything the pause skipped — nothing was skipped: the clock
+    /// stopped, it did not jump. Answered by [`crate::SceneContext::handle`] with
+    /// an empty diff.
+    Resume,
+    /// Jump the lecture clock **forward**, finishing whatever lies in between.
+    ///
+    /// `to` is an absolute time in virtual seconds, the same clock
+    /// [`crate::SceneContext::clock`] reports — so a script that has just
+    /// applied at t = 0 can say "show me where this is at 6.5 s". The jump runs
+    /// the playback machine on its own 1/60 s grid, so the tree it leaves is the
+    /// tree a run would have had at that time: passed beats are played and
+    /// `finish`ed (a `FadeOut` there really removes its target), a beat in
+    /// flight is advanced, and the next queued beat is ready to start.
+    ///
+    /// Three refusals are values: a negative or non-finite `to`, a `to` behind
+    /// the clock (forward-only — rewinding needs a snapshot, which is the
+    /// checkpoint/undo step and not this command), and a jump longer than
+    /// `SceneContext::MAX_SEEK_SECONDS`, because a fast-forward is bounded work
+    /// and a model must be told so rather than made to wait.
+    ///
+    /// Narration the jump crosses is **dropped**, not said late in a burst; a
+    /// seek is a jump, and eight sentences landing on one frame is not a
+    /// lecture. It works on a paused context too (scrub, then resume) and is
+    /// measured in lecture time, so `tempo` does not scale where it lands.
+    /// Answered by [`crate::SceneContext::handle`] with an empty diff.
+    Seek { to: f64 },
+    /// Play the timeline at a different speed from now on.
+    ///
+    /// `factor` multiplies virtual time per frame: `2.0` plays twice as fast,
+    /// `0.5` half. Both the animation clock and the lecture clock scale, so
+    /// narration paces along with the picture instead of drifting ahead of it.
+    /// The range is `SceneContext::MIN_TEMPO..=SceneContext::MAX_TEMPO`;
+    /// anything else — including `0.0`, which is what [`Command::Pause`] is for,
+    /// and a negative factor, which would run the timeline backwards — is
+    /// [`CommandError::OutOfRange`] under `factor`.
+    ///
+    /// Takes effect on the next frame and changes nothing already played, so a
+    /// tempo command is safe mid-beat. Answered by [`crate::SceneContext::handle`]
+    /// with an empty diff, because a speed is not a node.
+    Tempo { factor: f64 },
     /// Point the camera, now or over a beat.
     ///
     /// All four fields are optional and omitted when absent, like every other
@@ -1039,6 +1100,13 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // tree this function may touch. The arm keeps `apply` total, so a
             // caller driving it directly replays the same log without a panic.
         }
+        Command::Pause | Command::Resume | Command::Seek { .. } | Command::Tempo { .. } => {
+            // Playback controls. The pause flag, the tempo and the fast-forward
+            // all live on the `SceneContext` beside the clock they govern; the
+            // tree can express none of them. Keeping the arms is what lets a
+            // direct `apply` caller replay a whole session log — including the
+            // controls — without a panic.
+        }
         Command::Camera { .. } => {
             // Likewise answered by `SceneContext::handle`: resolving `focus` needs
             // the viewport's aspect ratio, and applying the result is either a
@@ -1811,6 +1879,13 @@ mod tests {
             // else. An implementation that serialised an empty object or a
             // `null` payload here would change what a relayed log says.
             r#"{"action":"stop"}"#.to_owned(),
+            // The playback controls. `pause` and `resume` are unit variants like
+            // `stop`; `seek` and `tempo` each carry one number, and an
+            // implementation that wrote the defaults back would fail here.
+            r#"{"action":"pause"}"#.to_owned(),
+            r#"{"action":"resume"}"#.to_owned(),
+            r#"{"action":"seek","to":6.5}"#.to_owned(),
+            r#"{"action":"tempo","factor":2.0}"#.to_owned(),
             // The handshake, in both spellings. An absent `protocol` is a client
             // that does not claim a version, and it must not come back as a
             // `null`; a *mismatched* version still parses — the refusal belongs
@@ -1855,6 +1930,10 @@ mod tests {
                 protocol: Some(PROTOCOL_VERSION),
             },
             Command::Stop,
+            Command::Pause,
+            Command::Resume,
+            Command::Seek { to: 2.0 },
+            Command::Tempo { factor: 2.0 },
             Command::Motion {
                 mode: MotionMode::Reduced,
             },
