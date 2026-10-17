@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **518 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **552 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -98,6 +98,8 @@ cargo run -p rustim-app -- --scene formula --png out.png  # Typst → per-glyph 
 cargo run -p rustim-app -- --scene rotate --inspect  # rotate + scale, then a FadeOut removal
 cargo run -p rustim-app -- --scene axes --png out.png  # axes, ticks, a plot and a camera beat
 cargo run -p rustim-app -- --motion reduced  # ignore the platform "reduce motion" preference
+cargo run -p rustim-app -- --captions --png out.png  # ...and draw the live region's sentence on it
+cargo run -p rustim-app -- --speak --frames 300      # self-voicing (windowed only)
 cargo run -p rustim-app -- --script sessions/intro.jsonl --reply  # drive it with JSON commands
 cargo run -p rustim-app -- --script - --reply --png out.png       # ...from stdin, answering each
 cargo run -p rustim-app -- --script crates/rustim-app/tests/fixtures/script/session.jsonl --inspect
@@ -107,6 +109,8 @@ cargo test -p rustim-math --test manim_parity   # replay the checked-in Manim fi
 cargo test -p rustim-app --test goldens         # compare renders to the checked-in baselines
 BLESS=1 cargo test -p rustim-app --test goldens # ...and rewrite them (review the diff!)
 cargo test -p rustim-app --test script          # the command feed, end to end, through the binary
+cargo test -p rustim-app --test captions        # the band is in the bottom of the still, and replays
+cargo test -p rustim-app --test speech          # --speak refuses the headless flags (no backend needed)
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
@@ -281,7 +285,7 @@ last property.
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, and the `compare` module that scores two frames | Real; ffmpeg pipe not written |
-| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge and the command feed (`feed`: JSONL in, replies out, the one apply point; both as a **lib** target), eight `--scene` entries, the golden and script suites | Real |
+| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — eight `--scene` entries, the golden, script and caption suites | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead.
@@ -878,11 +882,80 @@ Verifying it by hand, per platform:
 cargo run -p rustim-app -- --scene pythagorean --inspect   # the tree, no screen reader needed
 cargo run -p rustim-app -- --frames 300                    # Tab, arrows, space, `,`/`.`, `m`
 cargo run -p rustim-app -- --a11y-probe                    # did a reader attach? report on stderr
+cargo run -p rustim-app -- --captions                     # the same sentences, as a caption band
+cargo run -p rustim-app -- --speak                        # ...and aloud, if a synthesiser exists
 # macOS: start VoiceOver (Cmd+F5), then run the probe. Windows: Narrator (Win+Ctrl+Enter),
 # then run the probe. Linux: Orca needs a session bus — with none, accesskit_unix skips
 # silently, so nothing here has been heard. The probe is what makes the other two machines
 # a ten-minute check rather than an unfinished claim; the audible result still needs them.
 ```
+
+### Narration, captions and self-voicing
+
+The live region reaches exactly the people who have a screen reader attached. Two features close that
+gap, and they share one pipeline: **whatever the live region is saying is also what the caption draws
+and what the built-in voice speaks.**
+
+- **`{"action":"narrate","text":"…","at":2.0}`** puts a line on the scene's own timeline.
+  `SceneContext` gained a private `clock`, advanced in `advance(dt)` — the same clock a windowed
+  `frame_dt` and the headless 10 s `settle` drive, so both kinds of run expire narration by the same
+  rule. `take_narration()` drains the lines whose time has come, sorted by due time.
+  **`at` is a delay from when the command arrived, not an absolute time**, because a file feed applies
+  every line at t = 0 (that is what makes replay deterministic); with no `at` a line is due
+  immediately. Two narrations pushed in one frame are all drained in that frame, which is a script
+  pacing problem, not an engine one. The command is a harmless no-op in `apply` and is intercepted in
+  `SceneContext::handle`, returning an empty `StateDiff` for `play`'s reason: the tree did not change.
+  Refusals are `OutOfRange` under `text` (empty or whitespace — the payload a model most easily sends
+  by accident) and `at` (negative or non-finite: "in the past" is not "now").
+
+- **`--captions` draws the live region at the bottom of the frame.** `rustim_app::caption` appends the
+  band after the scene's own ops, so it is a *screen layer*: it takes neither a `Viewport` nor a
+  `Camera`, and 24 px stays 24 px at every zoom. Consequently it is also the visual twin of what a
+  screen reader would say — a Tab focus announcement, `动画结束` and a scripted narration all appear
+  there. The font provider is built once (19 MB parsed per caption would be absurd), the band reshapes
+  on a text or frame-size change, and a line expires after `hold_seconds(text)` — about eight
+  characters a second, clamped to 3–12 s — of **wall** time, so a paused scene does not keep showing a
+  sentence nobody is reading. A still keeps it: `--png --captions` deliberately never expires, because
+  the still's answer to "what was said by t = 10" must not depend on how long the process took.
+
+  The transform is the whole trick. `text_ops` computes `place = to_device · world ·
+  layout_to_local(w, h)` with `layout_to_local = T(-w/2, +h/2) · S(1, -1)`; the caption passes
+  `to_device = S(1, -1)` and `world = T(x0 + w/2, -(y0 + h/2))`, and the two y flips cancel to the
+  **identity** linear part. Anything else — composing the camera, or flipping the position instead of
+  the layout — leaves a net negative y scale, which silently moves the run off `glifo`'s hinted path
+  while still drawing correct-looking text (see "Text").
+
+- **`--speak` reads the same text aloud.** `rustim_app::speech` (app layer only: the kernel may not
+  spawn a process) tries `espeak-ng` then `espeak` on Linux, `say` on macOS, and Windows PowerShell's
+  `System.Speech` assembly. The sentence always travels on **standard input**: `espeak-ng --stdin`,
+  `say` with no file arguments, `[Console]::In.ReadToEnd()` on Windows. Args would need quoting per
+  platform, would truncate on some, and would leave the prose in every process listing; `command_for`
+  is pure so all three spellings are tested on any one platform. `Speaker` owns a thread and a
+  channel, because speech takes seconds and a frame takes milliseconds; dropping it stops at the end
+  of the current sentence rather than joining. No backend is reported in one line and the run
+  continues — a bare Linux is the common case, and captions still work.
+
+- **A screen reader wins.** `--speak` goes silent once `full_pushes + incremental_pushes > 0`, i.e.
+  once an assistive technology has ever attached (the counters only move inside `update_if_active`),
+  and comes back automatically when it detaches. Two voices reading the same sentence is worse than
+  one. The caption is unaffected; it is for the people neither voice can reach.
+
+- **Narration bypasses the announcer, on purpose.** `A11yCore::narrate` writes `live` directly.
+  `offer` goes through the 750 ms throttle, which *holds one slot and drops what follows*, so a
+  scripted lecture with lines closer together than that would lose them. Narration is content, not an
+  event; a burst is said in full by the built-in voice, and the live region (one slot) carries the
+  last line. The host sets `last_live` when it calls `narrate`, so the next frame does not mistake the
+  engine's own narration for a fresh change and say it twice.
+
+- **The opening summary is injected on the first frame's narration drain**, after that frame's
+  `a11y.update`, not in `resumed`: a static scene offers `动画结束` on frame one (`was_animating`
+  starts true) and the live region has one slot. With an opening narration, the narration wins —
+  saying "this is the scene" over the first thing the script wants to say is not an introduction.
+
+The dependency is one-directional and worth stating: captions and speech consume the **same**
+`live_text()` the adapter pushes, so there is no second source of truth about what was said. The cost
+is one frame of latency (the band is read after the update that produced the sentence) and the
+announcer's merge window for announcements — which is why narration does not go through it.
 
 ### Text
 
@@ -1126,6 +1199,25 @@ is in all three platform backends, so "inactive costs nothing" is structural rat
 optimisation to remember. The corollary is that nothing may depend on a call *having* happened, and
 that the push counters read zero unattached: `--a11y-probe` reports that as "not attached", which is
 the only signal `accesskit_winit` gives (there is no `is_active`).
+
+**Narration must not go through the announcer, and that is a content decision.** `Announcer` exists to
+keep a burst of *events* from overwhelming a reader: it holds one slot and drops anything offered
+within 750 ms of the last flush. A scripted lecture is not a burst of events — each line is content
+the listener is owed — and a pacing of "one sentence every half second" would silently lose every
+other line. `A11yCore::narrate` therefore writes `live` directly, and the pipeline says the whole
+drained list while the live region (which can hold one string) keeps the last line. The corollary is
+that narration and the announcer share one slot: an announcement that flushes afterwards replaces the
+narration in the live region, which is why the host records `last_live` when it narrates — otherwise
+the next frame would treat its own line as a fresh change and speak it twice.
+
+**A speech child that reads to end of input deadlocks if the parent waits with the pipe open.**
+`espeak-ng --stdin`, `say` and PowerShell's `[Console]::In.ReadToEnd()` all speak until EOF, so the
+write end must be dropped **before** `wait`. In Rust that is the borrow rule doing the work: the
+`ChildStdin` is a local, and the `if let Some(mut stdin) = child.stdin.take()` block's end is the
+close. A broken pipe is ignored — the synthesiser exiting without reading is its answer, not a reason
+to take the speaker thread down. Text is always written to stdin and never placed in argv, so a
+sentence with quotes, newlines or CJK cannot be mangled by per-platform quoting and never appears in a
+process listing.
 
 **An incremental AccessKit update is a set of relationship promises, not merely a smaller
 snapshot.** `tree: None` is legal only if the consumer can still reach every node it needs to
@@ -1754,7 +1846,22 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   the projection pushing a focus the consumer cannot resolve. Step 13 added `--a11y-probe` — one
   announcement, 600 frames, and a stderr report saying whether a backend attached; the honest answer
   on this machine is "not attached, 0 pushes", and the report says so rather than pretending.
-- **P3+** — video export and the visual-regression CLI; self-voicing TTS; MathML flattening; the AI
+- **P3's narration, captions and self-voicing are done**, in three steps, and **not one golden
+  moved**: without `--captions` or `--speak` the frame loop emits exactly the ops it always did.
+  Step 14 added `{"action":"narrate","text","at"}` and gave `SceneContext` a virtual clock, so a line
+  can be queued for a beat of the timeline instead of being said the instant the command lands — the
+  step's evidence is that `apply` is a no-op, `handle` returns an empty diff, and the clock a window's
+  `dt` and a still's 10 s both advance is the same one. Step 15 drew the live region as a caption
+  band (`--captions`), including in `--png` stills — see "Narration, captions and self-voicing" for
+  the transform that keeps `glifo` hinting — and its integration test asserts the *only* pixels that
+  differ from a plain still are in the bottom band. Step 16 added `--speak` on `espeak-ng` / `say` /
+  PowerShell's `System.Speech`, with the sentence on stdin, a speaker thread so the frame loop never
+  blocks, and the built-in voice yielding to a screen reader that has ever attached. Deliberately
+  deferred: `.srt` export (it belongs with video export, where the frame timeline exists — item 9 of
+  the development list), a user-selectable voice (the default is the distribution's; hard-coding
+  `-v cmn` breaks machines without that voice), `piper`, and captions that follow the camera or
+  scale with DPI — 24 px is the determinism promise.
+- **P3+** — video export and the visual-regression CLI; MathML flattening; the AI
   command surface at full width; Web (WASM).
 
 ## AI integration
@@ -1766,6 +1873,7 @@ The product is an AI explainer assistant, so the engine exposes a JSON command i
 { "action": "add", "type": "circle", "params": { "radius": 2.0, "label": "leg a" } }
 { "action": "set", "target": 4294967299, "property": { "name": "opacity", "value": 0.5 } }
 { "action": "play", "animation": { "target": 4294967299, "type": "fade_in", "duration": 0.6, "rate": "ease_in_out_sine" } }
+{ "action": "narrate", "text": "两条直角边是 3 和 4", "at": 2.0 }
 ```
 
 `target` is a `NodeId`: an **opaque 64-bit integer**, not a small index (see the `slotmap` note above
@@ -1783,11 +1891,13 @@ therefore returns an **empty** `StateDiff`, and honestly so: a diff describes th
 beat does not change the tree, it changes what will happen to it. An interruption would be a *different*
 command, spelled out in the data; `play` cannot preempt what is already playing.
 
-`camera` and `motion` are the other two commands intercepted by `SceneContext::handle` rather than
-by the pure `command::apply`, and both return an **empty** `StateDiff` for `play`'s reason — the view
-and the motion policy are not nodes. `camera` writes the view now or queues a `CameraMove`; `motion`
-(`{"action":"motion","mode":"full"|"reduced"}`) writes the policy the **next beat started** will be
-given, without touching the beat already running.
+`camera`, `motion` and `narrate` are the commands intercepted by `SceneContext::handle` rather than
+by the pure `command::apply`, and all three return an **empty** `StateDiff` for `play`'s reason — the
+view, the motion policy and a spoken line are not nodes. `camera` writes the view now or queues a
+`CameraMove`; `motion` (`{"action":"motion","mode":"full"|"reduced"}`) writes the policy the **next
+beat started** will be given, without touching the beat already running; `narrate` queues a line on
+the narration track, due `at` seconds after it arrived (see "Narration, captions and
+self-voicing").
 
 Two wire-format invariants are load-bearing, both pinned by tests:
 - **Commands round-trip byte-for-byte.** `to_string(parse(json)) == json`. A host logs, replays and
@@ -1833,6 +1943,10 @@ of I/O and of a JSON parser (it compiles to wasm).
 - **`--script` without `--scene` runs on a `BlankScene`** — an empty `construct`, deliberately **not**
   in the `--scene` registry, so `--help` does not list it and the golden suite does not owe it a
   baseline on three platforms.
+- **A `narrate` line is paced by `at`, not by where it sits in the file.** Every line of a file feed
+  is applied at t = 0 — that is the determinism property, not a quirk — so two `narrate` lines
+  without `at` are both due in the frame the file is read. Its reply is a present-but-empty diff,
+  like `play`'s.
 
 `Scene::on_command(&StateDiff, &mut SceneContext)` — declared since the trait was written, never called
 until this step — now fires for every command that reached the tree, from the feed *and* from the
