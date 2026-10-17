@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **385 tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **408 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
@@ -276,9 +276,9 @@ last property.
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `FadeOut`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `CameraMove`, `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
-| `rustim-render` | `Renderer` trait, `DrawList`, the `vello_cpu` backend | Real (CPU only) |
+| `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, and the `compare` module that scores two frames | Real; ffmpeg pipe not written |
-| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge and the command feed (`feed`: JSONL in, replies out, the one apply point; both as a **lib** target), seven `--scene` entries, the golden and script suites | Real |
+| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge and the command feed (`feed`: JSONL in, replies out, the one apply point; both as a **lib** target), eight `--scene` entries, the golden and script suites | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead.
@@ -288,12 +288,77 @@ if the renderer ever grows a heavier surface, `DrawList` should move down instea
 ```text
 winit event loop → Scene::update(dt) → SceneContext::advance(dt) → AnimationScheduler::update
                  → SceneContext::build_draw_list(&mut DrawList)
-                 → Renderer::render(&DrawList) → softbuffer → screen
+                 → DrawList::damage_since(&previous_frame) → Damage
+                 → Renderer::render_damaged(&DrawList, Damage) → softbuffer (damaged region) → screen
 ```
 
 `SceneContext::build_draw_list` is the only place world coordinates are materialised. Everything
 upstream mutates *local* points and an `Affine2`; the flattening step folds each mobject's transform
 together with its ancestors' and emits paths.
+
+### Damage rectangles
+
+A frame that changed one object's opacity should not cost a whole-frame rasterisation, and an idle
+frame should cost nothing at all. `DrawList::damage_since(&old) -> Damage` answers this from the draw
+lists alone — no scene bookkeeping, no dirty flags on mobjects — and `Renderer::render_damaged`
+rasterises only what it says.
+
+```rust
+pub enum Damage { None, Full, Region(PixelRect) }
+```
+
+`PixelRect` is a half-open pixel rectangle (`x0..x1`, `y0..y1`) in the frame's own coordinates.
+
+**The diff is positional and conservative.** Ops are paired by index, carrying the `(transform,
+paint)` state each one draws under; an op that differs *or* whose governing state differs marks both
+its old and its new bounds, and the result is the union. That is O(ops) with no allocation, and it is
+correct across the draw walk's actual shape — one `SetTransform` at the head of the frame, then
+`SetPaint` + `FillPath`/`StrokePath` per mobject — because a paint change and a transform change each
+mark exactly the geometry they govern. It is deliberately not a diff of *geometry*: two lists with
+their ops in a different order are treated as a full repaint rather than matched, and a `GlyphRun` is
+one op, so a change to any glyph damages the union of that run's glyph boxes. Conservative is the
+right side to err on.
+
+**The escapes to `Full` are the cases a region render cannot express.** A size or background change
+(the frame is new, or what is under every pixel changed); a transparent background (`None` means "do
+not touch the target", which a fresh region cannot honour — it would leave the previous frame's
+pixels inside the region); and any `PushClip`/`PopClip`/`PushLayer`/`PopLayer`. The last is not
+caution: vello's clip and layer stacks are *positional*, and a region render starts a fresh context,
+so the state at the top of the region is not the state the full frame would have had there. A change
+entirely outside the frame is `None`; an identical list is `None`.
+
+**The region render shifts the scene rather than the target.** In vello_cpu 0.3.0
+`RasterizerSettings::offset` is `(u16, u16)` — an *unsigned* offset, so a region at `(x0, y0)` cannot
+be expressed as a negative offset from the frame's origin. `CpuRenderer::encode_with_origin` therefore
+pre-multiplies every `DrawOp::SetTransform(affine)` with `translate(-x0, -y0)`; the geometry, the
+glyph-run transforms and the background rect all move by the same integer amount. The render happens
+into a **reused scratch `Pixmap`** sized to the damage rectangle, initialised with
+`TargetInit::Clear(background)` — `SrcOver` would preserve the scratch's previous contents, which is
+the opposite of what a reprojected region needs — and is then copied row by row into the persistent
+pixmap. (`PixmapMut::new` demands exactly `width * height * 4` bytes with no stride, so a region of
+the main pixmap cannot be viewed in place.) The blend is exact because the shift is an integer: the
+tests assert an incremental frame is **pixel-identical** to a full one — `assert_eq` on the buffers,
+not the golden suite's tolerance — including antialiased rotated shapes and a region crossing the
+frame edge.
+
+`RenderStats { painted, frame }` is what makes the feature observable: `painted` is the area the
+rasteriser had to compute, which is the number the damage rectangle controls. Frame time is the wrong
+witness — it moves with the machine, the clock and the scheduler. The acceptance test for this step
+is stated in those terms: a one-property change repaints less than 1/20th of the frame, and the
+result is indistinguishable from a full render (`crates/rustim-scene/tests/damage.rs`, over the real
+`SceneContext` draw walk, not hand-built op lists).
+
+The trait's default `render_damaged` renders the whole list and reports the whole frame, so a backend
+that cannot cut out a region remains correct; `Damage::None` is honoured by every backend, which is
+the cheap and common case — a paused scene, or a script that has finished, presents nothing.
+
+In the app the rebuilt list and the list on screen ping-pong through `prev`, and the swap happens
+only after a frame was rasterised **and** presented: a failed frame leaves `prev` alone, so the next
+attempt is diffed against what the window still shows rather than against an image that never
+reached it. `blit_damage` copies the rectangle out of the renderer's buffer into softbuffer's (their
+widths agree because `Resized` sizes both), and for `Damage::None` it presents nothing at all. The
+periodic frame line gained `N px repainted`, and prints `prev.ops.len()` because the lists were
+swapped.
 
 ### The camera
 
@@ -792,6 +857,15 @@ and will not compile — 0.30 needs `ApplicationHandler` + `EventLoop::run_app`.
 
 **Do not approach `winit` 0.31 beta.** `accesskit_winit` only supports `^0.30.5`.
 
+**`winit` 0.30.13 has a pre-existing X11 race that can abort a windowed run.** Approximately two in
+ten `--frames` runs ended with "panic in a destructor during cleanup"; the backtrace is
+`get_frame_extents_heuristic` → `.expect("Failed to translate window coordinates")`, with
+`X11Error { error_kind: Window, request_name: Some("TranslateCoordinates") }`, reached from
+`configure_notify` while events were being pumped. Five sequential runs then exited 0, and no
+non-windowed path (`--png`, `--inspect`, the tests) is affected. It is not caused by the damage
+rectangles — it reproduces the same way with a full render — so do not chase it when a windowed run
+aborts this way.
+
 **The accessibility adapter must be built before the window is first shown, and every one of its
 constructors takes an `&ActiveEventLoop`.** `accesskit_winit` panics otherwise. This is what forced
 the window out of the pre-`run_app` creation the app had — the comment there argued for it on
@@ -965,7 +1039,8 @@ so macOS and Windows honour `--motion reduced` and not the system setting (see "
 the timeline section for what is read and why the rest is not). The CPU cost is
 **fill-area bound, not
 shape-count bound** (4 large filled polygons at 720p already cost p50 2.25 ms of a 16.7 ms budget), so
-damage-rectangle invalidation is likely worth more than any micro-optimisation.
+damage-rectangle invalidation was likely worth more than any micro-optimisation — and it landed as
+P3's damage rectangles (see "Damage rectangles").
 
 The accessibility layer's own deferred edges, so they are not rediscovered as gaps: the
 macOS/Windows backends are **compile-checked only** (this machine has no accessible bus, so nothing
@@ -1224,6 +1299,18 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   because the plot's rasterisation genuinely changed. Deferred: stroke joins/caps/dashes and
   per-segment widths (the style has one width and `vello`'s defaults), a per-mobject stroke style on
   formulas (see "P1 step 5"), and `Create`/`Uncreate`, which is what a stroke makes visible.
+- **P3's damage rectangles are done.** `DrawList::damage_since` diffs two frames positionally and
+  conservatively, `Renderer::render_damaged` renders only the resulting `PixelRect`, and the app
+  blits only that rectangle — see "Damage rectangles" for the mechanism, the `Full` escapes and why
+  the region is expressed by shifting the scene rather than the target. The evidence is
+  `RenderStats::painted` (the acceptance criterion was stated in repaint *area*, not frame time) and
+  pixel-exactness: an incremental frame equals a full render byte for byte, including antialiased
+  rotated shapes. All eight goldens passed without reblessing — a still frame is one frame, so the
+  feature changed what a frame *costs* and not what it *is*. Deferred, deliberately: damage across
+  clip/layer ops (the stacks are positional, so those frames take the full path), a real damage
+  propagation from `StateDiff` (the draw-list diff already gives the same answer without trusting
+  scene bookkeeping), and multi-rectangle damage (one union rectangle is what the scratch-target
+  route can express; several disjoint regions would need several renders).
 - **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration

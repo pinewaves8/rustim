@@ -24,10 +24,10 @@
 //! are two orders of magnitude below that.
 
 use vello_common::pixmap::Pixmap;
-use vello_cpu::{RenderContext, Resources};
+use vello_cpu::{RasterizerSettings, RenderContext, Resources, TargetInit};
 
-use crate::draw::{DrawList, DrawOp};
-use crate::{RenderError, Renderer};
+use crate::draw::{Damage, DrawList, DrawOp, PixelRect};
+use crate::{RenderError, RenderStats, Renderer};
 
 /// Rasterises draw lists on the CPU.
 pub struct CpuRenderer {
@@ -36,6 +36,14 @@ pub struct CpuRenderer {
     pixmap: Pixmap,
     width: u16,
     height: u16,
+    /// The target of an incremental render, sized to the damage rectangle and
+    /// copied back into `pixmap` afterwards.
+    ///
+    /// A separate pixmap rather than a view into `pixmap` because a region of a
+    /// row-major buffer is not contiguous and `PixmapMut` has no stride. Kept
+    /// across frames for the same reason `pixmap` is: the common case is the
+    /// same rectangle twice.
+    scratch: Option<Pixmap>,
     /// Set while encoding a frame in which a glyph could not be drawn, cleared at
     /// the start of the next one. A frame is not the right granularity to report
     /// it from — [`Self::render`] returns it after rasterising, so the pixels
@@ -51,6 +59,7 @@ impl CpuRenderer {
             pixmap: Pixmap::new(width, height),
             width,
             height,
+            scratch: None,
             text_error: None,
         }
     }
@@ -60,8 +69,29 @@ impl CpuRenderer {
     /// Split out from [`Renderer::render`] so that the export path can build a
     /// context once and rasterise it at several resolutions.
     pub fn encode(&mut self, list: &DrawList) {
+        self.encode_with_origin(list, (0, 0));
+    }
+
+    /// Replay a draw list shifted by `-origin` in device space.
+    ///
+    /// The shift is applied to every `SetTransform` in the list rather than
+    /// through the rasteriser's `offset`, because `offset` is unsigned and
+    /// describes where the scene origin lands *inside* the target: to put the
+    /// damage rectangle at (x, y) at the target's origin it would have to be
+    /// negative. Composing `translate(-x, -y)` with the list's own transforms
+    /// moves the whole scene instead, and the target's smaller size cuts it
+    /// back down to the rectangle.
+    ///
+    /// The background fill is issued under the same shift, so it still covers
+    /// every pixel of the target. It is the full frame's rectangle, not the
+    /// damage rectangle's, which is larger than needed and deliberately simple:
+    /// the excess is clipped away by the target and the extra coverage would be
+    /// cut off anyway.
+    pub fn encode_with_origin(&mut self, list: &DrawList, origin: (u16, u16)) {
+        let shift = rustim_math::Affine::translate((-f64::from(origin.0), -f64::from(origin.1)));
         self.ctx.reset();
         self.text_error = None;
+        self.ctx.set_transform(shift);
         if let Some(bg) = list.background {
             self.ctx.set_paint(bg);
             self.ctx.fill_rect(&rustim_math::Rect::new(
@@ -74,7 +104,7 @@ impl CpuRenderer {
         for op in &list.ops {
             match op {
                 DrawOp::SetPaint(color) => self.ctx.set_paint(*color),
-                DrawOp::SetTransform(affine) => self.ctx.set_transform(*affine),
+                DrawOp::SetTransform(affine) => self.ctx.set_transform(shift * *affine),
                 DrawOp::FillPath(path) => self.ctx.fill_path(path),
                 DrawOp::StrokePath { path, width } => {
                     self.ctx
@@ -117,6 +147,122 @@ impl CpuRenderer {
             }
         }
     }
+
+    /// Validate the list's size and bring the persistent target to it.
+    fn prepare(&mut self, list: &DrawList) -> Result<(), RenderError> {
+        if list.width == 0 || list.height == 0 {
+            return Err(RenderError::BadSize(list.width, list.height));
+        }
+        if (list.width, list.height) != (self.width, self.height) {
+            self.resize(list.width, list.height);
+        }
+        Ok(())
+    }
+
+    fn frame_pixels(&self, list: &DrawList) -> u64 {
+        u64::from(list.width) * u64::from(list.height)
+    }
+
+    fn take_text_error(&mut self) -> Result<(), RenderError> {
+        match self.text_error.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Rasterise one rectangle of `list` into the persistent pixmap.
+    fn render_region(
+        &mut self,
+        list: &DrawList,
+        rect: PixelRect,
+        frame: u64,
+    ) -> Result<RenderStats, RenderError> {
+        self.prepare(list)?;
+        let rect = PixelRect::new(
+            rect.x0.min(self.width),
+            rect.y0.min(self.height),
+            rect.x1.min(self.width),
+            rect.y1.min(self.height),
+        );
+        if rect.is_empty() {
+            return Ok(RenderStats { painted: 0, frame });
+        }
+        // A rectangle that happens to be the whole frame is the full path; it
+        // avoids allocating a scratch target the size of the frame.
+        if rect.width() == self.width && rect.height() == self.height {
+            self.encode(list);
+            self.ctx.flush();
+            self.ctx.render(self.pixmap.as_mut(), &mut self.resources);
+            self.take_text_error()?;
+            return Ok(RenderStats {
+                painted: frame,
+                frame,
+            });
+        }
+        // `damage_since` refuses to produce a region for a transparent
+        // background, because there would be nothing to clear the region to.
+        // A caller that built such a `Damage` by hand gets a full frame rather
+        // than stale pixels.
+        let Some(background) = list.background else {
+            return self.render_damaged(list, Damage::Full);
+        };
+
+        let (w, h) = (rect.width(), rect.height());
+        if self
+            .scratch
+            .as_ref()
+            .is_none_or(|p| (p.width(), p.height()) != (w, h))
+        {
+            self.scratch = Some(Pixmap::new(w, h));
+        }
+        self.encode_with_origin(list, (rect.x0, rect.y0));
+        self.ctx.flush();
+        // `Clear`, not `SrcOver`: the scratch is reused from one damaged frame
+        // to the next, so it still holds the previous one's pixels, and an
+        // object that left the rectangle must not leave its ghost behind.
+        // Clearing to the background reproduces exactly the pixels a full
+        // render would have produced there, because the full render also
+        // starts from an opaque background.
+        let settings = RasterizerSettings {
+            target_init: TargetInit::Clear(background),
+            ..RasterizerSettings::default()
+        };
+        self.ctx.render_with(
+            self.scratch
+                .as_mut()
+                .expect("the scratch target was allocated just above"),
+            &mut self.resources,
+            settings,
+        );
+        copy_region(
+            &mut self.pixmap,
+            self.scratch
+                .as_ref()
+                .expect("the scratch target was allocated just above"),
+            rect,
+        );
+        self.take_text_error()?;
+        Ok(RenderStats {
+            painted: u64::from(w) * u64::from(h),
+            frame,
+        })
+    }
+}
+
+/// Copy the scratch's whole contents into `dst` at `(rect.x0, rect.y0)`.
+///
+/// Row by row: the two buffers have different widths, so there is no single
+/// contiguous copy to make.
+fn copy_region(dst: &mut Pixmap, src: &Pixmap, rect: PixelRect) {
+    let dst_stride = usize::from(dst.width()) * 4;
+    let src_stride = usize::from(src.width()) * 4;
+    let row_bytes = usize::from(rect.width()) * 4;
+    let (dst, src) = (dst.data_as_u8_slice_mut(), src.data_as_u8_slice());
+    for row in 0..usize::from(rect.height()) {
+        let d = (usize::from(rect.y0) + row) * dst_stride + usize::from(rect.x0) * 4;
+        let s = row * src_stride;
+        dst[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+    }
 }
 
 impl Renderer for CpuRenderer {
@@ -141,12 +287,7 @@ impl Renderer for CpuRenderer {
     }
 
     fn render(&mut self, list: &DrawList) -> Result<(), RenderError> {
-        if list.width == 0 || list.height == 0 {
-            return Err(RenderError::BadSize(list.width, list.height));
-        }
-        if (list.width, list.height) != (self.width, self.height) {
-            self.resize(list.width, list.height);
-        }
+        self.prepare(list)?;
         self.encode(list);
         // Required before `render` whenever the `multithreading` feature is on:
         // the parallel dispatcher batches work and panics with "attempted to
@@ -157,9 +298,27 @@ impl Renderer for CpuRenderer {
         self.ctx.render(self.pixmap.as_mut(), &mut self.resources);
         // After rasterising, never instead of it: the frame is usable, and the
         // error says it is missing a glyph. See `text_error`.
-        match self.text_error.take() {
-            Some(e) => Err(e),
-            None => Ok(()),
+        self.take_text_error()
+    }
+
+    fn render_damaged(
+        &mut self,
+        list: &DrawList,
+        damage: Damage,
+    ) -> Result<RenderStats, RenderError> {
+        let frame = self.frame_pixels(list);
+        match damage {
+            // The whole point of the type: an idle frame does not touch the
+            // rasteriser or the pixel buffer at all.
+            Damage::None => Ok(RenderStats { painted: 0, frame }),
+            Damage::Full => {
+                self.render(list)?;
+                Ok(RenderStats {
+                    painted: frame,
+                    frame,
+                })
+            }
+            Damage::Region(rect) => self.render_region(list, rect, frame),
         }
     }
 
@@ -357,5 +516,167 @@ mod tests {
         assert_eq!(*alpha, 255, "background must keep the frame opaque");
         assert!(*red > 100 && *red < 230, "expected a blend, got red={red}");
         assert!(*green < 60, "green should stay near the background");
+    }
+
+    // ---- incremental rendering -------------------------------------------
+
+    /// A 32x32 frame with two filled squares; `second` is the colour of the
+    /// lower-right one, so changing it damages only that corner.
+    fn two_square_frame(second: rustim_color::Srgb) -> DrawList {
+        let mut list = DrawList::new(32, 32);
+        list.background = Some(rustim_color::BG);
+        list.push(DrawOp::SetTransform(Affine::IDENTITY));
+        list.push(DrawOp::SetPaint(rustim_color::BLUE));
+        list.push(DrawOp::FillPath(rect_path(Rect::new(2.0, 2.0, 8.0, 8.0))));
+        list.push(DrawOp::SetPaint(second));
+        list.push(DrawOp::FillPath(rect_path(Rect::new(
+            20.0, 20.0, 28.0, 28.0,
+        ))));
+        list
+    }
+
+    /// The property the whole feature rests on: a region render produces the
+    /// same pixels a full render would, everywhere.
+    #[test]
+    fn a_region_render_matches_a_full_render_pixel_for_pixel() {
+        let old = two_square_frame(rustim_color::RED);
+        let new = two_square_frame(rustim_color::YELLOW);
+        let damage = new.damage_since(&old);
+        assert!(
+            matches!(damage, Damage::Region(_)),
+            "expected a region, got {damage:?}"
+        );
+
+        let mut incremental = CpuRenderer::new(32, 32);
+        incremental.render(&old).unwrap();
+        let stats = incremental.render_damaged(&new, damage).unwrap();
+        // The acceptance criterion as an assertion: the repainted area is
+        // visible, and it shrank.
+        assert!(!stats.is_full(), "{stats:?}");
+        assert!(stats.painted * 4 < stats.frame, "{stats:?}");
+
+        let mut full = CpuRenderer::new(32, 32);
+        full.render(&new).unwrap();
+        assert_eq!(
+            incremental.pixels(),
+            full.pixels(),
+            "an incremental frame must be indistinguishable from a full one"
+        );
+    }
+
+    /// A rotated shape is the case where "translate the scene by the region
+    /// origin" could plausibly move an antialiased edge by a fraction of a
+    /// pixel: every coverage value is computed from fractional coordinates, and
+    /// a region render sees the same geometry at a different offset. It must
+    /// not — the shift is an integer, so the coverage of every pixel inside the
+    /// region is bit-identical to the full render's.
+    #[test]
+    fn a_region_render_of_a_rotated_shape_matches_a_full_one_exactly() {
+        fn frame(colour: rustim_color::Srgb) -> DrawList {
+            let mut list = DrawList::new(32, 32);
+            list.background = Some(rustim_color::BG);
+            list.push(DrawOp::SetTransform(
+                Affine::translate((16.0, 16.0)) * Affine::rotate(0.37),
+            ));
+            list.push(DrawOp::SetPaint(colour));
+            list.push(DrawOp::FillPath(rect_path(Rect::new(-9.0, -9.0, 9.0, 9.0))));
+            list
+        }
+
+        let old = frame(rustim_color::RED);
+        let new = frame(rustim_color::YELLOW);
+        let damage = new.damage_since(&old);
+        assert!(matches!(damage, Damage::Region(_)), "{damage:?}");
+
+        let mut incremental = CpuRenderer::new(32, 32);
+        incremental.render(&old).unwrap();
+        incremental.render_damaged(&new, damage).unwrap();
+
+        let mut full = CpuRenderer::new(32, 32);
+        full.render(&new).unwrap();
+        assert_eq!(
+            incremental.pixels(),
+            full.pixels(),
+            "an integer shift must not change antialiased coverage"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_frame_does_not_touch_the_pixels() {
+        let frame = two_square_frame(rustim_color::RED);
+        let mut r = CpuRenderer::new(32, 32);
+        r.render(&frame).unwrap();
+        let before = r.pixels().to_vec();
+        let stats = r
+            .render_damaged(&frame, frame.damage_since(&frame))
+            .unwrap();
+        assert_eq!(stats.painted, 0);
+        assert_eq!(r.pixels(), &before[..]);
+    }
+
+    #[test]
+    fn a_region_erases_an_object_that_left_it() {
+        // The scratch target is reused, so a region render must clear it: a
+        // full render would not show the deleted square either.
+        let old = two_square_frame(rustim_color::RED);
+        let mut new = old.clone();
+        new.ops.pop();
+        new.ops.pop();
+        let damage = new.damage_since(&old);
+        assert!(matches!(damage, Damage::Region(_)), "{damage:?}");
+
+        let mut incremental = CpuRenderer::new(32, 32);
+        incremental.render(&old).unwrap();
+        incremental.render_damaged(&new, damage).unwrap();
+
+        let mut full = CpuRenderer::new(32, 32);
+        full.render(&new).unwrap();
+        assert_eq!(incremental.pixels(), full.pixels());
+    }
+
+    #[test]
+    fn a_region_crossing_the_frame_edge_is_clipped_not_wrapped() {
+        let ops = |c: rustim_color::Srgb| {
+            vec![
+                DrawOp::SetTransform(Affine::IDENTITY),
+                DrawOp::SetPaint(c),
+                DrawOp::FillPath(rect_path(Rect::new(26.0, 26.0, 36.0, 36.0))),
+            ]
+        };
+        let mut old = DrawList::new(32, 32);
+        old.background = Some(rustim_color::BG);
+        old.ops = ops(rustim_color::RED);
+        let mut new = old.clone();
+        new.ops = ops(rustim_color::YELLOW);
+        let damage = new.damage_since(&old);
+        let Damage::Region(r) = damage else {
+            panic!("expected a region, got {damage:?}");
+        };
+        assert_eq!((r.x1, r.y1), (32, 32), "the region must stop at the frame");
+
+        let mut incremental = CpuRenderer::new(32, 32);
+        incremental.render(&old).unwrap();
+        incremental.render_damaged(&new, damage).unwrap();
+        let mut full = CpuRenderer::new(32, 32);
+        full.render(&new).unwrap();
+        assert_eq!(incremental.pixels(), full.pixels());
+    }
+
+    #[test]
+    fn a_region_that_covers_the_frame_takes_the_full_path() {
+        let old = two_square_frame(rustim_color::RED);
+        let mut new = old.clone();
+        new.background = Some(rustim_color::BLUE);
+        let mut r = CpuRenderer::new(32, 32);
+        r.render(&old).unwrap();
+        // A full-frame rectangle is legal even though `damage_since` would have
+        // said `Full`; it must render, not be treated as empty.
+        let stats = r
+            .render_damaged(&new, Damage::Region(PixelRect::frame(32, 32)))
+            .unwrap();
+        assert!(stats.is_full());
+        let mut full = CpuRenderer::new(32, 32);
+        full.render(&new).unwrap();
+        assert_eq!(r.pixels(), full.pixels());
     }
 }

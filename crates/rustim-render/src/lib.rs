@@ -17,7 +17,7 @@
 pub mod draw;
 pub mod vello_cpu_backend;
 
-pub use draw::{DrawList, DrawOp};
+pub use draw::{Damage, DrawList, DrawOp, PixelRect};
 /// Re-exported because it is a [`DrawOp`] payload: a caller building a glyph run
 /// should not have to reach into `rustim-math` for the type the field is.
 pub use rustim_math::TextGlyph;
@@ -47,6 +47,27 @@ pub enum RenderError {
     GlyphsSkipped { index: usize, count: usize },
 }
 
+/// What a render actually did.
+///
+/// `painted` is the point of the type: it is the area the rasteriser had to
+/// compute, not the frame's area, and a test can assert that it fell. Frame
+/// time is the wrong witness — it moves with the machine, the clock and the
+/// scheduler — while this number is the thing the damage rectangle controls.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RenderStats {
+    /// Pixels rasterised by this call.
+    pub painted: u64,
+    /// Pixels in the whole frame.
+    pub frame: u64,
+}
+
+impl RenderStats {
+    /// Everything was repainted.
+    pub fn is_full(&self) -> bool {
+        self.painted == self.frame
+    }
+}
+
 /// A thing that can turn a [`DrawList`] into pixels.
 ///
 /// Deliberately synchronous and sans I/O. Presenting those pixels to a window is
@@ -58,6 +79,28 @@ pub trait Renderer {
 
     /// Rasterise `list` into this renderer's own pixel buffer.
     fn render(&mut self, list: &DrawList) -> Result<(), RenderError>;
+
+    /// Rasterise only what [`DrawList::damage_since`] says changed.
+    ///
+    /// The default is correct for any backend that cannot cut out a region: it
+    /// renders the whole list and reports the whole frame. `Damage::None` is
+    /// honoured everywhere, and is the case that matters even for a backend
+    /// that cannot do regions — an idle frame costs nothing.
+    fn render_damaged(
+        &mut self,
+        list: &DrawList,
+        damage: Damage,
+    ) -> Result<RenderStats, RenderError> {
+        let frame = u64::from(list.width) * u64::from(list.height);
+        if damage == Damage::None {
+            return Ok(RenderStats { painted: 0, frame });
+        }
+        self.render(list)?;
+        Ok(RenderStats {
+            painted: frame,
+            frame,
+        })
+    }
 
     /// The rendered pixels: RGBA8, **premultiplied** alpha, tightly packed.
     fn pixels(&self) -> &[u8];

@@ -36,7 +36,7 @@ use rustim_app::a11y::{A11y, Request};
 use rustim_app::{AppEvent, Intent, feed, input};
 use rustim_math::{Affine2, BezPath, Camera, Point, Viewport, bezier};
 use rustim_mobject::{Mobject, NodeId, NodeKind, Style};
-use rustim_render::{CpuRenderer, DrawList, DrawOp, RenderError, Renderer};
+use rustim_render::{CpuRenderer, Damage, DrawList, DrawOp, RenderError, RenderStats, Renderer};
 use rustim_scene::command::Command;
 use rustim_scene::{Scene, SceneContext};
 use rustim_text::{FontProvider, ShapedText, TextStyle};
@@ -1291,6 +1291,38 @@ fn blit(src: &[u8], dst: &mut [u32]) {
     }
 }
 
+/// Present the part of the frame that changed.
+///
+/// `dst` is softbuffer's buffer and `src` the renderer's, and their widths agree
+/// because `Resized` resizes both. `Damage::None` is the case that matters most:
+/// an idle scene presents nothing at all, so the window keeps the last image.
+fn blit_damage(src: &[u8], dst: &mut [u32], frame_width: u16, damage: Damage) {
+    let Damage::Region(r) = damage else {
+        if damage == Damage::Full {
+            blit(src, dst);
+        }
+        return;
+    };
+    let stride = usize::from(frame_width);
+    if stride == 0 {
+        return;
+    }
+    let rows = dst.len() / stride;
+    let x1 = usize::from(r.x1).min(stride);
+    let x0 = usize::from(r.x0).min(x1);
+    let y1 = usize::from(r.y1).min(rows);
+    let y0 = usize::from(r.y0).min(y1);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let s = (y * stride + x) * 4;
+            let Some(px) = src.get(s..s + 4) else {
+                continue;
+            };
+            dst[y * stride + x] = u32::from(px[0]) << 16 | u32::from(px[1]) << 8 | u32::from(px[2]);
+        }
+    }
+}
+
 fn build_frame(scene: &mut dyn Scene, ctx: &mut SceneContext, list: &mut DrawList, dt: f64) {
     scene.update(dt, ctx);
     // Through the scene, not straight through the context: a scene may have
@@ -1391,6 +1423,15 @@ struct App {
     title: String,
     renderer: CpuRenderer,
     list: DrawList,
+    /// The frame currently in the renderer's pixel buffer, for
+    /// [`DrawList::damage_since`]. Swapped with `list` after a frame is
+    /// presented, so the buffer being rebuilt and the frame it is compared
+    /// against ping-pong rather than allocate.
+    prev: DrawList,
+    /// What the last frame actually rasterised, for the frame-rate line. A
+    /// region render is the claim that this number falls; the log is the only
+    /// place that claim is visible while the engine runs.
+    stats: RenderStats,
     scene: Box<dyn Scene>,
     ctx: SceneContext,
     /// Commands produced by the keyboard or by assistive technology, applied at
@@ -1693,14 +1734,21 @@ impl ApplicationHandler<AppEvent> for App {
                 // not coerce to `&mut dyn Scene` in argument position without the
                 // reborrow.
                 build_frame(&mut *self.scene, &mut self.ctx, &mut self.list, dt);
+                // What changed since the frame in the pixel buffer. An idle
+                // scene — paused, or a script that has finished — produces
+                // `None`, and the frame loop then skips both the rasteriser and
+                // the blit. A one-property change produces the union of the old
+                // and new bounds, and only those pixels are recomputed.
+                let damage = self.list.damage_since(&self.prev);
                 // A frame that could not be rasterised must not be blitted — the
                 // pixel buffer still holds the *previous* frame, so presenting it
                 // would show a stale image as if it were current. A frame that
                 // was rasterised but is missing a glyph is presented, because it
                 // is a true picture of the scene minus one glyph, and the
                 // complaint is reported instead.
-                let rasterised = match self.renderer.render(&self.list) {
-                    Ok(()) => {
+                let rasterised = match self.renderer.render_damaged(&self.list, damage) {
+                    Ok(stats) => {
+                        self.stats = stats;
                         self.report_text_error(None);
                         true
                     }
@@ -1713,12 +1761,17 @@ impl ApplicationHandler<AppEvent> for App {
                         false
                     }
                 };
-                if rasterised
-                    && let Some(w) = self.windowed.as_mut()
-                    && let Ok(mut buf) = w.surface.buffer_mut()
-                {
-                    blit(self.renderer.pixels(), &mut buf);
-                    let _ = buf.present();
+                if rasterised {
+                    if let Some(w) = self.windowed.as_mut()
+                        && let Ok(mut buf) = w.surface.buffer_mut()
+                    {
+                        blit_damage(self.renderer.pixels(), &mut buf, self.list.width, damage);
+                        let _ = buf.present();
+                    }
+                    // Only now is `prev` the frame that is on screen. An error
+                    // leaves it alone, so the next attempt is compared against
+                    // what the window still shows.
+                    std::mem::swap(&mut self.list, &mut self.prev);
                 }
                 self.render_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
 
@@ -1752,10 +1805,15 @@ impl ApplicationHandler<AppEvent> for App {
                     note(
                         self.reply,
                         format_args!(
-                            "frame {:>5}  {mean:.2} ms/frame  ({:.0} fps)  {} ops  focus {}",
+                            "frame {:>5}  {mean:.2} ms/frame  ({:.0} fps)  {} ops  \
+                             {} px repainted  focus {}",
                             self.frame,
                             1000.0 / mean.max(1e-9),
-                            self.list.ops.len(),
+                            // `prev`, not `list`: the lists were swapped when
+                            // the frame was presented, and the one on screen is
+                            // the one this line describes.
+                            self.prev.ops.len(),
+                            self.stats.painted,
                             self.windowed
                                 .as_ref()
                                 .and_then(|w| w.a11y.focused())
@@ -2012,6 +2070,11 @@ fn main() {
         title: format!("rustim — {scene_name}"),
         renderer: CpuRenderer::new(WIDTH, HEIGHT),
         list: DrawList::new(WIDTH, HEIGHT),
+        // A zero-sized list of no ops: whatever the first frame is, its size
+        // differs and `damage_since` says `Full`. The renderer's buffer has no
+        // pixels yet, so that is exactly right.
+        prev: DrawList::default(),
+        stats: RenderStats::default(),
         scene,
         ctx,
         queued: Vec::new(),
