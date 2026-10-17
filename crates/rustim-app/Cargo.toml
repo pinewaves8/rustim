@@ -14,6 +14,9 @@ rustim-anim.workspace = true
 rustim-render.workspace = true
 rustim-export.workspace = true
 rustim-scene.workspace = true
+# Shared with the browser build: the app's `pythagorean` scene is this crate's
+# `Pythagorean`, so the desktop golden and the canvas pixels are one construction.
+rustim-scenes.workspace = true
 # Text shaping. Only this crate links it: `rustim-render` must not (it would drag
 # parley into the `wasm32-unknown-unknown` kernel build), and `rustim-text` must
 # not link a renderer. The app is where the two sides meet, which is why it is

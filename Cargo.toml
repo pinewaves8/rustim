@@ -9,6 +9,7 @@ members = [
     "crates/rustim-scene",
     "crates/rustim-render",
     "crates/rustim-export",
+    "crates/rustim-scenes",
     "crates/rustim-app",
 ]
 # Throwaway Phase-0 probes with their own target dirs; not part of the engine.
@@ -29,6 +30,7 @@ rustim-text = { path = "crates/rustim-text" }
 rustim-scene = { path = "crates/rustim-scene" }
 rustim-render = { path = "crates/rustim-render" }
 rustim-export = { path = "crates/rustim-export" }
+rustim-scenes = { path = "crates/rustim-scenes" }
 
 # Pinned to versions verified on 2026-10-16 (see 方案建议.md 3.6).
 kurbo = "0.13.1"

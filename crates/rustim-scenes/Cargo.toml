@@ -1,0 +1,18 @@
+[package]
+name = "rustim-scenes"
+description = "Scenes shared by every host: the windowed app, the exporter and the browser build."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A scene is semantic kernel plus colour, exactly like the demo scenes that
+# still live in `rustim-app`. Nothing here renders, reads a file or names a
+# windowing API, so the same `construct` runs in a window, in the exporter and
+# under `wasm32-unknown-unknown`.
+[dependencies]
+rustim-math.workspace = true
+rustim-color.workspace = true
+rustim-mobject.workspace = true
+rustim-anim.workspace = true
+rustim-scene.workspace = true

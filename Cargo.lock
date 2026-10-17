@@ -3141,6 +3141,7 @@ dependencies = [
  "rustim-mobject",
  "rustim-render",
  "rustim-scene",
+ "rustim-scenes",
  "rustim-text",
  "serde_json",
  "softbuffer",
@@ -3209,6 +3210,17 @@ dependencies = [
  "rustim-render",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustim-scenes"
+version = "0.0.0"
+dependencies = [
+ "rustim-anim",
+ "rustim-color",
+ "rustim-math",
+ "rustim-mobject",
+ "rustim-scene",
 ]
 
 [[package]]
