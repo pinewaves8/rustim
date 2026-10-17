@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **408 tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **423 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all eight golden scenes match their checked-in
@@ -162,7 +162,7 @@ from, which is why `/media` is in `.gitignore`. Render a reference frame with:
 
 **Manim numerical parity (`rustim-math`).** `crates/rustim-math/src/bezier.rs` and `space_ops.rs` are
 literal ports of `manim.utils.bezier` and `manim.utils.space_ops`, and
-`crates/rustim-math/tests/manim_parity.rs` replays **439 recorded Manim results** against them
+`crates/rustim-math/tests/manim_parity.rs` replays **495 recorded Manim results** against them
 (`tests/fixtures/manim-{bezier,geometry,space-ops}.json`, checked in — the suite needs no Python).
 The acceptance rule is `1e-9` absolute on every coordinate, with no "close enough" allowances: the
 ports reproduce Manim's *rounding paths*, not just its formulas, which is the only way the numbers
@@ -273,7 +273,7 @@ last property.
 | `rustim-math` | Points, `Affine2`, rate functions, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`), stable `NodeId`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
-| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `FadeOut`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `CameraMove`, `Wait` | Real |
+| `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform`, `CameraMove`, `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
@@ -957,6 +957,31 @@ otherwise. (Related: math typesets a Latin letter as the *mathematical italic* c
 becomes U+1D465 — so a label taken from the shaped glyph is not the character the author typed,
 which is what makes the source slice worth preferring at all.)
 
+**A partial range that lands exactly on a curve boundary keeps *eight* points, not four.**
+`integer_interpolate(0, n, 1/n)` returns `(1, 0.0)`: the index is the curve you are *on*, and its residue
+is inclusive at the start, so the boundary belongs to the upper curve. `partial_path_points` over
+exactly one third of a three-curve path is therefore the whole first curve plus a second curve
+collapsed onto its start — the point before and the point after the boundary are the same coordinate,
+and the array is 8 long. (It only reads wrong if you expect "a third of the path" to mean "a third of
+the points"; every Manim renderer draws the same 8-point spelling and cannot tell.) Two ends of the
+same contract: `b <= a` is a degenerate four-point curve rather than an error — `Uncreate` reaches it
+at its final frame, where the removal follows immediately — and a **ragged** array (not a multiple of
+four) is returned unchanged, because there is no curve to split. The parity group is what pins all
+three; a hand-written test of `(0.25, 0.75)` alone would not have told you the boundary rule.
+
+**`Uncreate` reverses outside the rate function, and the difference is visible for asymmetric curves.**
+Manim composes the reversal *inside* it — a per-submobject alpha of `rate_func(1 - raw)`
+(`animation/animation.py:385-391`), with `Create._get_bounds` still returning `(0, alpha)` — because
+its `Animation` owns the raw clock value; this engine's scheduler hands an animation an alpha that is
+already eased, so the port can only write `1 - rate(raw)`. The two agree exactly for every curve that
+is **point-symmetric** about `(0.5, 0.5)`, i.e. `f(1 - t) == 1 - f(t)` — `linear`, `ease_in_out` and
+`smooth` are — and differ for `ease_in`, `ease_out` and `overshoot`, so under those the erase has
+different timing from Manim's. It is documented on the type rather than hidden, and it is the
+constraint the "~40 rate functions" item has to respect: a new rate function is not automatically
+available to `Uncreate` with Manim's timing. Recovering `raw` is not an option — it would need the
+inverse of a curve that is not injective (`overshoot`), and a numerical inverse would not be
+bit-identical anyway.
+
 ## Where the workspace diverges from the tutorial
 
 The tutorial puts everything in a flat `src/` (`main.rs`, `mobject.rs`, `animation.rs`, `scene.rs`,
@@ -1026,7 +1051,7 @@ weeks later.
 
 | | P1 step | State |
 |---|---|---|
-| 1 | Numerical parity against Manim (439 cases at 1e-9) | done — see "Commands" |
+| 1 | Numerical parity against Manim (495 cases at 1e-9) | done — see "Commands" |
 | 2 | Golden-image suite: per-platform baselines, CI job (eight scenes now) | done — see "Golden images" |
 | 3 | Accessibility: structure + full keyboard + throttled announcements | done — see "Accessibility" |
 | 4 | Text: `parley` end to end (string → glyphs → screen), bundled CJK, measured font size | done — see "Text" |
@@ -1247,12 +1272,11 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   turned arrow was announced as "长度 2.49" rather than 3, because the measurement fell back to the
   bounding box — see "Accessibility" for the diameter rule that replaced it, and note that the test
   now asserts on a *rotated* arrow, since the unrotated one gave the right answer by coincidence.
-  Deferred at the time, since landed: **strokes in the mobject model** (see "Strokes").
-  Deferred on purpose: `Create`/`Uncreate` (needs
-  `pointwise_become_partial`), `Rotating` (an animation that never ends makes `is_playing`
-  permanently true, which every "react when the timeline drains" scene depends on), `path_arc` for a
-  straight move, `FadeIn`'s `shift`/`scale`, and axes and plots — **the last two have since
-  landed** with P3's camera ("P3's coordinate systems are done").
+  Deferred at the time, since landed: **strokes in the mobject model** (see "Strokes") and
+  `Create`/`Uncreate` (see "P3's Create/Uncreate"). Deferred on purpose: `Rotating` (an animation
+  that never ends makes `is_playing` permanently true, which every "react when the timeline drains"
+  scene depends on), `path_arc` for a straight move, and `FadeIn`'s `shift`/`scale`; axes and plots
+  landed with P3's camera ("P3's coordinate systems are done").
 - **The command feed — the first slice of P3's "AI command surface at full width" — is done**, and it
   is the step that made the engine *drivable* rather than merely scriptable: `--script` applies a file
   of JSON commands or reads stdin line by line, `--reply` answers each one, and a windowed run takes
@@ -1311,6 +1335,18 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   propagation from `StateDiff` (the draw-list diff already gives the same answer without trusting
   scene bookkeeping), and multi-rectangle damage (one union rectangle is what the scratch-target
   route can express; several disjoint regions would need several renders).
+- **P3's `Create`/`Uncreate` are done** — the first of the remaining-animation items. The math half is
+  `bezier::partial_path_points` / `integer_interpolate`, literal ports of `pointwise_become_partial`
+  covered by a `pointwise_partial` group in `manim-geometry.json` (56 new cases, 145 in that file);
+  the animation half is `rustim_anim::{Create, Uncreate}` and the wire kinds `create`/`uncreate`.
+  **There is no new golden, on purpose**: a settled still cannot show a half-drawn path (the fixed
+  10 s of virtual time always outlives the animation), so a `create` scene would only re-assert
+  "the animation finished" — the evidence is the parity group, the unit tests over the point array,
+  and the command-layer tests. `Uncreate` is the second animation whose effect is after its last
+  frame (after `FadeOut`), so it removes its target in `finish`; reduced motion is covered because
+  `Sequence`'s reduced branch calls `finish` too. Deferred: `Create` over a *group* (each child would
+  need its own prefix, which is `align_submobjects` territory), and Manim's per-submobject
+  `rate_func` staggering, which is the `lag_ratio` item.
 - **P3+** — video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration

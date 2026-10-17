@@ -343,6 +343,105 @@ pub fn partial_bezier_points(points: &[Point], a: f64, b: f64) -> Vec<Point> {
     }
 }
 
+/// Manim's `integer_interpolate`: an integer index between `start` and `end`,
+/// plus the fraction of the way from that index to the next.
+///
+/// This is the index arithmetic [`partial_path_points`] is built on, and the two
+/// endpoint cases are the part a re-derivation gets wrong: `alpha >= 1` returns
+/// `end - 1` with residue `1.0` (not `end`), and `alpha <= 0` returns `start`
+/// with residue `0.0`. Both exist so the *last* curve still ends at its own far
+/// endpoint instead of one index past the array.
+///
+/// Returned as `i64` because that is what Python's `int()` produces for a
+/// negative `start`; every caller here passes `start = 0`, but a truncating cast
+/// to an unsigned type would turn a negative index into a huge one.
+pub fn integer_interpolate(start: f64, end: f64, alpha: f64) -> (i64, f64) {
+    if alpha >= 1.0 {
+        return (end as i64 - 1, 1.0);
+    }
+    if alpha <= 0.0 {
+        return (start as i64, 0.0);
+    }
+    // Python's `int()` truncates toward zero, which is Rust's `as` cast for a
+    // finite float. `interpolate(start, end, alpha)` is `start + (end-start)*alpha`.
+    let value = (start + (end - start) * alpha) as i64;
+    // Python's float `%` is non-negative for a positive divisor; so is Rust's
+    // here, because both operands are positive for every caller.
+    let residue = ((end - start) * alpha) % 1.0;
+    (value, residue)
+}
+
+/// The portion of a whole Manim path between parameters `a` and `b`, in Manim's
+/// flat point layout.
+///
+/// A literal port of `VMobject.pointwise_become_partial`
+/// (`manim/mobject/types/vectorized_mobject.py:1990`), which is what
+/// [`crate::bezier`]'s `partial_bezier_points` is to a single curve. `Create`
+/// and `Uncreate` drive this: at progress `alpha` the object wears the first
+/// `alpha` fraction of its own path, and the *last* frame writes the whole
+/// array back unchanged.
+///
+/// Three parts make up the result, and the middle one is why this is not
+/// simply "split the curve at `a` and `b`": the interval can begin inside one
+/// curve and end inside another, so the output is
+/// `partial(first, lower_residue, 1) ++ whole curves between ++ partial(last, 0,
+/// upper_residue)`. A path is split into `len / 4` curves; the remainder of the
+/// division is what `integer_interpolate` turns into `(index, residue)`.
+///
+/// Like Manim, `a <= 0 && b >= 1` copies the array before doing any arithmetic,
+/// so a full range is **bit-identical** to the input rather than a re-evaluated
+/// Bézier. That is what makes `Create`'s last frame an exact restore.
+///
+/// Two cases Manim does not promise are given a defined answer rather than a
+/// panic:
+///
+/// * A **ragged** array (`len % 4 != 0`) is returned unchanged — there is no
+///   curve to split, and this workspace's builders always emit whole curves.
+/// * `b <= a` collapses the path onto the point at `a` (a degenerate four-point
+///   curve), the same shape `a == b` produces. `Create` never asks for it;
+///   `Uncreate` reaches it only at its final frame, where the removal follows
+///   immediately. Manim raises on the equivalent numpy assignment.
+pub fn partial_path_points(points: &[Point], a: f64, b: f64) -> Vec<Point> {
+    if a <= 0.0 && b >= 1.0 {
+        return points.to_vec();
+    }
+    if !points.len().is_multiple_of(POINTS_PER_CURVE) {
+        return points.to_vec();
+    }
+    let num_curves = points.len() / POINTS_PER_CURVE;
+    if num_curves == 0 {
+        return points.to_vec();
+    }
+    let nppcc = POINTS_PER_CURVE;
+    let (lower_index, lower_residue) = integer_interpolate(0.0, num_curves as f64, a);
+    let (upper_index, upper_residue) = integer_interpolate(0.0, num_curves as f64, b);
+    let lower = lower_index.max(0).min(num_curves as i64 - 1) as usize;
+    let upper = upper_index.max(0).min(num_curves as i64 - 1) as usize;
+
+    if b <= a {
+        let curve = &points[nppcc * lower..nppcc * (lower + 1)];
+        return partial_bezier_points(curve, lower_residue, lower_residue);
+    }
+    if lower == upper {
+        let curve = &points[nppcc * lower..nppcc * (lower + 1)];
+        return partial_bezier_points(curve, lower_residue, upper_residue);
+    }
+
+    let mut out = Vec::with_capacity(nppcc * (upper - lower + 1));
+    out.extend(partial_bezier_points(
+        &points[nppcc * lower..nppcc * (lower + 1)],
+        lower_residue,
+        1.0,
+    ));
+    out.extend_from_slice(&points[nppcc * (lower + 1)..nppcc * upper]);
+    out.extend(partial_bezier_points(
+        &points[nppcc * upper..nppcc * (upper + 1)],
+        0.0,
+        upper_residue,
+    ));
+    out
+}
+
 /// Split a Bézier curve at `t`, returning the first curve's control points
 /// followed by the second's.
 ///
@@ -1739,5 +1838,130 @@ mod tests {
             pt(0.0, 0.0),
             pt(POINT_EQUALITY_ATOL / 2.0, 0.0)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // partial_path_points
+    // -----------------------------------------------------------------------
+
+    /// Two straight curves, written in Manim's flat layout: the second curve
+    /// restates the first's endpoint as its own start.
+    fn two_curves() -> Vec<Point> {
+        points_as_corners(&[pt(0.0, 0.0), pt(3.0, 1.0), pt(6.0, 0.5)])
+    }
+
+    /// Manim's own docstring example: `integer_interpolate(0, 10, 0.46)` is
+    /// `(4, 0.6)`.
+    #[test]
+    fn integer_interpolate_matches_manims_example() {
+        let (index, residue) = integer_interpolate(0.0, 10.0, 0.46);
+        assert_eq!(index, 4);
+        assert!((residue - 0.6).abs() < 1e-12, "residue = {residue}");
+    }
+
+    /// The endpoint cases are not limits of the interior formula — they are
+    /// branches, and both win by one: `alpha = 1` is index `end - 1`, not `end`,
+    /// so the last curve is still sliced rather than indexed past the array.
+    #[test]
+    fn integer_interpolate_pins_its_endpoint_branches() {
+        assert_eq!(integer_interpolate(0.0, 10.0, 1.0), (9, 1.0));
+        assert_eq!(integer_interpolate(0.0, 10.0, 1.5), (9, 1.0));
+        assert_eq!(integer_interpolate(0.0, 10.0, 0.0), (0, 0.0));
+        assert_eq!(integer_interpolate(0.0, 10.0, -0.5), (0, 0.0));
+        assert_eq!(integer_interpolate(3.0, 10.0, 0.0), (3, 0.0));
+    }
+
+    /// A full range is a *copy*, so `Create`'s last frame restores the path
+    /// exactly rather than re-evaluating the Béziers and rounding differently.
+    #[test]
+    fn a_full_range_is_the_path_itself() {
+        let pts = two_curves();
+        assert_eq!(partial_path_points(&pts, 0.0, 1.0), pts);
+        assert_eq!(partial_path_points(&pts, -1.0, 2.0), pts);
+    }
+
+    /// At `b = 0.5` the interval ends exactly on the boundary between the two
+    /// curves: the first curve is whole and the second is collapsed onto its own
+    /// start, so the array keeps eight points and the same anchors at both ends.
+    #[test]
+    fn a_range_ending_on_a_curve_boundary_keeps_the_boundary_point() {
+        let pts = two_curves();
+        let got = partial_path_points(&pts, 0.0, 0.5);
+        assert_eq!(got.len(), 2 * POINTS_PER_CURVE);
+        assert_eq!(got[0], pts[0]);
+        assert_eq!(got[3], pts[3], "the first curve ends at the shared anchor");
+        assert_eq!(
+            got[4], pts[3],
+            "the second curve collapsed onto that anchor"
+        );
+        assert_eq!(got[7], pts[3]);
+    }
+
+    /// The middle branch: an interval that starts and ends inside different
+    /// curves gets a partial on each end and the whole curves between them.
+    #[test]
+    fn a_range_across_curves_keeps_the_curves_between_them() {
+        let pts = two_curves();
+        let got = partial_path_points(&pts, 0.25, 0.75);
+        assert_eq!(got.len(), 2 * POINTS_PER_CURVE);
+        // It begins a quarter along the first curve and ends three quarters
+        // along the second; neither end is one of the original anchors.
+        assert!((got[0].x - 1.5).abs() < 1e-12, "{:?}", got[0]);
+        assert!((got[7].x - 4.5).abs() < 1e-12, "{:?}", got[7]);
+    }
+
+    /// A closed three-curve path (a triangle) has three curves, not three
+    /// points; this is the `len / 4` that stops a "third of the path" from being
+    /// read as "third of the array". Two thirds along the first curve is one
+    /// curve's worth of output; **exactly** one third is one whole curve plus a
+    /// collapsed second, because the interior formula lands on index 1 with
+    /// residue 0 and the boundary is inclusive at its start.
+    #[test]
+    fn a_third_of_a_triangle_splits_by_curve_not_by_point() {
+        let triangle = points_as_corners(&[pt(0.0, 0.0), pt(4.0, 0.0), pt(0.0, 3.0), pt(0.0, 0.0)]);
+        assert_eq!(triangle.len(), 3 * POINTS_PER_CURVE);
+
+        let early = partial_path_points(&triangle, 0.0, 0.3);
+        assert_eq!(early.len(), POINTS_PER_CURVE);
+        assert_eq!(early[0], pt(0.0, 0.0));
+        assert!((early[3].x - 3.6).abs() < 1e-12, "{:?}", early[3]);
+
+        let boundary = partial_path_points(&triangle, 0.0, 1.0 / 3.0);
+        assert_eq!(boundary.len(), 2 * POINTS_PER_CURVE);
+        assert_eq!(boundary[3], pt(4.0, 0.0));
+        assert_eq!(boundary[4], pt(4.0, 0.0), "the second curve is degenerate");
+    }
+
+    /// Degenerate ranges are defined rather than panicking, because the
+    /// animation reaches the first one on its final frame and a caller can pass
+    /// anything:
+    /// * an empty range collapses to a four-point degenerate curve at `a`;
+    /// * a ragged array has no curves to split and comes back untouched.
+    #[test]
+    fn degenerate_inputs_have_defined_answers() {
+        let pts = two_curves();
+        let collapsed = partial_path_points(&pts, 0.5, 0.5);
+        assert_eq!(collapsed.len(), POINTS_PER_CURVE);
+        assert!(collapsed.iter().all(|p| *p == pts[4]));
+
+        let ragged = vec![pt(0.0, 0.0), pt(1.0, 0.0), pt(2.0, 0.0)];
+        assert_eq!(partial_path_points(&ragged, 0.0, 0.5), ragged);
+        assert!(partial_path_points(&[], 0.0, 0.5).is_empty());
+    }
+
+    /// Monotone progress walks the path in order: the start point of each range
+    /// never goes backwards along the original curve.
+    #[test]
+    fn partial_paths_advance_along_the_original() {
+        let pts = two_curves();
+        let mut last_end = f64::NEG_INFINITY;
+        for i in 1..=20 {
+            let b = f64::from(i) / 20.0;
+            let got = partial_path_points(&pts, 0.0, b);
+            let end = got.last().copied().unwrap();
+            let x = end.x;
+            assert!(x >= last_end - 1e-12, "went backwards at b = {b}");
+            last_end = x;
+        }
     }
 }

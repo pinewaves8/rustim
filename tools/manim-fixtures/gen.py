@@ -609,6 +609,26 @@ def collect_geometry():
         "up_right": [1.0, 1.0, 0.0],
         "down_left": [-1.0, -1.0, 0.0],
     }
+    # The intervals `Create` and `Uncreate` walk: a full range (the copy
+    # shortcut), a range inside one curve, a range ending exactly on a
+    # curve boundary, a range across curves, and the degenerate empty range
+    # `Uncreate` reaches on its last frame.
+    INPUTS["partial_bounds"] = [
+        [0.0, 0.0],
+        [0.0, 0.25],
+        [0.0, 0.5],
+        [0.25, 0.75],
+        [0.1, 0.9],
+        [0.0, 1.0],
+        [0.75, 1.0],
+        [0.5, 0.5],
+    ]
+
+    def partial(vm, a, b):
+        """`VMobject.pointwise_become_partial` into a fresh object."""
+        dst = VMobject()
+        dst.pointwise_become_partial(vm, a, b)
+        return dst.points
 
     builders = [(name, vm_corners, pts) for name, pts in CORNERS.items()] + [
         (name, vm_cubic, pts) for name, pts in CUBICS.items()
@@ -636,6 +656,12 @@ def collect_geometry():
                 "critical_point",
                 f"{name}@{dname}",
                 lambda vm=vm, d=np.array(d, dtype=float): vm.get_critical_point(d),
+            )
+        for a, b in INPUTS["partial_bounds"]:
+            case(
+                "pointwise_partial",
+                f"{name}@{a},{b}",
+                lambda vm=vm, a=a, b=b: partial(vm, a, b),
             )
 
     # One case per pair, named after the input, so the Rust test can iterate the
@@ -870,7 +896,12 @@ def main(argv):
             "get_smooth_closed_cubic_bezier_handle_points",
             "get_smooth_cubic_bezier_handle_points",
         ],
-        "manim-geometry.json": ["get_arc_length", "critical_point", "align_points"],
+        "manim-geometry.json": [
+            "get_arc_length",
+            "critical_point",
+            "align_points",
+            "pointwise_partial",
+        ],
         "manim-space-ops.json": [
             "normalize",
             "norm_squared",
@@ -921,6 +952,7 @@ def main(argv):
             "arc_samples",
             "critical_directions",
             "align_pairs",
+            "partial_bounds",
         ],
         "manim-space-ops.json": [
             "vectors",

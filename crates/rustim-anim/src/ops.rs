@@ -3,9 +3,10 @@
 //! The shapes the design has to support, one animation each: a scalar
 //! ([`FadeIn`], [`FadeOut`]), an interpolated transform ([`MoveTo`]) — where the
 //! deferred transform pays off directly — a parameterised *rigid* transform whose
-//! parameter is not a matrix entry ([`Rotate`], [`Scale`]), and point arrays
+//! parameter is not a matrix entry ([`Rotate`], [`Scale`]), point arrays
 //! ([`Transform`], the morph), which is what puts Manim's `align_points`
-//! machinery to work.
+//! machinery to work, and a *prefix* of a point array ([`Create`],
+//! [`Uncreate`]), which is `pointwise_become_partial`.
 //!
 //! [`CameraMove`] is the one animation that writes no object at all — it moves
 //! the view — and it is here rather than beside the command layer because it is
@@ -530,6 +531,145 @@ impl Animation for Transform {
         m.opacity = lerp_scalar(start.from_opacity, self.target.opacity, alpha);
         m.style = Style::lerp(start.from_style, self.target.style, alpha);
         m.dirty.style = true;
+    }
+}
+
+/// Draws an object's path on, from its first point to its last.
+///
+/// Manim's `Create` (`animation/creation.py:140`), which is its `ShowPartial`
+/// with bounds `(0, alpha)` (`:133-134`): at progress `alpha` the object wears
+/// the first `alpha` fraction of its own point array, so the path appears to be
+/// traced by a pen. The fraction is measured in **curves**, not points — a
+/// three-curve triangle is one third drawn when its first side is — via
+/// [`bezier::partial_path_points`], the port of `pointwise_become_partial`.
+///
+/// # What it draws, and what it does not
+///
+/// The animation rewrites the target's own `points`, which is exactly right for
+/// every shape builder in `rustim-mobject` (`square`, `circle`, `line`, `plot`,
+/// …). It does **not** recurse into children, for the same reason
+/// [`Transform`]'s alignment does not: a text and a formula mobject have no
+/// points of their own — their geometry is a glyph run or child glyphs — so
+/// `Create` on one of them traces nothing. Drawing a *group* on child by child
+/// is `lag_ratio`'s job and is deferred with it.
+///
+/// # The last frame is a copy
+///
+/// `alpha = 1.0` takes `partial_path_points`' full-range shortcut, which returns
+/// the captured array unchanged rather than re-evaluating each Bézier. So the
+/// object ends **bit-identical** to where it started, which is what lets
+/// `Create` be composed with a later animation without drift.
+///
+/// The captured start is a *clone*, and the tree's array is replaced wholesale
+/// each frame: an interrupted `Create` leaves the object partially drawn, the
+/// same way an interrupted `FadeIn` leaves it partially transparent. Manim's
+/// interruption semantics are not reproduced anywhere in this engine.
+#[derive(Debug, Clone)]
+pub struct Create {
+    target: NodeId,
+    start: Option<Vec<Point>>,
+    duration: f64,
+}
+
+impl Create {
+    pub fn new(target: NodeId) -> Self {
+        Self {
+            target,
+            start: None,
+            duration: 1.0,
+        }
+    }
+
+    pub fn with_duration(mut self, seconds: f64) -> Self {
+        self.duration = seconds;
+        self
+    }
+}
+
+impl Animation for Create {
+    fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    fn begin(&mut self, tree: &SceneTree) {
+        // The whole path, captured once; every frame is a prefix of this.
+        self.start = tree.get(self.target).map(|m| m.points.clone());
+    }
+
+    fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
+        let Some(start) = &self.start else { return };
+        let Some(m) = tree.get_mut(self.target) else {
+            return;
+        };
+        m.points = bezier::partial_path_points(start, 0.0, alpha);
+        m.dirty.geometry = true;
+    }
+}
+
+/// `Create` backwards: the path is erased from its end, then the object is gone.
+///
+/// Manim's `Uncreate` is `Create` with `reverse_rate_function` and `remover`
+/// (`animation/creation.py:180-196`). The removal is the part that matters for
+/// the picture: a partially drawn object left in the tree would be a stale node
+/// in the accessibility tree and in `--inspect`, the same argument `FadeOut`'s
+/// [`Animation::finish`] carries.
+///
+/// # How the reversal is spelled
+///
+/// Manim composes the reverse *inside* the rate function — `rate_func(1 - raw)`
+/// (`animation.py:388-391`) — while this engine's scheduler hands an animation
+/// its already-eased alpha. The port therefore reverses outside:
+/// `interpolate` draws `1 - alpha`, i.e. `1 - rate(raw)`. Manim draws
+/// `rate(1 - raw)`, so the two are identical exactly when the curve is
+/// **point-symmetric** about `(0.5, 0.5)` — `f(1 - t) == 1 - f(t)`, which
+/// `linear`, `ease_in_out` and `smooth` satisfy — and differ for `ease_in`,
+/// `ease_out` and `overshoot`. Recovering `raw` is not an alternative: it needs
+/// the inverse of a curve that is not injective (`overshoot`). Documented rather
+/// than hidden, because "Uncreate is Create in reverse" is only true this
+/// precisely for the curves the engine actually offers.
+#[derive(Debug, Clone)]
+pub struct Uncreate {
+    target: NodeId,
+    start: Option<Vec<Point>>,
+    duration: f64,
+}
+
+impl Uncreate {
+    pub fn new(target: NodeId) -> Self {
+        Self {
+            target,
+            start: None,
+            duration: 1.0,
+        }
+    }
+
+    pub fn with_duration(mut self, seconds: f64) -> Self {
+        self.duration = seconds;
+        self
+    }
+}
+
+impl Animation for Uncreate {
+    fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    fn begin(&mut self, tree: &SceneTree) {
+        self.start = tree.get(self.target).map(|m| m.points.clone());
+    }
+
+    fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
+        let Some(start) = &self.start else { return };
+        let Some(m) = tree.get_mut(self.target) else {
+            return;
+        };
+        m.points = bezier::partial_path_points(start, 0.0, 1.0 - alpha);
+        m.dirty.geometry = true;
+    }
+
+    /// The removal, matching `FadeOut`'s: the subtree goes with the object.
+    fn finish(&mut self, tree: &mut SceneTree) {
+        tree.remove_subtree(self.target);
     }
 }
 
@@ -1080,6 +1220,115 @@ mod tests {
             &[kept],
             "no orphan was promoted to the root"
         );
+    }
+
+    /// A triangle is three curves; at half progress the first is whole and the
+    /// second is partly traced, so the object wears `partial(first) ++
+    /// partial(second)` — eight points, not six — and at `alpha = 1` it is
+    /// restored exactly.
+    #[test]
+    fn create_draws_the_path_on_and_ends_exactly_whole() {
+        let (mut tree, id) = scene(triangle());
+        let original = tree.get(id).unwrap().points.clone();
+        assert_eq!(original.len(), 12);
+
+        let mut anim = Create::new(id);
+        anim.begin(&tree);
+
+        // The empty prefix is a degenerate four-point curve at the start.
+        anim.interpolate(0.0, &mut tree);
+        let at_zero = tree.get(id).unwrap().points.clone();
+        assert_eq!(at_zero.len(), 4);
+        assert!(at_zero.iter().all(|p| *p == original[0]));
+
+        anim.interpolate(0.5, &mut tree);
+        let half = tree.get(id).unwrap().points.clone();
+        assert_eq!(half.len(), 8, "one whole curve plus the next's prefix");
+        assert_eq!(half[0], original[0], "the drawn path starts where it did");
+        assert_eq!(half[3], original[3], "the first curve is complete");
+
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(
+            tree.get(id).unwrap().points,
+            original,
+            "the last frame must be a bit-identical restore, not a re-evaluated curve"
+        );
+    }
+
+    /// `Uncreate` erases from the end and takes the object with it. Both halves
+    /// are asserted: a transparently *drawn* object left in the tree would pass
+    /// every pixel test, and `--inspect` is the only place that could show it.
+    #[test]
+    fn uncreate_erases_the_path_and_removes_the_object() {
+        let (mut tree, id) = scene(triangle());
+        let original = tree.get(id).unwrap().points.clone();
+
+        let mut anim = Uncreate::new(id);
+        anim.begin(&tree);
+
+        anim.interpolate(0.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().points, original, "full at the start");
+
+        anim.interpolate(0.5, &mut tree);
+        let half = tree.get(id).unwrap().points.clone();
+        assert!(half.len() < original.len(), "{half:?}");
+        assert_eq!(
+            half[0], original[0],
+            "the remaining part is the path's head"
+        );
+
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(
+            tree.get(id).unwrap().points.len(),
+            4,
+            "collapsed at the end"
+        );
+
+        anim.finish(&mut tree);
+        assert!(tree.get(id).is_none(), "the erased node must be gone");
+    }
+
+    /// Through the scheduler — the route a real beat takes, and the one the
+    /// blanket `Box<T>` impl's `finish` forwarding is for. `Uncreate` is the
+    /// second remover in the crate, so it guards the same trap `FadeOut` does.
+    #[test]
+    fn a_boxed_uncreate_removes_its_target_when_the_scheduler_finishes_it() {
+        use crate::AnimationScheduler;
+
+        let (mut tree, id) = scene(Mobject::new(shapes::circle(1.0)));
+        let mut sched = AnimationScheduler::new();
+        sched.add_boxed(Box::new(Uncreate::new(id).with_duration(0.5)));
+        for _ in 0..40 {
+            sched.update(1.0 / 60.0, &mut tree);
+        }
+        assert!(sched.is_empty());
+        assert!(tree.get(id).is_none(), "the erased node must be gone");
+    }
+
+    /// The reduced-motion branch never reaches the scheduler, so it depends on
+    /// `Sequence` driving each member once and finishing it. A `Create` must
+    /// land whole and an `Uncreate` must remove.
+    #[test]
+    fn reduced_motion_lands_create_whole_and_removes_an_uncreate() {
+        use crate::{AnimationScheduler, Motion, Sequence};
+
+        let (mut tree, whole) = scene(triangle());
+        let original = tree.get(whole).unwrap().points.clone();
+        let removed = tree.insert(Mobject::new(shapes::square(2.0, 2.0)));
+
+        let mut seq = Sequence::new();
+        seq.push([Create::new(whole).with_duration(0.4)]);
+        seq.push([Uncreate::new(removed).with_duration(0.4)]);
+        let mut sched = AnimationScheduler::new();
+        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
+        assert!(seq.start_next(&mut sched, &mut tree, Motion::Reduced));
+
+        assert_eq!(
+            tree.get(whole).unwrap().points,
+            original,
+            "a reduced Create lands on the whole path"
+        );
+        assert!(tree.get(removed).is_none(), "a reduced Uncreate removes");
     }
 
     /// A quarter turn in two halves is a 45° rotation, not the componentwise

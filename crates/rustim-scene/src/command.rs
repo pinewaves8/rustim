@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use rustim_anim::{Animation, FadeIn, FadeOut, MoveTo, Rotate, Scale};
+use rustim_anim::{Animation, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Uncreate};
 use rustim_math::{Affine2, Camera, Point, Viewport};
 use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree};
@@ -131,6 +131,10 @@ pub enum AnimationKind {
     MoveTo,
     Rotate,
     Scale,
+    /// Trace the object's path on from its first point.
+    Create,
+    /// Erase the path from its end and remove the object.
+    Uncreate,
 }
 
 /// Why a command was refused.
@@ -524,6 +528,8 @@ pub fn animation_for(
             }
             Box::new(Scale::new(spec.target, factor).with_duration(duration))
         }
+        AnimationKind::Create => Box::new(Create::new(spec.target).with_duration(duration)),
+        AnimationKind::Uncreate => Box::new(Uncreate::new(spec.target).with_duration(duration)),
     })
 }
 
@@ -681,6 +687,12 @@ mod tests {
             ),
             format!(
                 r#"{{"action":"play","animation":{{"target":{id},"type":"scale","factor":2.5}}}}"#
+            ),
+            // The two kinds that carry no parameter beyond the target: a `create`
+            // and an `uncreate` are spelled with the target and nothing else.
+            format!(r#"{{"action":"play","animation":{{"target":{id},"type":"create"}}}}"#),
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"uncreate","duration":0.7}}}}"#
             ),
             // The camera command, in its full and partial spellings. The full
             // one exercises every optional field at once; the partial one is what
@@ -1011,6 +1023,8 @@ mod tests {
             AnimationKind::MoveTo,
             AnimationKind::Rotate,
             AnimationKind::Scale,
+            AnimationKind::Create,
+            AnimationKind::Uncreate,
         ] {
             let mut what = spec(id, kind);
             match kind {
@@ -1166,6 +1180,46 @@ mod tests {
             (centre.x - 3.0).abs() < 1e-12 && centre.y.abs() < 1e-12,
             "{centre:?}"
         );
+    }
+
+    // ---- the P3 create/uncreate kinds --------------------------------------
+
+    /// A `create` draws the object's own path on, and at the end it is the whole
+    /// object again — the command layer's only job is the mapping, so this asserts
+    /// that the animation it builds is genuinely a prefix-of-the-point-array one.
+    #[test]
+    fn a_create_command_draws_the_path_on() {
+        let (mut tree, id) = scene_with_a_blank();
+        let whole = tree.get(id).unwrap().points.len();
+        let mut what = spec(id, AnimationKind::Create);
+        what.duration = Some(0.4);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        assert_eq!(anim.duration(), 0.4);
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+        let half = tree.get(id).unwrap().points.len();
+        assert!(half < whole, "{half} of {whole} at alpha 0.5");
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().points.len(), whole);
+    }
+
+    /// An `uncreate` erases the path and then **removes the object**, which is
+    /// what `finish` is for. A command that built it without the removal hook
+    /// would leave a fully transparent node in the tree and in `--inspect`.
+    #[test]
+    fn an_uncreate_command_erases_and_removes_the_object() {
+        let (mut tree, id) = scene_with_a_blank();
+        let mut what = spec(id, AnimationKind::Uncreate);
+        what.duration = Some(0.4);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+        assert!(tree.get(id).is_some(), "half-way is not gone yet");
+        anim.interpolate(1.0, &mut tree);
+        anim.finish(&mut tree);
+        assert!(tree.get(id).is_none(), "the object outlived its uncreate");
     }
 
     /// **The behavioural change of P2 step 5, pinned.**

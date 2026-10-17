@@ -730,6 +730,37 @@ fn critical_point_matches() {
     rec.assert_exhaustive(&["critical_point"]);
 }
 
+/// `VMobject.pointwise_become_partial` — the partial path `Create` draws.
+///
+/// The interesting cases are not the interiors, which any split-and-join gets
+/// roughly right, but the boundaries:
+///
+/// - `@0.0,0.5` on a two-curve path ends on the curve boundary, so the second
+///   curve comes back **degenerate** onto the shared anchor rather than absent:
+///   the array keeps eight points, which is what `nppc * (upper - lower + 1)`
+///   allocates.
+/// - `@0.0,1.0` is the copy shortcut, so the result is bit-identical to the
+///   input rather than a re-evaluated Bézier.
+/// - `@0.0,0.0` is the empty range `Uncreate` reaches on its last frame; it is
+///   four copies of the first point.
+#[test]
+fn pointwise_partial_matches() {
+    let fixture = Fixture::load("manim-geometry.json");
+    let mut rec = Recorder::new(&fixture);
+    let bounds: Vec<(f64, f64)> = fixture.input("partial_bounds");
+
+    for (name, pts) in geometry_paths(&fixture) {
+        for (a, b) in &bounds {
+            let case = format!("{name}@{},{}", py_float(*a), py_float(*b));
+            let want: Vec<Point> = Vec::from_value(&rec.expect("pointwise_partial", &case), &case);
+            let got = bezier::partial_path_points(&pts, *a, *b);
+            close_points(&got, &want, &case);
+        }
+    }
+
+    rec.assert_exhaustive(&["pointwise_partial"]);
+}
+
 /// `VMobject.align_points` — one case per pair in the `align_pairs` input.
 ///
 /// Four of the twelve are there because a plausible port goes wrong on them, and
@@ -1183,7 +1214,12 @@ const BEZIER_GROUPS: &[&str] = &[
     "get_smooth_cubic_bezier_handle_points",
 ];
 
-const GEOMETRY_GROUPS: &[&str] = &["get_arc_length", "critical_point", "align_points"];
+const GEOMETRY_GROUPS: &[&str] = &[
+    "get_arc_length",
+    "critical_point",
+    "align_points",
+    "pointwise_partial",
+];
 
 const SPACE_OPS_GROUPS: &[&str] = &[
     "normalize",
@@ -1214,7 +1250,7 @@ const SPACE_OPS_GROUPS: &[&str] = &[
 fn fixture_case_counts_are_stable() {
     for (file, expected) in [
         ("manim-bezier.json", 282usize),
-        ("manim-geometry.json", 89),
+        ("manim-geometry.json", 145),
         ("manim-space-ops.json", 68),
     ] {
         let fixture = Fixture::load(file);
