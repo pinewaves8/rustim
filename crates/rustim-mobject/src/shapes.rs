@@ -30,6 +30,14 @@ pub enum ShapeKind {
     /// filled polygon: the fill rule would close the open polyline with its
     /// chord and paint the region under the curve.
     Plot,
+    /// A closed figure through caller-supplied vertices, filled by the fill
+    /// rule.
+    ///
+    /// The one kind whose geometry is not derived from a size: the vertices are
+    /// the object, which is what makes an arbitrary triangle, a parallelogram
+    /// or a hexagon expressible at all. [`ShapeParams::points`] carries them,
+    /// in world coordinates.
+    Polygon,
     /// A string, typeset by the host's [`crate::TextBlock`] provider.
     ///
     /// This kind is the one that needs something outside the kernel: its
@@ -58,7 +66,7 @@ impl ShapeKind {
     /// second copy of the enum that can drift. A shape added to the enum and to
     /// [`build`] but not here fails the capabilities conformance test by
     /// omission only if the test counts — it does.
-    pub const ALL: [ShapeKind; 11] = [
+    pub const ALL: [ShapeKind; 12] = [
         ShapeKind::Square,
         ShapeKind::Circle,
         ShapeKind::RightTriangle,
@@ -67,6 +75,7 @@ impl ShapeKind {
         ShapeKind::NumberLine,
         ShapeKind::Axes,
         ShapeKind::Plot,
+        ShapeKind::Polygon,
         ShapeKind::Text,
         ShapeKind::Formula,
         ShapeKind::Group,
@@ -137,13 +146,15 @@ pub struct ShapeParams {
     /// How far a tick rises above its axis, in world units.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tick_size: Option<f64>,
-    /// A [`ShapeKind::Plot`]'s samples, **in world coordinates**.
+    /// A [`ShapeKind::Plot`]'s samples or a [`ShapeKind::Polygon`]'s vertices,
+    /// **in world coordinates**.
     ///
     /// World rather than data coordinates on purpose: the command layer has no
     /// expression language and no opinion about what a sample means, so a host
     /// that wants `y = 0.25x² - 2` samples it itself and hands over the points it
     /// wants drawn. [`AxesScale::to_world`] is the mapping a scene uses to do
-    /// that against the axes it is drawing.
+    /// that against the axes it is drawing. For a polygon the order is the
+    /// winding order: each vertex joins the next, and the last joins the first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub points: Option<Vec<[f64; 2]>>,
     /// The string a [`ShapeKind::Text`] or [`ShapeKind::Formula`] is made of.
@@ -276,6 +287,15 @@ pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
             // No samples is a legitimate description — a host may add the
             // object before it has data — and it is an empty mobject rather
             // than an error, which is what `add` can say.
+            None => Vec::new(),
+        },
+        // A polygon with no vertices is the same story as a plot with no
+        // samples; fewer than three, or a non-finite vertex, is answered with
+        // no picture rather than a degenerate one (see [`polygon`]). The
+        // command layer refuses the same cases under `points`, so a host hears
+        // about the mistake instead of adding an invisible object.
+        ShapeKind::Polygon => match &params.points {
+            Some(points) => polygon(points),
             None => Vec::new(),
         },
         // Neither can be built from geometry: the picture is a glyph run, and
@@ -469,6 +489,40 @@ pub fn arrow(length: f64, thickness: f64) -> Vec<Point> {
         Point::new(0.0, t),
         Point::new(0.0, -t),
     ])
+}
+
+/// A closed polygon through the given vertices, in the order they are given.
+///
+/// The vertices are the geometry itself — there is no width or height to derive
+/// them from — which is what makes an arbitrary triangle, parallelogram or
+/// hexagon expressible. Each consecutive pair becomes one straight cubic and the
+/// last vertex is joined back to the first, all through
+/// [`bezier::points_as_corners`] (see [`square`] for why the degenerate
+/// spelling of a straight segment is not acceptable).
+///
+/// A caller may repeat the first vertex at the end — the common way to spell a
+/// closed loop — and the repeat is dropped rather than drawing a zero-length
+/// segment. Fewer than three distinct vertices, or any non-finite coordinate,
+/// yields **no points**: a two-vertex "polygon" would draw as a line and a
+/// one-vertex one as nothing, and both would report success. This is the
+/// kernel's usual posture — a bad description in, an honest object out — and
+/// the command layer turns the same cases into a refusal under `points`.
+pub fn polygon(vertices: &[[f64; 2]]) -> Vec<Point> {
+    if vertices
+        .iter()
+        .any(|[x, y]| !x.is_finite() || !y.is_finite())
+    {
+        return Vec::new();
+    }
+    let mut corners: Vec<Point> = vertices.iter().map(|[x, y]| Point::new(*x, *y)).collect();
+    if corners.len() > 1 && corners.first() == corners.last() {
+        corners.pop();
+    }
+    if corners.len() < 3 {
+        return Vec::new();
+    }
+    corners.push(corners[0]);
+    bezier::points_as_corners(&corners)
 }
 
 /// A number line: a horizontal filled shaft with ticks rising from it.
@@ -964,6 +1018,63 @@ mod tests {
                 Point::new(0.0, 0.0),
             ]
         );
+    }
+
+    /// A polygon is its vertices, in order, closed back to the first — and a
+    /// description that cannot be a polygon draws nothing rather than a
+    /// degenerate one.
+    #[test]
+    fn a_polygon_walks_its_vertices_and_closes_on_the_first() {
+        let pts = polygon(&[[0.0, 0.0], [2.0, 0.0], [1.0, 3.0]]);
+        // Three edges at four control points each: the third closes the loop.
+        assert_eq!(pts.len(), 3 * 4);
+        // Each corner appears twice — once as the end of one segment and once
+        // as the start of the next — except the first vertex, which appears at
+        // both ends of the closed loop (the same spelling `right_triangle`
+        // asserts).
+        assert_eq!(
+            bezier::anchors(&pts).unwrap(),
+            vec![
+                Point::new(0.0, 0.0),
+                Point::new(2.0, 0.0),
+                Point::new(2.0, 0.0),
+                Point::new(1.0, 3.0),
+                Point::new(1.0, 3.0),
+                Point::new(0.0, 0.0),
+            ]
+        );
+
+        // Repeating the first vertex at the end is the common spelling of a
+        // closed loop; it must not add a zero-length segment.
+        let repeated = polygon(&[[0.0, 0.0], [2.0, 0.0], [1.0, 3.0], [0.0, 0.0]]);
+        assert_eq!(repeated, pts);
+
+        // An empty or two-vertex list is not a polygon (the latter would draw
+        // as a line), and a non-finite vertex is not a coordinate. Nothing is a
+        // better answer than a shape that reports success and draws the wrong
+        // thing; the command layer turns all three into a refusal under
+        // `points`.
+        assert!(polygon(&[]).is_empty());
+        assert!(polygon(&[[0.0, 0.0], [1.0, 0.0]]).is_empty());
+        assert!(polygon(&[[0.0, 0.0], [1.0, 0.0], [f64::NAN, 1.0]]).is_empty());
+    }
+
+    #[test]
+    fn a_polygon_is_a_filled_contour_of_its_kind() {
+        let m = build(
+            ShapeKind::Polygon,
+            &ShapeParams {
+                points: Some(vec![[0.0, 0.0], [2.0, 0.0], [1.0, 3.0]]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(m.kind, crate::NodeKind::Polygon);
+        assert_eq!((m.style.fill_opacity, m.style.stroke_opacity), (1.0, 0.0));
+
+        // No vertices is an empty object rather than a panic: `add` refuses the
+        // same description, so this is the path a direct kernel caller takes.
+        let empty = build(ShapeKind::Polygon, &ShapeParams::default());
+        assert!(empty.points.is_empty());
     }
 
     #[test]

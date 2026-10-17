@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **856 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **859 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -62,8 +62,8 @@ six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` 
 scenes match their checked-in
 baselines, a script replays to a byte-identical frame, an exported frame equals the still pixel for
 pixel, a scripted `add` of `text` / `formula` / `group` builds real objects through the host's
-`Typesetter` (the desktop `hello` advertises all **11** shapes; the plain browser page advertises
-nine, the formula page ten), and `rustim-app --png out.png` reproduces the
+`Typesetter` (the desktop `hello` advertises all **12** shapes; the plain browser page advertises
+ten, the formula page eleven), and `rustim-app --png out.png` reproduces the
 Manim reference frame with an **identical content bounding box** (`343,90,936,629`); only 0.012% of
 pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The browser host
 builds both ways (with and without Typst) and was **run in Chrome 151**, where its canvas matches the
@@ -369,7 +369,7 @@ last property.
 |---|---|---|
 | `rustim-math` | Points, `Affine2`, rate functions and the `Rate` wire vocabulary, the pixel-only `Viewport` and the `Camera` view (world→screen), the pointer gesture vocabulary (`gesture`: drag, scroll, zoom factor, zoom range) shared by both hosts, and literal ports of Manim's `bezier` / `space_ops` / `paths` / `rate_functions` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
-| `rustim-mobject` | `Mobject` (points / declared `local_bounds` / a wire-shaped `text: Option<TextBlock>` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot` / `group`) and `AxesScale`, `text` (`TextBlock` / `TextRun` / `FontData` — the glyph geometry a shaper hands over), `critical_point`, `world_anchors`, `ids_with_label` | Real |
+| `rustim-mobject` | `Mobject` (points / declared `local_bounds` / a wire-shaped `text: Option<TextBlock>` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot` / `polygon` / `group`) and `AxesScale`, `text` (`TextBlock` / `TextRun` / `FontData` — the glyph geometry a shaper hands over), `critical_point`, `world_anchors`, `ids_with_label` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it), `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) and `templates` (the `explain.*` thick tools: one group, addressable pieces, a declared box and an atomic rollback) | Real |
@@ -2974,6 +2974,20 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   (geometry and declared box, a two-run curve, atomic refusals including the late `y_range` one), two
   round-trip fixtures and a conformance case through the real binary; **all eight goldens unchanged**,
   count 846 → 856.
+- **The `polygon` shape is in the kernel**, added as the prerequisite for `explain.geometry` and
+  useful on its own: an arbitrary triangle, parallelogram or hexagon had no spelling, because every
+  other kind derives its points from a size. `ShapeKind::Polygon` (twelfth shape) reads
+  `ShapeParams::points` as world-space vertices in order, closes the loop through
+  `bezier::points_as_corners` (a repeated first vertex is dropped, not drawn as a zero-length
+  segment), and is a **filled contour** like the other closed shapes. Three vertices are the minimum:
+  fewer, or any non-finite coordinate, answers with no points in `build`, and the `add` arm refuses
+  the same cases under `points` with a sentence naming which one — an invisible object that reports
+  success is the answer this layer exists to avoid. `NodeKind::Polygon` takes the `Image` role and
+  the description **3 条边的三角形，面积 6** (or *n* 边形), measured from the corner set by the
+  shoelace formula rather than from the box, which for a turned figure would overstate the area.
+  Evidence: two kernel tests over the vertex walk and the style, one command test over the three
+  refusals, the sentence pinned beside the other kinds, a round-trip fixture, the capabilities count
+  (`ALL` 11 → 12) and the conformance probe; **all eight goldens unchanged**, count 856 → 859.
 
 ## AI integration
 

@@ -80,7 +80,9 @@ impl SemanticRole {
             | NodeKind::RightTriangle
             | NodeKind::Line
             | NodeKind::Arrow => Self::Image,
-            NodeKind::Axes | NodeKind::Plot | NodeKind::NumberLine => Self::Image,
+            NodeKind::Axes | NodeKind::Plot | NodeKind::NumberLine | NodeKind::Polygon => {
+                Self::Image
+            }
             NodeKind::Group => Self::Group,
             NodeKind::Text => Self::Label,
             NodeKind::Heading => Self::Heading,
@@ -346,6 +348,7 @@ pub fn default_name(kind: NodeKind) -> &'static str {
         NodeKind::Formula => "公式",
         NodeKind::Axes => "坐标轴",
         NodeKind::Plot => "函数图象",
+        NodeKind::Polygon => "多边形",
         NodeKind::Unknown => "图形",
     }
 }
@@ -423,6 +426,7 @@ pub fn describe(kind: NodeKind, label: Option<&str>, shape: Option<&Shape>) -> S
                     }
                     NodeKind::Square => rectangle_sentence(s, w, h, !named),
                     NodeKind::RightTriangle => triangle_sentence(s, w, h, !named),
+                    NodeKind::Polygon => polygon_sentence(s, !named),
                     NodeKind::Line | NodeKind::Arrow | NodeKind::NumberLine => {
                         line_sentence(kind, s, w, h, !named)
                     }
@@ -501,6 +505,49 @@ fn triangle_sentence(s: &Shape, w: f64, h: f64, with_noun: bool) -> String {
     } else {
         format!("{legs}，面积 {area}")
     }
+}
+
+/// A closed figure through its own vertices: how many sides, and the area.
+///
+/// Both numbers are rotation-invariant, which is why the box is not consulted:
+/// the box of a turned triangle is larger than the triangle, and a reader told
+/// that has been told the wrong size. The sides come from the corner set — the
+/// distinct vertices of the closed polyline — and the area from the shoelace
+/// formula over the same corners, so "3 条边的三角形，面积 6" cannot disagree
+/// with the figure on screen.
+///
+/// A figure with fewer than three corners — a degenerate description that
+/// reached the tree some other way — falls back to the box sentence rather
+/// than reporting "0 边形".
+fn polygon_sentence(s: &Shape, with_noun: bool) -> String {
+    let sides = s.corners.len();
+    if sides < 3 {
+        let (w, h) = (s.bounds.width(), s.bounds.height());
+        return match with_noun {
+            true => format!("{} × {} 的多边形", num(w), num(h)),
+            false => format!("{} × {}", num(w), num(h)),
+        };
+    }
+    let area = num(polygon_area(&s.corners).abs());
+    let noun = match sides {
+        3 => "三角形".to_string(),
+        4 => "四边形".to_string(),
+        _ => format!("{sides} 边形"),
+    };
+    match with_noun {
+        true => format!("{sides} 条边的{noun}，面积 {area}"),
+        false => format!("{sides} 条边，面积 {area}"),
+    }
+}
+
+/// The signed area of a closed polygon through `corners`, by the shoelace
+/// formula. The sign is the winding direction; callers take the magnitude.
+fn polygon_area(corners: &[Point]) -> f64 {
+    0.5 * corners
+        .iter()
+        .zip(corners.iter().cycle().skip(1))
+        .map(|(a, b)| a.x * b.y - b.x * a.y)
+        .sum::<f64>()
 }
 
 /// A line, an arrow or a number line: its **length**.
@@ -850,6 +897,26 @@ mod tests {
         assert_eq!(
             describe(NodeKind::RightTriangle, None, Some(&tri)),
             "两条直角边长 3 和 4 的直角三角形，面积 6"
+        );
+
+        // A polygon is counted and measured from its own vertices, so a
+        // *turned* one reads the same as an axis-aligned one: the box would
+        // report a larger area for the same figure.
+        let polygon = shaped(
+            ShapeKind::Polygon,
+            &ShapeParams {
+                points: Some(vec![[0.0, 0.0], [3.0, 0.0], [0.0, 4.0]]),
+                ..Default::default()
+            },
+            NodeKind::Polygon,
+        );
+        assert_eq!(
+            describe(NodeKind::Polygon, None, Some(&polygon)),
+            "3 条边的三角形，面积 6"
+        );
+        assert_eq!(
+            describe(NodeKind::Polygon, Some("甲"), Some(&polygon)),
+            "甲，3 条边，面积 6"
         );
 
         let circle = shaped(

@@ -1770,11 +1770,11 @@ mod tests {
             CommandOutcome::Greeted(caps) => {
                 assert_eq!(caps.protocol, command::PROTOCOL_VERSION);
                 assert_eq!(caps.animations.len(), 11);
-                // Nine of the eleven kinds: this context has no typesetter, so
+                // Ten of the twelve kinds: this context has no typesetter, so
                 // it must not advertise the two that need one. Advertising them
                 // and refusing the first `add` would teach a client to distrust
                 // the handshake.
-                assert_eq!(caps.shapes.len(), 9, "{:?}", caps.shapes);
+                assert_eq!(caps.shapes.len(), 10, "{:?}", caps.shapes);
                 for absent in ["text", "formula"] {
                     assert!(
                         !caps.shapes.iter().any(|shape| shape == absent),
@@ -1783,7 +1783,7 @@ mod tests {
                 }
                 // The full protocol vocabulary still names them, which is what
                 // makes the two lists different rather than redundant.
-                assert_eq!(Capabilities::current().shapes.len(), 11);
+                assert_eq!(Capabilities::current().shapes.len(), 12);
             }
             other => panic!("expected a greeting, got {other:?}"),
         }

@@ -66,6 +66,13 @@ pub enum NodeKind {
     Formula,
     Axes,
     Plot,
+    /// A closed figure through caller-supplied vertices.
+    ///
+    /// Distinct from every sized kind because its geometry *is* its vertices:
+    /// a reader told "3 条边的三角形，面积 …" has been told the shape's
+    /// definition, while a box measurement of the same figure would describe
+    /// the frame it happens to fill.
+    Polygon,
 }
 
 impl From<ShapeKind> for NodeKind {
@@ -79,6 +86,7 @@ impl From<ShapeKind> for NodeKind {
             ShapeKind::NumberLine => Self::NumberLine,
             ShapeKind::Axes => Self::Axes,
             ShapeKind::Plot => Self::Plot,
+            ShapeKind::Polygon => Self::Polygon,
             ShapeKind::Text => Self::Text,
             ShapeKind::Formula => Self::Formula,
             ShapeKind::Group => Self::Group,
@@ -111,7 +119,7 @@ mod tests {
     /// could silently shrink.
     #[test]
     fn every_shape_kind_is_in_the_vocabulary() {
-        assert_eq!(ShapeKind::ALL.len(), 11);
+        assert_eq!(ShapeKind::ALL.len(), 12);
         for kind in ShapeKind::ALL {
             assert_ne!(NodeKind::from(kind), NodeKind::Unknown, "{kind:?}");
         }
@@ -134,6 +142,7 @@ mod tests {
             NodeKind::Formula,
             NodeKind::Axes,
             NodeKind::Plot,
+            NodeKind::Polygon,
         ] {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(serde_json::from_str::<NodeKind>(&json).unwrap(), kind);

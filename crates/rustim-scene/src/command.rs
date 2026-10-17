@@ -1714,6 +1714,37 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
                     .to_owned(),
                 });
             }
+            // A polygon's geometry *is* its vertices, so there is no size to
+            // fall back on: an absent, too-short or non-finite vertex list
+            // would insert an invisible object that reports success. Refused
+            // here under the field the caller got wrong; `shapes::build`
+            // answers the same cases with no points, for a direct kernel
+            // caller that never passes through this layer.
+            if *kind == ShapeKind::Polygon {
+                match params.points.as_deref() {
+                    Some(points) if points.len() < 3 => {
+                        return Err(CommandError::OutOfRange {
+                            property: "points".to_owned(),
+                            detail: "a polygon needs at least three vertices".to_owned(),
+                        });
+                    }
+                    Some(points)
+                        if points.iter().any(|[x, y]| !x.is_finite() || !y.is_finite()) =>
+                    {
+                        return Err(CommandError::OutOfRange {
+                            property: "points".to_owned(),
+                            detail: "every vertex must be finite".to_owned(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(CommandError::OutOfRange {
+                            property: "points".to_owned(),
+                            detail: "a polygon needs its vertices".to_owned(),
+                        });
+                    }
+                }
+            }
             if children.is_some() && *kind != ShapeKind::Group {
                 return Err(CommandError::OutOfRange {
                     property: "children".to_owned(),
@@ -2573,6 +2604,12 @@ mod tests {
                 .to_owned(),
             r#"{"action":"add","type":"plot","params":{"thickness":0.05,"points":[[0.0,0.0],[1.0,1.0],[2.0,0.0]]}}"#
                 .to_owned(),
+            // A polygon's vertices are its geometry, so the round trip has to
+            // preserve the nested array exactly — and the label says the two
+            // spellings of a closed loop (repeated first vertex or not) are
+            // both legal input.
+            r#"{"action":"add","type":"polygon","params":{"label":"三角形","points":[[0.0,0.0],[2.0,0.0],[1.0,3.0]]}}"#
+                .to_owned(),
             // The two kinds only a hosted typesetter can build. The source
             // string is `params.text`, and the layout knobs are optional: a
             // read-back that wrote them as `null` would fail here.
@@ -3312,6 +3349,52 @@ mod tests {
             })
         );
         assert!(tree.root_ids().contains(&a), "the child was not moved");
+    }
+
+    /// A polygon's geometry *is* its vertex list, so the list is validated
+    /// under its own field before anything is built. The three ways it can be
+    /// unusable — absent, too short, non-finite — are distinct sentences, and
+    /// none of them inserts an object.
+    #[test]
+    fn a_polygon_without_three_finite_vertices_is_refused() {
+        let mut tree = SceneTree::new();
+        let mut refusals = vec![
+            (
+                serde_json::from_str::<Command>(r#"{"action":"add","type":"polygon"}"#).unwrap(),
+                "a polygon needs its vertices",
+            ),
+            (
+                serde_json::from_str::<Command>(
+                    r#"{"action":"add","type":"polygon","params":{"points":[[0.0,0.0],[1.0,0.0]]}}"#,
+                )
+                .unwrap(),
+                "a polygon needs at least three vertices",
+            ),
+        ];
+        // NaN has no JSON spelling, so this case is built rather than parsed —
+        // and it is the one a model can send by computing a vertex.
+        refusals.push((
+            Command::Add {
+                kind: ShapeKind::Polygon,
+                params: ShapeParams {
+                    points: Some(vec![[0.0, 0.0], [1.0, 0.0], [f64::NAN, 1.0]]),
+                    ..Default::default()
+                },
+                children: None,
+            },
+            "every vertex must be finite",
+        ));
+        for (cmd, detail) in refusals {
+            assert_eq!(
+                apply(&mut tree, &cmd),
+                Err(CommandError::OutOfRange {
+                    property: "points".to_owned(),
+                    detail: detail.to_owned(),
+                }),
+                "{cmd:?}"
+            );
+        }
+        assert!(tree.root_ids().is_empty(), "nothing was inserted");
     }
 
     /// **Nothing is inserted until every child resolves.** A `children` list
