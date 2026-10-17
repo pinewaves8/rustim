@@ -48,7 +48,7 @@
 //! [`SceneTree::world_bounds`]: rustim_mobject::SceneTree::world_bounds
 
 use rustim_math::{Affine2, Rect};
-use rustim_mobject::shapes::{AxesScale, ShapeKind, ShapeParams};
+use rustim_mobject::shapes::{AxesScale, DEFAULT_THICKNESS, ShapeKind, ShapeParams};
 use rustim_mobject::{Mobject, NodeId, NodeKind, SceneTree, TextBlock};
 
 use crate::command::{CommandError, StateDiff};
@@ -758,6 +758,493 @@ fn boundary(from: [f64; 2], to: [f64; 2], y0: f64, y1: f64) -> Option<[f64; 2]> 
     Some([from[0] + (to[0] - from[0]) * t, edge])
 }
 
+// ---- explain.geometry ---------------------------------------------------
+
+/// The label the figure itself carries inside `explain.geometry`.
+const FIGURE_LABEL: &str = "图形";
+
+/// The label a right-angle marker carries.
+///
+/// The markers are scenery rather than subjects: they carry a label so
+/// `--inspect` names them, and `NodeKind::Unknown` so a marker is not described
+/// as a small four-sided figure with an area, which it is not.
+const RIGHT_ANGLE_LABEL: &str = "直角标记";
+
+/// The default fill of a figure.
+///
+/// A wash rather than a solid: the template exists to show the geometry, so
+/// the stroke and the labels have to read on top of the fill. `1.0` is legal —
+/// a caller asking for a silhouette gets one — but a filled figure with labels
+/// over it is the caller's decision, not the default.
+const GEOMETRY_FILL_OPACITY: f64 = 0.3;
+
+/// The most vertices one figure may have.
+///
+/// The same posture as the axes' `MAX_TICKS`: a command from a model must not
+/// be able to allocate an unbounded number of label nodes. Sixty-four is far
+/// past any teaching figure and cheap to walk.
+const MAX_VERTICES: usize = 64;
+
+/// The gap between an edge or a vertex and the ink of the label naming it.
+const LABEL_GAP: f64 = 0.12;
+
+/// How close to a right angle a corner must be to earn a marker, as `|cos|`.
+///
+/// One dot product rather than an angle: `1e-3` is a tenth of a degree, far
+/// tighter than a figure typed by hand will miss by, and far looser than the
+/// rounding of a computation that meant exactly 90°.
+const RIGHT_ANGLE_TOLERANCE: f64 = 1e-3;
+
+/// A right-angle marker's leg: a fraction of the shorter adjoining edge,
+/// clamped so it neither vanishes on a small figure nor swamps a large one.
+const MARKER_FRACTION: f64 = 0.18;
+const MARKER_MIN: f64 = 0.08;
+const MARKER_MAX: f64 = 0.4;
+
+/// The tolerance below which three vertices are taken to be collinear.
+///
+/// A figure whose vertices lie on one line has no area and draws nothing, so
+/// it is refused rather than accepted as an invisible group. The test is the
+/// cross product of every vertex against the first distinct edge — exact for
+/// the teaching coordinates this template serves, and winding-agnostic, which
+/// a signed-area test would not be (a bow tie has zero signed area and is a
+/// perfectly good picture).
+const COLLINEAR_EPSILON: f64 = 1e-9;
+
+/// The slots `explain.geometry` fills.
+pub(crate) struct Geometry<'a> {
+    /// The figure's outline, in world coordinates. Closed by the template.
+    pub vertices: &'a [[f64; 2]],
+    /// One label per edge, in vertex order: label `i` names the edge from
+    /// vertex `i` to vertex `i + 1`.
+    pub side_labels: Option<&'a [String]>,
+    /// One label per vertex, in the same order as `vertices`.
+    pub vertex_labels: Option<&'a [String]>,
+    /// Mark the corners that are right angles (default `true`).
+    pub right_angle: Option<bool>,
+    /// The figure's fill opacity (default [`GEOMETRY_FILL_OPACITY`]).
+    pub fill_opacity: Option<f64>,
+    /// The figure's colour; the labels stay foreground.
+    pub color: Option<[u8; 3]>,
+    /// The side and vertex labels' em size in world units.
+    pub label_size: Option<f64>,
+    pub caption: Option<&'a str>,
+    pub caption_size: Option<f64>,
+    pub position: Option<[f64; 2]>,
+    pub label: Option<&'a str>,
+}
+
+/// A closed figure, its side and vertex labels, right-angle markers and a
+/// caption.
+///
+/// The template exists because a model asked to "show a triangle with legs 3
+/// and 4" should not have to work out where a side label sits outside the
+/// edge, that a right angle deserves a marker, or where a caption goes. It
+/// fills the slots and the engine makes those decisions.
+///
+/// The vertices are the figure: the caller supplies them in world coordinates
+/// and the template **centres them on their bounding box**, so `position`
+/// names the figure's centre rather than an arbitrary corner — the same
+/// convention every sized shape follows, where the origin is the centre.
+///
+/// Pieces, in `created` order: the figure, one stroked square per right-angle
+/// corner, the side labels, the vertex labels, then the caption if there is
+/// one. The figure is a [`ShapeKind::Polygon`] with a stroked outline, so its
+/// edge is visible against its own wash; the markers are the same builder's
+/// polygon with the fill switched off — a filled marker would be a black
+/// right-angle block rather than the conventional outline.
+///
+/// Only the optional labels and the caption typeset, so a build with no
+/// typesetter can draw a bare figure and refuses a labelled one under `text`.
+pub(crate) fn geometry(
+    tree: &mut SceneTree,
+    mut typesetter: Option<&mut dyn Typesetter>,
+    args: Geometry<'_>,
+) -> Result<StateDiff, CommandError> {
+    let vertices = args.vertices;
+    if vertices.len() < 3 {
+        return Err(CommandError::OutOfRange {
+            property: "vertices".to_owned(),
+            detail: format!(
+                "{} vertices cannot close a figure; give at least three",
+                vertices.len()
+            ),
+        });
+    }
+    if vertices.len() > MAX_VERTICES {
+        return Err(CommandError::OutOfRange {
+            property: "vertices".to_owned(),
+            detail: format!(
+                "{} vertices exceed the {MAX_VERTICES}-vertex cap",
+                vertices.len()
+            ),
+        });
+    }
+    if let Some([x, y]) = vertices
+        .iter()
+        .copied()
+        .find(|[x, y]| !x.is_finite() || !y.is_finite())
+    {
+        return Err(CommandError::OutOfRange {
+            property: "vertices".to_owned(),
+            detail: format!("[{x}, {y}] is not a finite vertex"),
+        });
+    }
+    if collinear(vertices) {
+        return Err(CommandError::OutOfRange {
+            property: "vertices".to_owned(),
+            detail: "the vertices lie on one line, so the figure has no area".to_owned(),
+        });
+    }
+    for (labels, field) in [
+        (args.side_labels, "side_labels"),
+        (args.vertex_labels, "vertex_labels"),
+    ] {
+        let Some(labels) = labels else { continue };
+        if labels.len() != vertices.len() {
+            return Err(CommandError::OutOfRange {
+                property: field.to_owned(),
+                detail: format!(
+                    "{} labels for a figure with {} {}",
+                    labels.len(),
+                    vertices.len(),
+                    match field {
+                        "side_labels" => "edges",
+                        _ => "vertices",
+                    }
+                ),
+            });
+        }
+        if let Some(index) = labels.iter().position(|label| label.trim().is_empty()) {
+            return Err(CommandError::OutOfRange {
+                property: field.to_owned(),
+                detail: format!("label {index} is blank"),
+            });
+        }
+    }
+    let fill = args.fill_opacity.unwrap_or(GEOMETRY_FILL_OPACITY);
+    if !fill.is_finite() || !(0.0..=1.0).contains(&fill) {
+        return Err(CommandError::OutOfRange {
+            property: "fill_opacity".to_owned(),
+            detail: format!("{fill} is not an opacity in 0.0..=1.0"),
+        });
+    }
+    if let Some(size) = args.label_size
+        && (!size.is_finite() || size <= 0.0)
+    {
+        return Err(CommandError::OutOfRange {
+            property: "label_size".to_owned(),
+            detail: format!("{size} is not a finite, positive size"),
+        });
+    }
+    if let Some(size) = args.caption_size
+        && (!size.is_finite() || size <= 0.0)
+    {
+        return Err(CommandError::OutOfRange {
+            property: "caption_size".to_owned(),
+            detail: format!("{size} is not a finite, positive size"),
+        });
+    }
+    let caption = match args.caption {
+        Some(text) if text.trim().is_empty() => {
+            return Err(CommandError::OutOfRange {
+                property: "caption".to_owned(),
+                detail: "a caption needs something to say".to_owned(),
+            });
+        }
+        Some(text) => Some(text),
+        None => None,
+    };
+    // Unlike a plot, whose tick labels are mandatory, a figure is a legitimate
+    // picture on its own; text is required only by the optional labels.
+    let needs_text =
+        args.side_labels.is_some() || args.vertex_labels.is_some() || caption.is_some();
+    if needs_text
+        && !typesetter
+            .as_ref()
+            .is_some_and(|typesetter| typesetter.supports_text())
+    {
+        return Err(CommandError::Unsupported {
+            feature: "text".to_owned(),
+        });
+    }
+    let local = centred(vertices);
+
+    let mut build = Build::open(tree, args.label, args.position, "position")?;
+    let result = (|| -> Result<(), CommandError> {
+        let figure = build.piece(
+            ShapeKind::Polygon,
+            ShapeParams {
+                points: Some(local.clone()),
+                color: args.color,
+                label: Some(FIGURE_LABEL.to_owned()),
+                ..ShapeParams::default()
+            },
+        );
+        if let Some(m) = build.tree.get_mut(figure) {
+            // The builder paints a polygon as a filled contour; a figure is a
+            // filled contour **with its edge drawn**, so the same paint serves
+            // both passes and only the opacities differ.
+            m.style.fill_opacity = fill;
+            m.style.stroke_opacity = 1.0;
+            m.style.stroke = m.style.fill;
+            m.style.stroke_width = DEFAULT_THICKNESS;
+            m.dirty.style = true;
+        }
+
+        if args.right_angle.unwrap_or(true) {
+            for index in right_angle_corners(&local) {
+                let Some(quad) = marker_quad(&local, index) else {
+                    continue;
+                };
+                let marker = build.piece(
+                    ShapeKind::Polygon,
+                    ShapeParams {
+                        points: Some(quad),
+                        color: args.color,
+                        ..ShapeParams::default()
+                    },
+                );
+                if let Some(m) = build.tree.get_mut(marker) {
+                    m.style.fill_opacity = 0.0;
+                    m.style.stroke_opacity = 1.0;
+                    m.style.stroke = m.style.fill;
+                    m.style.stroke_width = DEFAULT_THICKNESS;
+                    m.dirty.style = true;
+                    m.kind = NodeKind::Unknown;
+                    m.dirty.semantic = true;
+                    m.label = Some(RIGHT_ANGLE_LABEL.to_owned());
+                }
+            }
+        }
+
+        // `needs_text` already established that a typesetter is present when
+        // any of this section has work to do, so reaching here without one
+        // means every list is empty and there is nothing to place.
+        if let Some(typesetter) = typesetter.as_deref_mut() {
+            let label_spec = TextSpec {
+                size: args.label_size,
+                max_width: None,
+            };
+            // Labels are foreground, like a plot's tick labels: `color` names
+            // the figure, and a label that took it would read as part of the
+            // figure.
+            if let Some(labels) = args.side_labels {
+                for (index, text) in labels.iter().enumerate() {
+                    let (mid, normal) = edge_frame(&local, index);
+                    let block = typesetter
+                        .text(text, &label_spec)
+                        .map_err(|error| typeset_error(error, "side_labels"))?;
+                    let position = pushed(mid, normal, block.local_bounds());
+                    build.text(text, block, &label_spec, position, None, Some(text.clone()));
+                }
+            }
+            if let Some(labels) = args.vertex_labels {
+                for (index, text) in labels.iter().enumerate() {
+                    let direction = outward(local[index]);
+                    let block = typesetter
+                        .text(text, &label_spec)
+                        .map_err(|error| typeset_error(error, "vertex_labels"))?;
+                    let position = pushed(local[index], direction, block.local_bounds());
+                    build.text(text, block, &label_spec, position, None, Some(text.clone()));
+                }
+            }
+
+            if let Some(caption) = caption {
+                let spec = TextSpec {
+                    size: args.caption_size,
+                    max_width: None,
+                };
+                let block = typesetter
+                    .text(caption, &spec)
+                    .map_err(|error| typeset_error(error, "caption"))?;
+                let caption_half = block.local_bounds().map_or(0.0, |rect| rect.height() / 2.0);
+                // The lowest piece decides where the caption goes — usually
+                // the figure's own bottom edge, or a vertex label hanging
+                // below it.
+                let bottom = build
+                    .created
+                    .iter()
+                    .filter_map(|id| build.tree.world_bounds(*id))
+                    .map(|rect| rect.y0 - build.origin[1])
+                    .fold(f64::INFINITY, f64::min);
+                let y = if bottom.is_finite() {
+                    bottom - DEFAULT_GAP - caption_half
+                } else {
+                    -caption_half
+                };
+                build.text(caption, block, &spec, [0.0, y], None, None);
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => Ok(build.finish()),
+        Err(error) => {
+            build.rollback();
+            Err(error)
+        }
+    }
+}
+
+/// Translate the vertices so their bounding box is centred on the origin.
+///
+/// Every sized shape in the engine is centred, and the template's `position`
+/// names the group's origin; without this a caller's `position` would name an
+/// arbitrary offset inside the figure and `camera focus` would frame it off
+/// centre.
+fn centred(vertices: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let mut x0 = f64::INFINITY;
+    let mut x1 = f64::NEG_INFINITY;
+    let mut y0 = f64::INFINITY;
+    let mut y1 = f64::NEG_INFINITY;
+    for [x, y] in vertices {
+        x0 = x0.min(*x);
+        x1 = x1.max(*x);
+        y0 = y0.min(*y);
+        y1 = y1.max(*y);
+    }
+    let cx = (x0 + x1) / 2.0;
+    let cy = (y0 + y1) / 2.0;
+    vertices.iter().map(|[x, y]| [x - cx, y - cy]).collect()
+}
+
+/// Whether every vertex lies on one line — a figure with no area.
+fn collinear(vertices: &[[f64; 2]]) -> bool {
+    let Some(&[ax, ay]) = vertices.first() else {
+        return true;
+    };
+    let Some(&[bx, by]) = vertices.iter().find(|[x, y]| *x != ax || *y != ay) else {
+        return true;
+    };
+    let (dx, dy) = (bx - ax, by - ay);
+    vertices
+        .iter()
+        .all(|[x, y]| ((x - ax) * dy - (y - ay) * dx).abs() <= COLLINEAR_EPSILON)
+}
+
+/// The signed area of the vertex loop, by the shoelace formula.
+///
+/// Only its **sign** is read, to decide which side of an edge is outward: the
+/// wire has no winding field, so the vertices' own order is the only statement
+/// about orientation there is.
+fn signed_area(vertices: &[[f64; 2]]) -> f64 {
+    0.5 * vertices
+        .iter()
+        .zip(vertices.iter().cycle().skip(1))
+        .map(|(a, b)| a[0] * b[1] - b[0] * a[1])
+        .sum::<f64>()
+}
+
+/// The unit vector from `from` to `to`, or `None` when they coincide.
+fn unit(from: [f64; 2], to: [f64; 2]) -> Option<[f64; 2]> {
+    let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+    let len = dx.hypot(dy);
+    (len > 0.0).then(|| [dx / len, dy / len])
+}
+
+/// The midpoint of edge `index` and its **outward** unit normal.
+///
+/// The normal is the edge direction turned by 90°, with the sign chosen by the
+/// loop's signed area, so a label sits outside the figure whichever way the
+/// caller wound the vertices. A zero-length edge — a repeated vertex, which the
+/// polygon builder tolerates — has no normal to offer and gets `[0, 1]`, which
+/// still places the label instead of dropping it.
+fn edge_frame(vertices: &[[f64; 2]], index: usize) -> ([f64; 2], [f64; 2]) {
+    let n = vertices.len();
+    let a = vertices[index];
+    let b = vertices[(index + 1) % n];
+    let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+    let Some(direction) = unit(a, b) else {
+        return (mid, [0.0, 1.0]);
+    };
+    let sign = if signed_area(vertices) < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    (mid, [sign * direction[1], -sign * direction[0]])
+}
+
+/// The outward direction for a vertex: away from the figure's centre.
+///
+/// The centre is the origin because [`centred`] put the bounding box there; a
+/// vertex *at* the origin (a figure whose bounding-box centre is one of its
+/// own corners) has no direction to offer and is pushed up, which is as good
+/// as any other direction and never overlaps the figure's interior more than
+/// the alternatives.
+fn outward(vertex: [f64; 2]) -> [f64; 2] {
+    let len = vertex[0].hypot(vertex[1]);
+    if len == 0.0 {
+        [0.0, 1.0]
+    } else {
+        [vertex[0] / len, vertex[1] / len]
+    }
+}
+
+/// Where a label's **centre** goes: the anchor, pushed along `direction` clear
+/// of the anchor plus the label's own half-extent along that direction.
+///
+/// The extent is the support function of an axis-aligned box,
+/// `|dx|·w/2 + |dy|·h/2`, so a wide label below an edge is pushed down by its
+/// half-height only and does not float a text width away; a diagonal placement
+/// clears the box's corner. Without measuring the block the label would land
+/// with its centre on the edge and half of it inside the figure.
+fn pushed(anchor: [f64; 2], direction: [f64; 2], bounds: Option<Rect>) -> [f64; 2] {
+    let (width, height) = bounds.map_or((0.0, 0.0), |rect| (rect.width(), rect.height()));
+    let reach = direction[0].abs() * width / 2.0 + direction[1].abs() * height / 2.0 + LABEL_GAP;
+    [
+        anchor[0] + direction[0] * reach,
+        anchor[1] + direction[1] * reach,
+    ]
+}
+
+/// The corners of `vertices` whose interior angle is a right angle.
+fn right_angle_corners(vertices: &[[f64; 2]]) -> Vec<usize> {
+    let n = vertices.len();
+    (0..n)
+        .filter(|&index| {
+            let corner = vertices[index];
+            let (Some(a), Some(b)) = (
+                unit(corner, vertices[(index + n - 1) % n]),
+                unit(corner, vertices[(index + 1) % n]),
+            ) else {
+                return false;
+            };
+            (a[0] * b[0] + a[1] * b[1]).abs() <= RIGHT_ANGLE_TOLERANCE
+        })
+        .collect()
+}
+
+/// The little square that marks a right angle at `vertices[index]`.
+///
+/// Two legs along the adjoining edges, closed back to the corner: an
+/// axis-aligned square only for an axis-aligned right angle, and a rectangle
+/// in the figure's own frame otherwise — which is the conventional mark.
+/// Zero-length edges have no leg to draw and yield `None`.
+fn marker_quad(vertices: &[[f64; 2]], index: usize) -> Option<Vec<[f64; 2]>> {
+    let n = vertices.len();
+    let corner = vertices[index];
+    let prev = vertices[(index + n - 1) % n];
+    let next = vertices[(index + 1) % n];
+    let a = unit(corner, prev)?;
+    let b = unit(corner, next)?;
+    let shorter = (prev[0] - corner[0])
+        .hypot(prev[1] - corner[1])
+        .min((next[0] - corner[0]).hypot(next[1] - corner[1]));
+    let lower = MARKER_MIN.min(shorter / 2.0).min(MARKER_MAX);
+    let size = (MARKER_FRACTION * shorter).clamp(lower, MARKER_MAX);
+    let along = |direction: [f64; 2]| {
+        [
+            corner[0] + direction[0] * size,
+            corner[1] + direction[1] * size,
+        ]
+    };
+    let (p, q) = (along(a), along(b));
+    Some(vec![corner, p, [p[0] + b[0] * size, p[1] + b[1] * size], q])
+}
+
 #[cfg(test)]
 mod tests {
     //! The pure half of `explain.plot`: Horner, the sampling runs and the tick
@@ -825,5 +1312,83 @@ mod tests {
             axis_labels([-2.0, 2.0], 1.0),
             Some(vec![-2.0, -1.0, 0.0, 1.0, 2.0])
         );
+    }
+
+    // ---- explain.geometry -------------------------------------------------
+
+    #[test]
+    fn vertices_are_centred_on_their_bounding_box() {
+        let local = centred(&[[2.0, 1.0], [5.0, 1.0], [2.0, 5.0]]);
+        assert_eq!(local, vec![[-1.5, -2.0], [1.5, -2.0], [-1.5, 2.0]]);
+    }
+
+    #[test]
+    fn an_edge_normal_points_out_whichever_way_the_figure_is_wound() {
+        let ccw = centred(&[[0.0, 0.0], [3.0, 0.0], [0.0, 4.0]]);
+        let mut cw = ccw.clone();
+        cw.reverse();
+        for vertices in [ccw, cw] {
+            for index in 0..vertices.len() {
+                let (mid, normal) = edge_frame(&vertices, index);
+                // The third vertex of a triangle is on the inward side of the
+                // edge, so the normal has to point the opposite way from it.
+                let opposite = vertices[(index + 2) % vertices.len()];
+                let (dx, dy) = (mid[0] - opposite[0], mid[1] - opposite[1]);
+                assert!(
+                    dx * normal[0] + dy * normal[1] > 0.0,
+                    "edge {index} points inward: {mid:?} · {normal:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_right_angle_is_found_whichever_way_the_figure_is_wound() {
+        let ccw = [[0.0, 0.0], [3.0, 0.0], [0.0, 4.0]];
+        assert_eq!(right_angle_corners(&ccw), vec![0]);
+        let cw = [[0.0, 4.0], [3.0, 0.0], [0.0, 0.0]];
+        assert_eq!(right_angle_corners(&cw), vec![2]);
+        assert!(right_angle_corners(&[[0.0, 0.0], [2.0, 0.0], [1.0, 2.0]]).is_empty());
+    }
+
+    #[test]
+    fn a_line_of_vertices_is_collinear_but_a_bow_tie_is_not() {
+        assert!(collinear(&[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]));
+        assert!(collinear(&[[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]]));
+        assert!(!collinear(&[[0.0, 0.0], [3.0, 0.0], [0.0, 4.0]]));
+        // A bow tie's signed area is zero, which is why the refusal is a
+        // cross-product test and not an area test.
+        let bow_tie = [[0.0, 0.0], [2.0, 2.0], [2.0, 0.0], [0.0, 2.0]];
+        assert!(signed_area(&bow_tie).abs() < 1e-12);
+        assert!(!collinear(&bow_tie));
+    }
+
+    #[test]
+    fn a_label_is_pushed_clear_of_its_anchor_and_its_own_extent() {
+        let rect = Rect::new(-2.0, -0.5, 2.0, 0.5);
+        let below = pushed([0.0, 1.0], [0.0, -1.0], Some(rect));
+        assert_eq!(below, [0.0, 1.0 - 0.5 - LABEL_GAP]);
+        let diagonal = pushed([0.0, 1.0], [std::f64::consts::FRAC_1_SQRT_2; 2], Some(rect));
+        // A diagonal placement clears the box's corner, not its half-width.
+        let expected = (2.0 + 0.5) * std::f64::consts::FRAC_1_SQRT_2 + LABEL_GAP;
+        assert!(
+            (diagonal[0] - expected * std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12,
+            "{diagonal:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_is_a_small_square_in_the_figures_own_frame() {
+        let vertices = centred(&[[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]]);
+        let quad = marker_quad(&vertices, 0).unwrap();
+        assert_eq!(quad.len(), 4);
+        assert_eq!(quad[0], vertices[0]);
+        let leg = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).hypot(p[1] - q[1]);
+        // 0.18 of the shorter adjoining edge, which is 2 here.
+        assert!((leg(quad[0], quad[1]) - 0.36).abs() < 1e-12, "{quad:?}");
+        assert!((leg(quad[0], quad[3]) - 0.36).abs() < 1e-12, "{quad:?}");
+        // The far corner is the parallelogram's, not a fourth guess.
+        assert!((quad[2][0] - (quad[1][0] + quad[3][0] - quad[0][0])).abs() < 1e-12);
+        assert!((quad[2][1] - (quad[1][1] + quad[3][1] - quad[0][1])).abs() < 1e-12);
     }
 }

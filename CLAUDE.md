@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **859 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **870 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -373,7 +373,7 @@ last property.
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it), `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) and `templates` (the `explain.*` thick tools: one group, addressable pieces, a declared box and an atomic rollback) | Real |
-| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the remaining four templates, the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; the first two templates live one crate up) |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the remaining three templates, the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; the first three templates live one crate up) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -2103,7 +2103,7 @@ two-piece count. `ACTIONS` 26 → 27. **All eight goldens are unchanged**, and t
 846 → 856.
 
 Deferred, and named so they are not rediscovered as gaps: labels that *follow* their subject, the
-remaining four `explain.*` templates (`geometry`, `matrix`, `chart`, `algorithm`), the linter
+remaining three `explain.*` templates (`matrix`, `chart`, `algorithm`), the linter
 (out of frame, overlap, size, contrast, pacing) and `ScenePlan`. Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
 arrow is a static node placed once; re-placing it is a `point_at` again, and following would need a
 per-frame constraint the tree does not have), and spotlight-beyond-opacity (a true mask over the
@@ -2988,6 +2988,28 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   Evidence: two kernel tests over the vertex walk and the style, one command test over the three
   refusals, the sentence pinned beside the other kinds, a round-trip fixture, the capabilities count
   (`ALL` 11 → 12) and the conformance probe; **all eight goldens unchanged**, count 856 → 859.
+- **Phase 2's seventh slice — the third template, `explain.geometry` — is done**, and it is the one
+  template whose subject is *not* a mathematical object the engine already knew: a triangle is a
+  vertex list, and everything a lesson puts around it is the template's job. Four decisions are
+  load-bearing. **The vertices are centred on their bounding box** before anything is built, so
+  `position` names the figure's centre (the convention every sized shape follows) and `camera focus`
+  frames the figure rather than a corner. **The right angle is measured**, by the dot product of the
+  two adjoining unit edges against `1e-3`; the marker is a stroked square in the figure's own frame,
+  built by the same `Polygon` builder with the fill switched off and `kind = Unknown` so a reader
+  hears "an image", not "a four-sided figure with an area". **Labels are placed by measurement**:
+  an edge label sits on the outward normal (whose sign comes from the shoelace area, so either
+  winding works) pushed clear by the label's own support function plus `0.12`; a vertex label is
+  pushed away from the centre the same way. **A bare figure needs no typesetter** — unlike `plot`,
+  whose tick labels are mandatory — so the template takes `Option<&mut dyn Typesetter>` and a build
+  without one draws the figure and refuses only a labelled call, under `text`. Collinearity is
+  refused by cross products rather than by signed area, which would wrongly accept a bow tie.
+  `created = [group, figure, marker…, side labels, vertex labels, caption?]`. `ACTIONS` 27 → 28.
+  Evidence: six unit tests over the pure half (centring, the winding-independent normal, right-angle
+  detection, collinearity, the push distance, the marker quad), four context tests (the group with
+  its placed marker, side and vertex labels and caption, the bare figure without a typesetter, ten
+  by-field refusals plus three constructed ones with the tree unchanged, and a late-typesetter
+  rollback), two round-trip fixtures, and a conformance case through the real binary;
+  **all eight goldens unchanged**, count 859 → 870.
 
 ## AI integration
 

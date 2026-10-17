@@ -1330,6 +1330,50 @@ impl SceneContext {
             return crate::templates::plot(&mut self.tree, typesetter.as_mut(), args)
                 .map(CommandOutcome::Applied);
         }
+        if let Command::ExplainGeometry {
+            vertices,
+            side_labels,
+            vertex_labels,
+            right_angle,
+            fill_opacity,
+            color,
+            label_size,
+            position,
+            caption,
+            caption_size,
+            label,
+        } = cmd
+        {
+            // Unlike a plot, a figure is a legitimate picture with no text at
+            // all, so the shaper is optional here and the template refuses
+            // only the spellings that ask for labels. `supports_text` is what
+            // a host's `hello` already advertises.
+            fn as_typesetter(
+                typesetter: &mut Box<dyn crate::typeset::Typesetter>,
+            ) -> &mut dyn crate::typeset::Typesetter {
+                typesetter.as_mut()
+            }
+            let typesetter: Option<&mut dyn crate::typeset::Typesetter> = if self.supports_text() {
+                self.typesetter.as_mut().map(as_typesetter)
+            } else {
+                None
+            };
+            let args = crate::templates::Geometry {
+                vertices,
+                side_labels: side_labels.as_deref(),
+                vertex_labels: vertex_labels.as_deref(),
+                right_angle: *right_angle,
+                fill_opacity: *fill_opacity,
+                color: *color,
+                label_size: *label_size,
+                caption: caption.as_deref(),
+                caption_size: *caption_size,
+                position: *position,
+                label: label.as_deref(),
+            };
+            return crate::templates::geometry(&mut self.tree, typesetter, args)
+                .map(CommandOutcome::Applied);
+        }
         if let Command::Highlight {
             target,
             dim,
@@ -3660,7 +3704,268 @@ mod tests {
         ));
     }
 
-    // ---- the camera -------------------------------------------------------
+    // ---- explain.geometry -------------------------------------------------
+
+    /// A bare figure command: every optional slot defaulted.
+    fn explain_geometry(vertices: Vec<[f64; 2]>) -> Command {
+        Command::ExplainGeometry {
+            vertices,
+            side_labels: None,
+            vertex_labels: None,
+            right_angle: None,
+            fill_opacity: None,
+            color: None,
+            label_size: None,
+            position: None,
+            caption: None,
+            caption_size: None,
+            label: None,
+        }
+    }
+
+    /// A 3-4-5 right triangle with one right-angle marker, three side labels,
+    /// three vertex labels and a caption.
+    ///
+    /// Every number below is exact: the vertices are centred on their bounding
+    /// box first (so the figure's own corners are `(-1.5, -2)`, `(1.5, -2)` and
+    /// `(-1.5, 2)`) and then moved by `position`, and the fake shaper's blocks
+    /// are one unit tall and one unit per character wide. A template that
+    /// labelled the un-centred vertices, or that pushed a label out by half a
+    /// guess instead of its measured extent, lands somewhere else.
+    #[test]
+    fn a_geometry_groups_a_labelled_triangle() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[3.0,0.0],[0.0,4.0]],"side_labels":["a","b","c"],"vertex_labels":["A","B","C"],"caption":"直角三角形","position":[0.5,1.0],"label":"图"}"#,
+        )
+        .expect("a wire geometry");
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &cmd);
+
+        // Group, figure, one right-angle marker, three side labels, three
+        // vertex labels and the caption.
+        assert_eq!(diff.created.len(), 10, "{:?}", diff.created);
+        let group = diff.created[0];
+        assert_eq!(ctx.tree.get(group).unwrap().kind, NodeKind::Group);
+        assert_eq!(ctx.tree.get(group).unwrap().label.as_deref(), Some("图"));
+
+        // The figure is centred on its bounding box: the original bbox centre
+        // is (1.5, 2), so the local corners are -1.5..1.5 and -2..2, and the
+        // group moves them by (0.5, 1).
+        let figure = diff.created[1];
+        assert_eq!(ctx.tree.get(figure).unwrap().kind, NodeKind::Polygon);
+        let bounds = ctx.tree.world_bounds(figure).unwrap();
+        assert!((bounds.x0 + 1.0).abs() < 1e-12, "{bounds:?}");
+        assert!((bounds.x1 - 2.0).abs() < 1e-12, "{bounds:?}");
+        assert!((bounds.y0 + 1.0).abs() < 1e-12, "{bounds:?}");
+        assert!((bounds.y1 - 3.0).abs() < 1e-12, "{bounds:?}");
+
+        // A wash with a stroked edge in the same paint.
+        let style = &ctx.tree.get(figure).unwrap().style;
+        assert_eq!(style.fill_opacity, 0.3);
+        assert_eq!(style.stroke_opacity, 1.0);
+        assert_eq!(style.fill, style.stroke);
+
+        // The right angle at the origin corner is marked by an outline square
+        // with legs 0.4 (0.18 of the shorter edge, clamped): local
+        // (-1.5, -2)..(-1.1, -1.6).
+        let marker = diff.created[2];
+        let m = ctx.tree.get(marker).unwrap();
+        assert_eq!(m.label.as_deref(), Some("直角标记"));
+        assert_eq!(m.kind, NodeKind::Unknown);
+        assert_eq!((m.style.fill_opacity, m.style.stroke_opacity), (0.0, 1.0));
+        let marker_bounds = ctx.tree.world_bounds(marker).unwrap();
+        assert!((marker_bounds.x0 + 1.0).abs() < 1e-12, "{marker_bounds:?}");
+        assert!((marker_bounds.x1 + 0.6).abs() < 1e-12, "{marker_bounds:?}");
+        assert!((marker_bounds.y0 + 1.0).abs() < 1e-12, "{marker_bounds:?}");
+        assert!((marker_bounds.y1 + 0.6).abs() < 1e-12, "{marker_bounds:?}");
+
+        // Side labels sit outside their own edge, pushed clear by half their
+        // measured box plus the gap. Edge a is the bottom one: midpoint local
+        // (0, -2), outward (0, -1), half-height 0.5, gap 0.12.
+        let a = centres(&ctx, &diff, "a");
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert!((a[0].x - 0.5).abs() < 1e-12, "{:?}", a[0]);
+        assert!((a[0].y + 1.62).abs() < 1e-12, "{:?}", a[0]);
+        // The hypotenuse (edge b) faces up-right: its normal is (0.8, 0.6).
+        let b = centres(&ctx, &diff, "b");
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert!((b[0].x - 1.156).abs() < 1e-12, "{:?}", b[0]);
+        assert!((b[0].y - 1.492).abs() < 1e-12, "{:?}", b[0]);
+
+        // A vertex label is pushed away from the centred origin: the right
+        // angle's vertex at local (-1.5, -2) has direction (-0.6, -0.8).
+        let vertex = centres(&ctx, &diff, "A");
+        assert_eq!(vertex.len(), 1, "{vertex:?}");
+        assert!((vertex[0].x + 1.492).abs() < 1e-12, "{:?}", vertex[0]);
+        assert!((vertex[0].y + 1.656).abs() < 1e-12, "{:?}", vertex[0]);
+
+        // The caption is measured off the lowest piece — here a vertex label,
+        // whose line box reaches local -3.156 — one gap and half a line down.
+        let caption = *diff.created.last().unwrap();
+        assert_eq!(ctx.tree.get(caption).unwrap().kind, NodeKind::Text);
+        let text = ctx.tree.world_bounds(caption).unwrap();
+        assert!((text.center().x - 0.5).abs() < 1e-12, "{text:?}");
+        assert!((text.center().y + 3.006).abs() < 1e-12, "{text:?}");
+    }
+
+    /// A figure is a picture on its own: no typesetter, no labels, no refusal.
+    #[test]
+    fn a_bare_figure_needs_no_typesetter() {
+        let mut ctx = scene();
+        let diff = applied(
+            &mut ctx,
+            &explain_geometry(vec![[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]]),
+        );
+        assert_eq!(diff.created.len(), 3, "group, figure and one marker");
+        assert_eq!(ctx.tree.get(diff.created[0]).unwrap().kind, NodeKind::Group);
+        assert_eq!(
+            ctx.tree.get(diff.created[1]).unwrap().kind,
+            NodeKind::Polygon
+        );
+
+        // The same build refuses the moment a label asks for text.
+        let labelled = Command::ExplainGeometry {
+            vertices: vec![[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]],
+            side_labels: Some(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]),
+            vertex_labels: None,
+            right_angle: None,
+            fill_opacity: None,
+            color: None,
+            label_size: None,
+            position: None,
+            caption: None,
+            caption_size: None,
+            label: None,
+        };
+        let before = ctx.tree.len();
+        assert!(matches!(
+            ctx.handle(&labelled),
+            Err(CommandError::Unsupported { ref feature }) if feature == "text"
+        ));
+        assert_eq!(ctx.tree.len(), before);
+    }
+
+    /// Every refusal names its own field and leaves the tree exactly as it
+    /// found it.
+    #[test]
+    fn a_geometry_refuses_before_creating_anything() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let before = ctx.tree.len();
+        for (json, field) in [
+            (r#"{"action":"explain.geometry","vertices":[]}"#, "vertices"),
+            (
+                r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[1.0,0.0]]}"#,
+                "vertices",
+            ),
+            (
+                r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[1.0,1.0],[2.0,2.0]]}"#,
+                "vertices",
+            ),
+            (
+                r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[1.0,0.0],[0.0,1.0]],"side_labels":["a"]}"#,
+                "side_labels",
+            ),
+            (
+                r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[1.0,0.0],[0.0,1.0]],"side_labels":["a"," ","c"]}"#,
+                "side_labels",
+            ),
+            (
+                r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[1.0,0.0],[0.0,1.0]],"vertex_labels":["A","B"]}"#,
+                "vertex_labels",
+            ),
+            (
+                r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[1.0,0.0],[0.0,1.0]],"fill_opacity":1.5}"#,
+                "fill_opacity",
+            ),
+            (
+                r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[1.0,0.0],[0.0,1.0]],"label_size":0.0}"#,
+                "label_size",
+            ),
+            (
+                r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[1.0,0.0],[0.0,1.0]],"caption":"  "}"#,
+                "caption",
+            ),
+            (
+                r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[1.0,0.0],[0.0,1.0]],"caption_size":-1.0}"#,
+                "caption_size",
+            ),
+        ] {
+            let cmd: Command = serde_json::from_str(json).expect("a wire geometry");
+            assert!(
+                matches!(
+                    ctx.handle(&cmd),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == field
+                ),
+                "{json} refused as the wrong field"
+            );
+            assert_eq!(ctx.tree.len(), before, "{json} left nodes behind");
+        }
+
+        // Non-finite values and the vertex cap have no JSON spelling of their
+        // own here, so these are built directly.
+        let many: Vec<[f64; 2]> = (0..65).map(|i| [f64::from(i), f64::from(i % 3)]).collect();
+        let json = format!(
+            r#"{{"action":"explain.geometry","vertices":{}}}"#,
+            serde_json::to_string(&many).unwrap()
+        );
+        let too_many: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            ctx.handle(&too_many),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "vertices"
+        ));
+
+        let mut nan = explain_geometry(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]);
+        if let Command::ExplainGeometry { vertices, .. } = &mut nan {
+            vertices[2] = [f64::NAN, 1.0];
+        }
+        assert!(matches!(
+            ctx.handle(&nan),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "vertices"
+        ));
+
+        let mut off_world = explain_geometry(vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
+        if let Command::ExplainGeometry { position, .. } = &mut off_world {
+            *position = Some([f64::INFINITY, 0.0]);
+        }
+        assert!(matches!(
+            ctx.handle(&off_world),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "position"
+        ));
+        assert_eq!(ctx.tree.len(), before);
+    }
+
+    /// A label that fails to typeset rolls the whole figure back — the group,
+    /// the figure and the marker are already in the tree when it happens.
+    #[test]
+    fn a_failed_label_rolls_the_figure_back() {
+        let mut ctx = with_typesetter(FakeTypesetter {
+            refuse: Some(TypesetError::failed("assets/fonts is missing")),
+            ..FakeTypesetter::both()
+        });
+        let before = ctx.tree.len();
+        let labelled = Command::ExplainGeometry {
+            vertices: vec![[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]],
+            side_labels: Some(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]),
+            vertex_labels: None,
+            right_angle: None,
+            fill_opacity: None,
+            color: None,
+            label_size: None,
+            position: None,
+            caption: None,
+            caption_size: None,
+            label: None,
+        };
+        assert!(matches!(
+            ctx.handle(&labelled),
+            Err(CommandError::Typeset { .. })
+        ));
+        assert_eq!(
+            ctx.tree.len(),
+            before,
+            "a refused figure left pieces behind"
+        );
+    }
 
     fn camera_cmd(center: Option<[f64; 2]>, zoom: Option<f64>, duration: Option<f64>) -> Command {
         Command::Camera {

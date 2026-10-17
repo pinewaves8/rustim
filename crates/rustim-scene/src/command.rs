@@ -380,6 +380,65 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// Show a figure: a closed shape, its labelled sides and vertices, right-angle
+    /// markers and a caption.
+    ///
+    /// The third `explain.*` template. `vertices` is the figure's outline in
+    /// world coordinates, in winding order and **closed by the template** (a
+    /// repeated first vertex is accepted and dropped) — a triangle, a
+    /// parallelogram or a hexagon are the same command with a different vertex
+    /// table. At least three vertices are required; at most 64; every
+    /// coordinate must be finite and the vertices must not all lie on one line,
+    /// because a figure with no area draws nothing.
+    ///
+    /// **The vertices are centred on their bounding box**, so `position` names
+    /// the figure's centre rather than an arbitrary corner, and the slot means
+    /// the same thing it means for every sized shape.
+    ///
+    /// `side_labels` names the edges in vertex order — label `i` belongs to the
+    /// edge from vertex `i` to vertex `i + 1` — and `vertex_labels` names the
+    /// vertices in their own order. Each list must be as long as `vertices`, or
+    /// absent. Labels are placed **outside** the figure by their own measured
+    /// extent plus a gap, so a long word does not overlap the edge it names;
+    /// they are typeset in the foreground colour, because `color` names the
+    /// figure.
+    ///
+    /// `right_angle` (default `true`) marks every corner whose interior angle is
+    /// 90° with a small outline square — the conventional mark, and the reason a
+    /// caller explaining Pythagoras does not have to draw it. `fill_opacity`
+    /// (default `0.3`) is the figure's wash; its edge is always stroked, so the
+    /// outline reads against the fill. `label_size` sizes the side and vertex
+    /// labels.
+    ///
+    /// The reply's `created` is `[group, figure, marker…, side label…, vertex
+    /// label…, caption?]`, so `created[1]` is always the figure. Answered by
+    /// [`crate::SceneContext::handle`], because the labels are typeset; a build
+    /// with no typesetter still accepts a bare figure and refuses any command
+    /// that asks for text with [`CommandError::Unsupported`] under `text`.
+    #[serde(rename = "explain.geometry")]
+    ExplainGeometry {
+        vertices: Vec<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        side_labels: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vertex_labels: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        right_angle: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fill_opacity: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<[u8; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Dim everything but an object for a moment, then bring it back.
     ///
     /// The attention helper a spoken explanation needs and `point_at` does not
@@ -721,6 +780,7 @@ pub const ACTIONS: &[&str] = &[
     "checkpoint",
     "events",
     "explain.equation",
+    "explain.geometry",
     "explain.plot",
     "fit",
     "hello",
@@ -762,6 +822,7 @@ impl Command {
             Self::PointAt { .. } => "point_at",
             Self::Annotate { .. } => "annotate",
             Self::ExplainEquation { .. } => "explain.equation",
+            Self::ExplainGeometry { .. } => "explain.geometry",
             Self::ExplainPlot { .. } => "explain.plot",
             Self::Highlight { .. } => "highlight",
             Self::Play { .. } => "play",
@@ -1947,6 +2008,12 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // Answered by `SceneContext::handle` for the same reason: the tick
             // labels are typeset, and `apply` may not read fonts.
         }
+        Command::ExplainGeometry { .. } => {
+            // Answered by `SceneContext::handle` for the same reason: the side
+            // and vertex labels are typeset, and `apply` may not read fonts. A
+            // bare figure needs none, but `apply` cannot know which spelling
+            // arrived without duplicating the template's own validation.
+        }
         Command::Narrate { .. } => {
             // Answered by `SceneContext::handle`, because scheduling narration
             // needs the virtual clock and the narration track — neither of which
@@ -2810,6 +2877,8 @@ mod tests {
             // the serialised order, so the fields here follow the enum.
             r#"{"action":"explain.plot","coefficients":[0.0,-1.75,0.25],"x_range":[-4.0,4.0],"y_range":[-3.0,3.0],"width":7.0,"height":4.0,"samples":160,"step":1.0,"color":[255,213,79],"position":[0.0,0.5],"caption":"y = 0.25x² - 1.75","caption_size":0.5,"label":"抛物线"}"#.to_owned(),
             r#"{"action":"explain.plot","coefficients":[1.0,0.0,-1.0]}"#.to_owned(),
+            r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[3.0,0.0],[0.0,4.0]],"side_labels":["a","b","c"],"vertex_labels":["A","B","C"],"right_angle":true,"fill_opacity":0.3,"color":[100,181,246],"label_size":0.4,"position":[0.0,0.5],"caption":"直角三角形","caption_size":0.5,"label":"图形"}"#.to_owned(),
+            r#"{"action":"explain.geometry","vertices":[[0.0,0.0],[2.0,0.0],[1.0,2.0]]}"#.to_owned(),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for json in cases {
@@ -2909,6 +2978,19 @@ mod tests {
                 samples: None,
                 step: None,
                 color: None,
+                position: None,
+                caption: None,
+                caption_size: None,
+                label: None,
+            },
+            Command::ExplainGeometry {
+                vertices: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                side_labels: None,
+                vertex_labels: None,
+                right_angle: None,
+                fill_opacity: None,
+                color: None,
+                label_size: None,
                 position: None,
                 caption: None,
                 caption_size: None,
