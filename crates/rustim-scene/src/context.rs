@@ -219,6 +219,31 @@ impl SceneContext {
         self.animations.update(dt, &mut self.tree);
     }
 
+    /// Interrupt the timeline: drop every queued beat and every running
+    /// animation, leaving the picture exactly where the last frame put it.
+    ///
+    /// Two `clear`s and nothing else, and **that is the whole semantics**: both
+    /// drivers deliberately do not call [`Animation::finish`], so an animation
+    /// stopped here has no completion step — a `FadeOut` in flight leaves its
+    /// target in the tree at the opacity it reached, a morph leaves its subject
+    /// part-way, and the next `play` starts from there. Jumping every animation
+    /// to its end state instead would be `finish`, which is the opposite of what
+    /// "stop" means to a viewer.
+    ///
+    /// The clock is untouched — [`SceneContext::clock`] is the lecture's time,
+    /// and narration and subtitle cues are timed against it — but the scheduler's
+    /// own elapsed time resets with its list. That is unobservable: progress is
+    /// read as `elapsed - started_at`, and every animation queued afterwards is
+    /// stamped from the fresh zero, so it starts at its own zero either way.
+    ///
+    /// [`SceneContext::is_playing`] becomes false, which is what makes a scene
+    /// that reacts to the timeline draining (a relabel, the `ANIMATION_DONE`
+    /// announcement) see an interrupt as an ending rather than as a stall.
+    pub fn stop(&mut self) {
+        self.animations.clear();
+        self.playback.clear();
+    }
+
     /// Is there anything left to play — now or later?
     ///
     /// Not `!animations.is_empty()`: that reads "finished" during the frame before
@@ -321,9 +346,10 @@ impl SceneContext {
 
     /// Apply a command from outside the engine.
     ///
-    /// [`Command::Play`], [`Command::Camera`], [`Command::Motion`],
-    /// [`Command::Narrate`] and [`Command::Query`] are answered **here** rather
-    /// than in `command::apply`: a play needs the playback machine, a camera
+    /// [`Command::Play`], [`Command::Stop`], [`Command::Camera`],
+    /// [`Command::Motion`], [`Command::Narrate`] and [`Command::Query`] are
+    /// answered **here** rather than in `command::apply`: a play needs the
+    /// playback machine, a stop needs it *and* the scheduler, a camera
     /// command needs the playback machine *or* the viewport's aspect ratio (for
     /// `focus`), a motion command names a field on this context rather than in
     /// the tree, a narration needs the virtual clock and its own track, a query
@@ -333,6 +359,11 @@ impl SceneContext {
     /// and replayable.
     /// The wire→animation and wire→camera mappings still live in `command`, next
     /// to the wire types.
+    ///
+    /// A [`Command::Stop`] calls [`SceneContext::stop`] and answers with an
+    /// empty diff: the timeline ends where the last frame left it, and no
+    /// `finish` runs — see that method for what an interrupt deliberately does
+    /// *not* do.
     ///
     /// A camera command without a `duration` writes `tree.camera` now; one with a
     /// duration (including `0.0`) queues a single `CameraMove` beat, so it is
@@ -369,6 +400,10 @@ impl SceneContext {
         if let Command::Play { animation } = cmd {
             let anim = command::animation_for(&self.tree, animation)?;
             self.play_all([anim]);
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
+        }
+        if let Command::Stop = cmd {
+            self.stop();
             return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Motion { mode } = cmd {
@@ -552,7 +587,7 @@ impl SceneContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustim_anim::{FadeIn, Motion, MoveTo, Wait, rate};
+    use rustim_anim::{FadeIn, FadeOut, Motion, MoveTo, Wait, rate};
     use rustim_math::Affine2;
     use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 
@@ -1048,6 +1083,135 @@ mod tests {
         assert_eq!(opacity(&ctx, id), 1.0);
         assert!(!ctx.is_playing(), "and it really is over");
         assert!(ctx.animations.is_empty());
+    }
+
+    /// **An interrupt is not a fast-forward.**
+    ///
+    /// `stop` drops the running animation without running `finish`, so the tree
+    /// keeps exactly the state the last frame wrote — half faded, half moved —
+    /// and the next `play` starts from there. Driving the same fade to its end
+    /// would take the object to 1.0; a settled `stop` must not, and neither may
+    /// anything after it creep the value along.
+    #[test]
+    fn stop_freezes_the_picture_where_the_last_frame_left_it() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(FadeIn::new(id).with_duration(1.0));
+        ctx.play(Wait::new(0.5));
+
+        tick(&mut ctx, 30); // half a second, and `ease_in_out(0.5) == 0.5`
+        let half = opacity(&ctx, id);
+        assert!((half - 0.5).abs() < 1e-12, "opacity {half} is not half-way");
+        assert!(ctx.is_playing());
+
+        let diff = applied(&mut ctx, &Command::Stop);
+        assert_eq!(diff, StateDiff::default(), "stopping is not a tree change");
+        assert!(!ctx.is_playing(), "the timeline is over, not paused");
+        assert!(ctx.animations.is_empty());
+        assert_eq!(ctx.playback.len(), 0, "the queued pause went too");
+
+        // Idempotent: a second stop is a success that changes nothing. "Make it
+        // stop" is satisfied by a scene that has stopped.
+        let again = applied(&mut ctx, &Command::Stop);
+        assert_eq!(again, StateDiff::default());
+        assert!(!ctx.is_playing());
+
+        // Nothing moves it afterwards: neither an `interpolate` nor a `finish`.
+        tick(&mut ctx, 120);
+        assert_eq!(
+            opacity(&ctx, id),
+            half,
+            "a stopped animation must not creep"
+        );
+
+        // And the next beat starts from the frozen state rather than from zero.
+        ctx.play(FadeIn::new(id).with_duration(0.5));
+        tick(&mut ctx, 40);
+        assert_eq!(opacity(&ctx, id), 1.0);
+        assert!(!ctx.is_playing());
+    }
+
+    /// The difference between "stop" and "finish", stated on the one animation
+    /// whose completion *deletes* something: an interrupted `FadeOut` leaves its
+    /// target in the tree at the opacity it had reached.
+    ///
+    /// The counterfactual is in the same test, because a transparent object draws
+    /// nothing either way — the picture cannot tell an interrupted fade from a
+    /// completed one, exactly as it cannot see the `Box` forwarding trap. The tree
+    /// is the only witness.
+    #[test]
+    fn stop_does_not_run_the_removal_an_animation_owes() {
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        ctx.play(FadeOut::new(id).with_duration(1.0));
+
+        tick(&mut ctx, 30);
+        let half = opacity(&ctx, id);
+        assert!(half > 0.0 && half < 1.0, "opacity {half} is not mid-fade");
+
+        applied(&mut ctx, &Command::Stop);
+        tick(&mut ctx, 120);
+        assert!(
+            ctx.tree.get(id).is_some(),
+            "an interrupted fade-out must not remove its target"
+        );
+        assert_eq!(opacity(&ctx, id), half);
+
+        // The same script played out *does* remove it, so the assertion above is
+        // about the interrupt and not about `FadeOut` being inert.
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        ctx.play(FadeOut::new(id).with_duration(1.0));
+        while ctx.is_playing() {
+            ctx.advance(DT);
+        }
+        assert!(ctx.tree.get(id).is_none());
+    }
+
+    /// A beat that was queued but never started is dropped without ever running:
+    /// its animations do not `begin`, so the picture is untouched. Clearing only
+    /// the scheduler would pass the two tests above and leave this one failing on
+    /// the next frame, when the queue hands the dropped beat over anyway.
+    #[test]
+    fn stop_drops_beats_that_never_started() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        ctx.play(Wait::new(0.5));
+        ctx.play(FadeIn::new(id).with_duration(0.5));
+
+        tick(&mut ctx, 10); // inside the pause; the fade is still queued
+        assert_eq!(opacity(&ctx, id), 0.0);
+        assert_eq!(ctx.playback.len(), 1, "the fade is waiting its turn");
+
+        applied(&mut ctx, &Command::Stop);
+        assert_eq!(ctx.playback.len(), 0);
+        tick(&mut ctx, 120);
+        assert_eq!(opacity(&ctx, id), 0.0, "a dropped beat must never run");
+        assert!(!ctx.is_playing());
+    }
+
+    /// Narration is not an animation, so an interrupt does not cut the lecture
+    /// track: a line already scheduled still falls due, and the command's own
+    /// clock is not the scheduler's.
+    #[test]
+    fn stop_leaves_the_narration_track_alone() {
+        let mut ctx = scene();
+        ctx.handle(&Command::Narrate {
+            text: "停下来".to_owned(),
+            at: Some(0.25),
+        })
+        .unwrap();
+        applied(&mut ctx, &Command::Stop);
+        assert!(ctx.take_narration().is_empty(), "not due yet");
+
+        tick(&mut ctx, 20);
+        assert_eq!(ctx.take_narration(), vec!["停下来".to_owned()]);
     }
 
     /// Manim's `Scene.wait` is `play(Wait(duration))` (`scene.py:1242-1276`), and it

@@ -402,6 +402,78 @@ fn a_script_can_address_objects_by_label() {
     );
 }
 
+/// **An interrupt ends the timeline; it does not fast-forward it.**
+///
+/// A file feed applies every line at t = 0, so a `play` followed by a `stop`
+/// drops the beat before it ever starts — and the still is therefore
+/// pixel-identical to the same script without the `play` at all. Without the
+/// stop the fade-out completes and its target leaves the tree, which is the
+/// counterfactual this test renders: one script's worth of difference, in
+/// three frames.
+#[test]
+fn a_stop_drops_a_beat_before_it_starts() {
+    let add = r#"{"action":"add","type":"square","params":{"width":2.0,"label":"方块"}}"#;
+    let fade =
+        r#"{"action":"play","animation":{"target":"方块","type":"fade_out","duration":1.0}}"#;
+
+    let plain = scratch("stop-plain", &format!("{add}\n"));
+    let interrupted = scratch(
+        "stop-interrupted",
+        &format!("{add}\n{fade}\n{{\"action\":\"stop\"}}\n"),
+    );
+    let played = scratch("stop-played", &format!("{add}\n{fade}\n"));
+
+    let stopped_png = out_path("stop-interrupted");
+    let ran = run(&[
+        "--script",
+        interrupted.to_str().unwrap(),
+        "--reply",
+        "--png",
+        stopped_png.to_str().unwrap(),
+    ]);
+    ran.ok("--script … --reply --png with a stop");
+
+    // The reply is a present-but-empty diff, exactly like `play`'s: stopping
+    // changes what will happen, not what is in the tree.
+    let replies = ran.replies();
+    assert_eq!(replies.len(), 3);
+    let diff = replies[2]
+        .diff
+        .as_ref()
+        .expect("a stop is applied, not refused");
+    assert!(diff.created.is_empty() && diff.modified.is_empty() && diff.removed.is_empty());
+    assert!(replies.iter().all(|r| r.error.is_none()));
+
+    let plain_png = out_path("stop-plain");
+    let played_png = out_path("stop-played");
+    for (script, png) in [(&plain, &plain_png), (&played, &played_png)] {
+        run(&[
+            "--script",
+            script.to_str().unwrap(),
+            "--png",
+            png.to_str().unwrap(),
+        ])
+        .ok("--script … --png");
+    }
+
+    let tolerance = Tolerance::default();
+    let stopped =
+        compare_png_files(&stopped_png, &plain_png, &tolerance).expect("both files are one frame");
+    assert_eq!(
+        stopped.max,
+        0,
+        "the interrupted script must render as if the beat never played.\n{}",
+        stopped.report(&tolerance),
+    );
+    assert!(stopped.diff_bbox.is_none());
+    let completed =
+        compare_png_files(&played_png, &plain_png, &tolerance).expect("both files are one frame");
+    assert!(
+        completed.max > 0,
+        "the counterfactual is broken: a completed fade-out should have removed the square"
+    );
+}
+
 /// A refused command is answered, and the session continues.
 ///
 /// This is the whole posture of the command layer — a refusal is a value, never a

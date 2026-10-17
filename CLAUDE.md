@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **604 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **611 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -1924,8 +1924,9 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   find in their own script; and `--reply` exposed that `--png` and the frame-rate line both wrote to
   stdout, so `main::note` now routes every informational line to stderr when stdout is protocol. What
   it deliberately leaves for P3+: the query command (no way to read a live tree), label addressing,
-  and a merged `--reply`/`--inspect`. See "The feed" under AI integration. **The query command and
-  label addressing have since landed** (P3+ steps 22a and 22b, below); stop/interrupt is the last one.
+  and a merged `--reply`/`--inspect`. See "The feed" under AI integration. **The query command, label
+  addressing and stop/interrupt have all since landed** (P3+ steps 22a, 22b and 22c, below), which
+  leaves only the merged `--reply`/`--inspect` on that list.
 - **P3's camera is done** (the first half of the `axes`/`plot` step). `Viewport` was cut down to the
   window, `Camera` moved onto `SceneTree`, `CameraMove` joined the animation set, and
   `{"action":"camera","center"?,"zoom"?,"focus"?,"duration"?}` joined the protocol — see "The
@@ -2141,7 +2142,32 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   purpose: renaming on ambiguity (a command that rewrites the label would be a mutation nobody
   asked for), and prefix/glob matching — exact match only, because a fuzzy address that resolves is
   harder to explain than a refusal.
-- **P3+** — the AI command surface at full width: stop/interrupt (22c) is the last item.
+- **P3+ step 22c — stop/interrupt — is done**, and it is the item that makes the command surface
+  complete: `{"action":"stop"}` drops every queued beat and every running animation, and the picture
+  stays exactly where the last frame put it. The mechanism is two `clear`s — the scheduler's and the
+  queue's — and what is load-bearing is what they **do not** call: neither runs an animation's
+  `finish`, so a `FadeOut` in flight leaves its target in the tree at the opacity it reached, a morph
+  leaves its subject part-way, and the next `play` starts from there. That is the difference between
+  an interrupt and a fast-forward, and a still cannot see it (a half-faded object and a removed one
+  are both nearly invisible), which is why the tests assert on the tree. `SceneContext::stop` is the
+  named entry point, `handle` intercepts the command and answers with a present-but-empty
+  `StateDiff` for `play`'s reason, and `apply` keeps a no-op arm so a direct caller replays a log
+  without a panic. The lecture clock and the narration track are untouched — neither is an animation
+  — while `is_playing` goes false, so a scene listening for its timeline to drain sees an ending.
+  Evidence: four context tests (freeze at half-way with the next beat starting from the frozen state,
+  idempotence, an interrupted `FadeOut` keeping its target against a completed one removing it, a
+  queued-but-unstarted beat never running, narration still due after a stop), a command test that the
+  host-answered commands are no-ops on a bare tree, a round-trip case for the bare tag, a
+  browser-session interrupt through the shared bridge, and an end-to-end script whose `play` + `stop`
+  render is **pixel-identical** to the same script without the play — against a counterfactual render
+  where the completed fade-out removes the square. **No golden moved**: the command changes what
+  plays, not what is drawn. Tests 604 → 611. Deferred on purpose: a *target-scoped* stop ("stop that
+  object's animation") — the `Animation` trait exposes no target, so expressing it would mean adding
+  one to every animation for a feature the timeline-wide interrupt covers — and interrupting
+  narration already queued (a line is content, not motion).
+- **P3+ — the AI command surface at full width: done** — query (22a), label addressing (22b),
+  stop/interrupt (22c). The only known limit left is that `--reply` and `--inspect` both want
+  stdout, which is a transport question rather than a protocol one.
 
 ## AI integration
 
@@ -2183,12 +2209,23 @@ unambiguous handle is what a host stores for the commands that come after.
 beat of the same timeline a scene's own `ctx.play` writes into, which is what makes the picture a pure
 function of the command log — a host logs, replays and diffs a session, and gets the same frames. It
 therefore returns an **empty** `StateDiff`, and honestly so: a diff describes the tree, and queueing a
-beat does not change the tree, it changes what will happen to it. An interruption would be a *different*
-command, spelled out in the data; `play` cannot preempt what is already playing.
+beat does not change the tree, it changes what will happen to it. An interruption is a *different*
+command, spelled out in the data — `stop`, below — because `play` cannot preempt what is already
+playing.
 
-`camera`, `motion` and `narrate` are the commands intercepted by `SceneContext::handle` rather than
-by the pure `command::apply`, and all three return an **empty** `StateDiff` for `play`'s reason — the
-view, the motion policy and a spoken line are not nodes. `camera` writes the view now or queues a
+**`stop`** (`{"action":"stop"}`) is the one command that **interrupts**: it drops every queued beat
+and every running animation and answers with a present-but-empty `StateDiff`, for `play`'s reason.
+**No animation is `finish`ed**, and that is the whole semantics — a `FadeOut` in flight leaves its
+target in the tree at the opacity it reached, a morph leaves its subject part-way, and the next
+`play` starts from there. Jumping each animation to its end state would be `finish`, which is the
+opposite of what "stop" means to a viewer. The lecture clock and the narration track are untouched
+(neither is an animation), `is_playing` becomes false so a scene reacting to its timeline draining
+sees an ending rather than a stall, and the command is idempotent: stopping a stopped scene succeeds
+and changes nothing.
+
+`stop`, `camera`, `motion` and `narrate` are the commands intercepted by `SceneContext::handle`
+rather than by the pure `command::apply`, and all four return an **empty** `StateDiff` for `play`'s
+reason — the timeline, the view, the motion policy and a spoken line are not nodes. `camera` writes the view now or queues a
 `CameraMove`; `motion` (`{"action":"motion","mode":"full"|"reduced"}`) writes the policy the **next
 beat started** will be given, without touching the beat already running; `narrate` queues a line on
 the narration track, due `at` seconds after it arrived (see "Narration, captions and
@@ -2268,7 +2305,7 @@ of I/O and of a JSON parser (it compiles to wasm).
 until this step — now fires for every command that reached the tree, from the feed *and* from the
 keyboard/AT path. A command that was refused does not fire it.
 
-**Known limits, deliberately:** `--reply` and `--inspect` cannot both own stdout; and `play` still
-cannot interrupt a running beat — a stop command is the next P3+ step, and it is not a variant of
-`play` for the same reason an interruption would be a command of its own. Label addressing is no
-longer on this list: `Target` settled it (step 22b), including what to do about duplicates.
+**Known limits, deliberately:** `--reply` and `--inspect` cannot both own stdout. Two earlier
+entries have since been settled: label addressing by `Target` (step 22b), and interrupting a running
+beat by `stop` (step 22c), whose `clear`s point at the beat and the queue rather than at a variant of
+`play` — for the same reason an interruption is a command of its own.

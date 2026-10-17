@@ -186,6 +186,45 @@ fn apply_answers_like_the_desktop_feed() {
     assert_eq!(after["seq"], 5);
 }
 
+/// The interrupt crosses the bridge too, and stops the *scene's* timeline as
+/// well as the beat just queued — `Session::apply` is the same `handle` the
+/// desktop feed calls.
+#[test]
+fn a_stop_ends_the_browser_timeline() {
+    let mut session = Session::new(WIDTH, HEIGHT, "pythagorean").expect("the scene builds");
+
+    let reply: serde_json::Value = serde_json::from_str(
+        &session
+            .apply(r#"{"action":"add","type":"square","params":{"width":1.0,"label":"方块"}}"#)
+            .unwrap(),
+    )
+    .unwrap();
+    let id = reply["diff"]["created"][0].as_u64().expect("an id");
+
+    let play = format!(
+        r#"{{"action":"play","animation":{{"target":{id},"type":"fade_out","duration":0.5}}}}"#
+    );
+    session.apply(&play).unwrap();
+
+    let stopped: serde_json::Value =
+        serde_json::from_str(&session.apply(r#"{"action":"stop"}"#).unwrap()).unwrap();
+    assert_eq!(stopped["seq"], 3);
+    assert!(stopped.get("error").is_none());
+    assert_eq!(stopped["diff"]["created"].as_array().unwrap().len(), 0);
+    assert_eq!(stopped["diff"]["modified"].as_array().unwrap().len(), 0);
+    assert_eq!(stopped["diff"]["removed"].as_array().unwrap().len(), 0);
+
+    // Past the fade's own duration: the beat was dropped, so the square is
+    // still in the tree and the scene has not become "finished" in some other
+    // sense — a stop *is* the end of the timeline.
+    session.advance(1.0);
+    let tree = session.semantic();
+    assert!(
+        tree.nodes.iter().any(|n| n.name == "方块"),
+        "the interrupted fade-out must not have removed its target"
+    );
+}
+
 /// A query over the browser's bridge is answered with the semantic tree and no
 /// diff — the same reply the desktop feed writes, because it is the same two
 /// functions.

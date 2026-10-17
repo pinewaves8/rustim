@@ -2135,6 +2135,10 @@ fn main() {
                 // arrived, which is how a file feed (everything applied at t = 0)
                 // still paces itself.
                 println!(r#"  {{"action":"narrate","text":"先看这个三角形","at":2.0}}"#);
+                // `stop` interrupts: queued beats and running animations are
+                // dropped *without* their completion step, so the picture stays
+                // where the last frame left it.
+                println!(r#"  {{"action":"stop"}}"#);
                 // `rate` names the easing curve by Manim's name; absent means the
                 // animation's own default. The full vocabulary is the line above.
                 println!(

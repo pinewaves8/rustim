@@ -51,6 +51,31 @@ pub enum Command {
     Remove { target: Target },
     /// Play an animation that names its subject by id or label.
     Play { animation: AnimationSpec },
+    /// Interrupt the timeline: drop every queued beat and every running animation.
+    ///
+    /// The counterpart of `play`, and the only command that *preempts* rather
+    /// than appends. `play` puts a beat behind whatever is happening; `stop`
+    /// ends everything now and leaves the tree exactly as the last frame left
+    /// it. **No animation is `finish`ed**, so nothing an animation would do on
+    /// completion happens: a `FadeOut` in flight leaves its target in the tree
+    /// at the opacity it had reached, and a `MoveTo` leaves its subject where
+    /// it was rather than at its destination. That is the point of an
+    /// interrupt — "stop that" means the picture freezes, not that the engine
+    /// jumps to a state the viewer never saw. The next `play` starts from
+    /// there.
+    ///
+    /// The reply is a present-but-empty [`StateDiff`], for `play`'s reason:
+    /// stopping changes what *will* happen, not what is in the tree. It is
+    /// **idempotent** — stopping a scene that is already stopped succeeds and
+    /// changes nothing, because "make it stop" is satisfied by a scene that has
+    /// stopped; refusing would teach a model to check first.
+    ///
+    /// It does not touch narration already queued, nor the camera when no
+    /// `CameraMove` is running: neither is an animation, and a track that is
+    /// still talking or a view that has already arrived has nothing to
+    /// interrupt. Answered by [`crate::SceneContext::handle`], because only the
+    /// playback machine and the scheduler together are "the timeline".
+    Stop,
     /// Point the camera, now or over a beat.
     ///
     /// All four fields are optional and omitted when absent, like every other
@@ -694,6 +719,12 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // The arm stays so `apply` is still total over `Command` — a caller
             // driving `apply` directly gets the round-trip it always got, not a
             // panic.
+        }
+        Command::Stop => {
+            // Answered by `SceneContext::handle`: interrupting is a property of
+            // the playback machine and the scheduler, neither of which is in the
+            // tree this function may touch. The arm keeps `apply` total, so a
+            // caller driving it directly replays the same log without a panic.
         }
         Command::Camera { .. } => {
             // Likewise answered by `SceneContext::handle`: resolving `focus` needs
@@ -1371,6 +1402,10 @@ mod tests {
             // subtree. Neither writes a field it did not receive.
             r#"{"action":"query"}"#.to_owned(),
             format!(r#"{{"action":"query","target":{id}}}"#),
+            // The interrupt: a unit variant, so it is the bare tag and nothing
+            // else. An implementation that serialised an empty object or a
+            // `null` payload here would change what a relayed log says.
+            r#"{"action":"stop"}"#.to_owned(),
             // The label spelling of a target. The field is the same one; only
             // the JSON type differs, and it survives the round trip as a label —
             // a logged session stays readable, and replaying it resolves the
@@ -1387,6 +1422,37 @@ mod tests {
             let cmd: Command =
                 serde_json::from_str(&json).unwrap_or_else(|e| panic!("parsing {json}: {e}"));
             assert_eq!(serde_json::to_string(&cmd).unwrap(), json, "{json}");
+        }
+    }
+
+    /// The commands `SceneContext::handle` answers are **no-ops** in `apply`, not
+    /// panics — `apply` stays total over the wire so a direct caller can replay a
+    /// whole session log without a host around it. Each returns the empty diff its
+    /// arm promises and leaves the tree exactly as it found it.
+    #[test]
+    fn host_answered_commands_are_no_ops_on_the_bare_tree() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(rustim_mobject::shapes::build(
+            ShapeKind::Square,
+            &ShapeParams::default(),
+        ));
+        let before = tree.len();
+
+        for cmd in [
+            Command::Stop,
+            Command::Motion {
+                mode: MotionMode::Reduced,
+            },
+            Command::Narrate {
+                text: "先看这个三角形".to_owned(),
+                at: Some(1.0),
+            },
+            Command::Query { target: None },
+        ] {
+            let diff = apply(&mut tree, &cmd).expect("answered elsewhere, not refused");
+            assert_eq!(diff, StateDiff::default(), "{cmd:?}");
+            assert_eq!(tree.len(), before, "{cmd:?}");
+            assert!(tree.get(id).is_some(), "{cmd:?}");
         }
     }
 
