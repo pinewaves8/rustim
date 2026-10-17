@@ -24,6 +24,7 @@
 
 pub mod a11y;
 pub mod announce;
+pub mod feed;
 pub mod input;
 pub mod motion;
 pub mod text;
@@ -41,13 +42,21 @@ pub use input::{FocusState, Intent};
 /// is not a convenience — `Adapter::with_event_loop_proxy` is generic over
 /// `T: From<Event>` and uses it to convert.
 ///
-/// Only one variant so far, and it is still an enum: the proxy's type parameter
-/// is fixed at event-loop construction, so a second kind of cross-thread wakeup
-/// later (a file watcher, a network feed) can be added without rebuilding the
-/// loop.
+/// That enum was written with exactly one variant and a note that a second kind
+/// of cross-thread wakeup — "a file watcher, a network feed" — would one day be
+/// added without rebuilding the loop. [`AppEvent::Command`] is that variant: a
+/// line of a script read on a blocking thread, because the event loop cannot
+/// block on stdin itself. See [`feed`].
 #[derive(Debug)]
 pub enum AppEvent {
     AccessKit(accesskit_winit::Event),
+    /// One line of a command feed, with the 1-based physical line number it came
+    /// from. Parsed on the main thread, not here, so that a malformed line is a
+    /// reply rather than a thread that panicked before anyone could answer it.
+    Command {
+        seq: u64,
+        line: String,
+    },
 }
 
 impl From<accesskit_winit::Event> for AppEvent {

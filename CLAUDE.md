@@ -33,14 +33,15 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **316 unit tests plus a doctest** pass,
+The workspace itself is **verified green** as of 2026-10-17: **336 tests plus a doctest** pass,
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
 `rustim-app` and **not** from `rustim-scene`), all seven golden scenes match their checked-in
-baselines, and `rustim-app --png out.png` reproduces the Manim reference frame with an **identical
-content bounding box** (`343,90,936,629`); only 0.012% of pixels differ by more than 2/255, and none
-by more than 8. See `方案建议.md` §5.2. The count is not decoration — every one of those claims is
-re-run by the commands below, and the P2 rows in the roadmap say which step last moved it.
+baselines, a script replays to a byte-identical frame, and `rustim-app --png out.png` reproduces the
+Manim reference frame with an **identical content bounding box** (`343,90,936,629`); only 0.012% of
+pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The count is not
+decoration — every one of those claims is re-run by the commands below, and the P2 rows in the
+roadmap say which step last moved it.
 
 ## What rustim is
 
@@ -94,11 +95,15 @@ cargo run -p rustim-app -- --scene text --png out.png   # CJK + Latin glyph runs
 cargo run -p rustim-app -- --scene formula --png out.png  # Typst → per-glyph outlines
 cargo run -p rustim-app -- --scene rotate --inspect  # rotate + scale, then a FadeOut removal
 cargo run -p rustim-app -- --motion reduced  # ignore the platform "reduce motion" preference
+cargo run -p rustim-app -- --script sessions/intro.jsonl --reply  # drive it with JSON commands
+cargo run -p rustim-app -- --script - --reply --png out.png       # ...from stdin, answering each
+cargo run -p rustim-app -- --script crates/rustim-app/tests/fixtures/script/session.jsonl --inspect
 cargo test --workspace               # unit tests across all crates
 cargo test -p rustim-math ease_in_out       # a single test by name
 cargo test -p rustim-math --test manim_parity   # replay the checked-in Manim fixtures
 cargo test -p rustim-app --test goldens         # compare renders to the checked-in baselines
 BLESS=1 cargo test -p rustim-app --test goldens # ...and rewrite them (review the diff!)
+cargo test -p rustim-app --test script          # the command feed, end to end, through the binary
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
@@ -265,7 +270,7 @@ last property.
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait, `DrawList`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, and the `compare` module that scores two frames | Real; ffmpeg pipe not written |
-| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter and the shaper↔rasteriser bridge (both as a **lib** target), seven `--scene` entries, the golden suite | Real |
+| `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge and the command feed (`feed`: JSONL in, replies out, the one apply point; both as a **lib** target), seven `--scene` entries, the golden and script suites | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead.
@@ -574,7 +579,11 @@ catch. `DrawOp` therefore has both `PopClip` and `PopLayer`; do not merge them.
 hand instead, as the opaque 64-bit `as_ffi` packing, so JSON carries a plain integer while the
 generational check survives (`NodeId::raw` / `NodeId::from_raw` are the conversion points, and the
 feature is off in `Cargo.toml`). `from_ffi` accepts any `u64` safely, so a hostile command can only
-name a node that is not there.
+name a node that is not there. **`from_raw` is not a round trip for an arbitrary integer**: `from_ffi`
+normalises the generation to `… | 1`, so a host that sends `999` is answered with `4294968295` — the
+same id, spelled the way the engine holds it. That is why a refusal's `Display` prints `raw()` (the
+reply's number) rather than the `Debug` of the id, which is `NodeId(999v1)` and matches nothing anyone
+typed.
 
 **`kurbo` 0.13 has no `From<Rect> for BezPath`.** Use `rustim_math::rect_path` (or `fill_rect`, which
 both backends expose) rather than reaching for a conversion that does not exist. `Point` also has no
@@ -986,6 +995,19 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   `pointwise_become_partial`), `Rotating` (an animation that never ends makes `is_playing`
   permanently true, which every "react when the timeline drains" scene depends on), `path_arc` for a
   straight move, `FadeIn`'s `shift`/`scale`, and axes and plots.
+- **The command feed — the first slice of P3's "AI command surface at full width" — is done**, and it
+  is the step that made the engine *drivable* rather than merely scriptable: `--script` applies a file
+  of JSON commands or reads stdin line by line, `--reply` answers each one, and a windowed run takes
+  the same commands from a reader thread through the second `AppEvent` variant that enum was declared
+  to make room for. Nothing in the command layer or the renderer changed — the seven goldens passed
+  without a pixel moving, which is the claim that a transport was added outside them. Three things it
+  fixed while wiring it: `Scene::on_command` was declared and never called (it is called now, for both
+  the feed and the keyboard path); `CommandError`'s `Display` for `NoSuchNode` printed the id's
+  **internal** spelling (`NodeId(999v1)`) instead of the wire integer, which is the number a user can
+  find in their own script; and `--reply` exposed that `--png` and the frame-rate line both wrote to
+  stdout, so `main::note` now routes every informational line to stderr when stdout is protocol. What
+  it deliberately leaves for P3+: the query command (no way to read a live tree), label addressing,
+  and a merged `--reply`/`--inspect`. See "The feed" under AI integration.
 - **P3+** — camera (pan/zoom/focus); video export; the AI command surface at full width; Web (WASM).
 
 ## AI integration
@@ -1019,3 +1041,52 @@ Two wire-format invariants are load-bearing, both pinned by tests:
   diffs these, so anything that serialises back differently is a bug.
 - **Absent shape parameters are omitted, never written as `null`.** These payloads are model output;
   echoing `"width": null` back would teach the model that nulls are part of the protocol.
+
+### The feed: a session is a file of commands
+
+`rustim-app --script <path|->` applies one JSON command per line (JSONL) and is *how a host drives the
+engine at all* — without it the only scenes that exist are the seven compiled in. The transport is
+`rustim_app::feed`; the protocol is `rustim_scene::command`, which owns `CommandReply` and stays free
+of I/O and of a JSON parser (it compiles to wasm).
+
+```jsonl
+{"action":"add","type":"circle","params":{"radius":1.6,"color":[100,181,246],"label":"圆"}}
+{"action":"play","animation":{"target":4294967297,"type":"move_to","to":[2,1],"duration":1.0}}
+```
+
+- **`--reply` answers every command with one JSON line on stdout**, and then stdout is *only* replies:
+  every human-facing line the binary prints (`wrote out.png (1280x720)`, the frame-rate line) moves to
+  stderr (`main::note`). A host cannot skip a line it did not expect.
+  `{"seq":1,"diff":{"created":[4294967297],"modified":[],"removed":[]}}` — **exactly one of `diff` and
+  `error` is present**, and the presence is the discriminant. `created` is the only way to learn the id
+  of what was just created; a `play` gets a present-but-**empty** diff, because queueing a beat changes
+  nothing in the tree.
+- **`seq` is the 1-based *physical* line number**, blank lines included, so a human reading a log and a
+  host reading the stream count the same way. A blank line is skipped silently and produces no reply.
+- **Every reply is flushed before the next line is read.** A file source is read whole; `-` is stdin,
+  read line by line and answered line by line, so a host can send `add`, read the id back, and animate
+  it. Windowed, stdin is read on its own thread and arrives as `AppEvent::Command`.
+- **`CommandError::Unparseable { detail }`** joins the vocabulary for a line the transport could not
+  turn into a command. Only the application constructs it (`apply` never sees text), but a host has to
+  tell "the engine declined what I asked" from "the engine could not read what I sent", and one error
+  type on the wire is simpler than two.
+- **A refusal does not stop the feed**, and neither does it fail the run: refusals are counted and
+  summarised on stderr (`feed: 1 of 3 commands refused`); exit code stays 0. Only a script path that
+  cannot be read, `--reply` with no `--script`, and `--reply` with `--inspect` are `exit(2)`.
+- **A script is applied after `construct` and at virtual time zero**, so the scene's own objects keep
+  the ids they always had and the same script replays to the same frame (asserted `max == 0`, not the
+  golden tolerance). The feed is orthogonal to the scene: `--scene rotate --script /dev/null` is
+  byte-identical to `--scene rotate`.
+- **`--script` without `--scene` runs on a `BlankScene`** — an empty `construct`, deliberately **not**
+  in the `--scene` registry, so `--help` does not list it and the golden suite does not owe it a
+  baseline on three platforms.
+
+`Scene::on_command(&StateDiff, &mut SceneContext)` — declared since the trait was written, never called
+until this step — now fires for every command that reached the tree, from the feed *and* from the
+keyboard/AT path. A command that was refused does not fire it.
+
+**Known limits, deliberately, and the first three are what "the AI command surface at full width"
+(P3+) means:** there is **no query command**, so a live session can only learn what changed through the
+reply diffs — for the whole tree, run `--script <file> --inspect`; commands address nodes by `NodeId`
+only (the "labels may be addressed" sentence above is a design question this step did not settle);
+`--reply` and `--inspect` cannot both own stdout; and `play` still cannot interrupt a running beat.

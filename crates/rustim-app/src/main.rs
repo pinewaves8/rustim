@@ -19,7 +19,13 @@
 //! rustim-app --png out.png        # no window: render one frame to a PNG
 //! rustim-app --inspect            # no window: print the accessibility tree
 //! rustim-app --scene text --png t.png
+//! rustim-app --script session.jsonl --reply   # drive the engine with commands
 //! ```
+//!
+//! `--script` is the point of the whole crate: a session is a list of JSON
+//! commands, one per line, and the same list replays to the same frames. See
+//! [`rustim_app::feed`] for the transport and `rustim_scene::command` for the
+//! protocol.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -27,7 +33,7 @@ use std::time::Instant;
 
 use rustim_anim::Motion;
 use rustim_app::a11y::{A11y, Request};
-use rustim_app::{AppEvent, Intent, input};
+use rustim_app::{AppEvent, Intent, feed, input};
 use rustim_math::{Affine2, BezPath, Point, Viewport, bezier};
 use rustim_mobject::{Mobject, NodeId, NodeKind, Style};
 use rustim_render::{CpuRenderer, DrawList, DrawOp, RenderError, Renderer};
@@ -988,6 +994,24 @@ impl Scene for FormulaScene {
 /// The `--scene` value used when the flag is absent.
 const DEFAULT_SCENE: &str = "pythagorean";
 
+/// What a `--script` with no `--scene` runs on top of.
+///
+/// **Deliberately not in the `--scene` registry**, and that is not a tidiness
+/// point: `--help` is what the golden suite reads to decide which scenes it owes
+/// a baseline on, so registering this one would demand a `blank` baseline on
+/// three platforms — a picture of an empty frame — and it would add an entry to
+/// a list a user reads to find out what the engine can draw.
+///
+/// What it is for: `--script` alone should start from nothing and build the
+/// picture out of commands, because that is what a host driving the engine
+/// actually does. Starting from `pythagorean` instead would put a scene on
+/// screen that the host never asked for and cannot remove by name.
+struct BlankScene;
+
+impl Scene for BlankScene {
+    fn construct(&mut self, _ctx: &mut SceneContext) {}
+}
+
 /// Every scene the binary can render, by the name `--scene` takes.
 ///
 /// This exists for the golden-image suite: a test that can only render one
@@ -1074,6 +1098,55 @@ fn settle(scene: &mut dyn Scene, ctx: &mut SceneContext, list: &mut DrawList) {
     }
 }
 
+/// Print a human-facing line on stdout — or on stderr when stdout is a protocol
+/// stream.
+///
+/// **`--reply` makes stdout the reply channel and nothing else.** A host parsing
+/// the stream cannot skip a line it did not expect, and `wrote out.png (1280x720)`
+/// in the middle of it is a parse error whose *presence* depends on which other
+/// flags were passed — the worst kind of protocol bug, because it hides until
+/// someone adds a flag. Nothing is lost by moving these: the note is for a human,
+/// and a human reads the terminal either way.
+fn note(reply: bool, message: std::fmt::Arguments<'_>) {
+    if reply {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
+    }
+}
+
+/// Apply a whole script to a scene, and answer each line if `--reply` asked.
+///
+/// Used by both headless paths and by a windowed run fed from a *file*; a
+/// windowed run fed from **stdin** cannot use it, because a file is read whole
+/// here and stdin has to be read on its own thread — see `feed::spawn_stdin`.
+///
+/// **Every line lands at virtual time zero**, which is the property the replay
+/// guarantee rests on: a `play` in a script queues a beat, the next line queues
+/// the next, and the still is taken after ten seconds of virtual time whichever
+/// way the script was fed. Reading a file is not a scheduling decision, so it
+/// must not be one.
+///
+/// A script the run cannot read at all is an `exit(2)` — the one failure here
+/// that is not a per-line refusal, because there is no line to refuse. Every
+/// *line* failure stays inside [`feed::apply_all`] and is counted.
+fn apply_script(path: &str, scene: &mut dyn Scene, ctx: &mut SceneContext, reply: bool) {
+    let lines = feed::lines_from(path).unwrap_or_else(|e| {
+        eprintln!("--script {path}: {e}");
+        std::process::exit(2);
+    });
+    let mut out = reply.then(|| std::io::stdout().lock());
+    let counts = feed::apply_all(
+        scene,
+        ctx,
+        lines,
+        out.as_mut().map(|w| w as &mut dyn std::io::Write),
+    );
+    if let Some(line) = counts.report() {
+        eprintln!("{line}");
+    }
+}
+
 /// Everything that exists only once there is a window.
 ///
 /// A field rather than locals because the AccessKit adapter must be created
@@ -1110,6 +1183,17 @@ struct App {
     /// takes, which is the point: one validator, so input cannot reach a state
     /// the command layer would refuse.
     queued: Vec<Command>,
+    /// Lines of a stdin command feed, unread until the top of the next frame.
+    ///
+    /// Unparsed on purpose: the reader thread cannot reply (it is not the thread
+    /// that owns the tree) and must not panic (it has no way to report anything),
+    /// so a malformed line stays a line until [`feed::apply_all`] can turn it
+    /// into a reply.
+    pending: Vec<(u64, String)>,
+    /// Whether each command's reply is printed to stdout. Off unless `--reply`.
+    reply: bool,
+    /// What the feed has done so far, for the closing line.
+    feed: feed::Counts,
     /// The window's current modifier state. winit delivers modifiers in their
     /// own event, so this is tracked across events rather than read off the
     /// keypress — a Shift+Tab that read `event` alone would look like a Tab.
@@ -1262,42 +1346,52 @@ impl ApplicationHandler<AppEvent> for App {
 
     /// Accessibility events arrive here, not in `window_event`: the platform's
     /// backend calls in from its own thread and the winit adapter forwards
-    /// through the event-loop proxy.
+    /// through the event-loop proxy. Command lines from a stdin feed arrive the
+    /// same way, from the reader thread `feed::spawn_stdin` starts.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
-        // Irrefutable today. Written as a `let` rather than a match so that
-        // adding a second `AppEvent` variant is a compile error here, at the
-        // one place that has to learn about it.
-        let AppEvent::AccessKit(event) = event;
-        match event.window_event {
-            accesskit_winit::WindowEvent::InitialTreeRequested => {
-                // Routed through the ordinary frame path rather than answered
-                // here. The adapter was built with an event-loop proxy, so it
-                // cannot take a synchronous initial tree; the answer has to be
-                // the next frame's full snapshot, and `a11y.update` runs before
-                // `request_redraw` in that frame, which is what guarantees the
-                // snapshot describes the state that is on screen.
+        // A `match` rather than the irrefutable `let` this used to be, which is
+        // exactly what that `let` was written to force: the second variant could
+        // not be added without coming here.
+        match event {
+            AppEvent::AccessKit(event) => match event.window_event {
+                accesskit_winit::WindowEvent::InitialTreeRequested => {
+                    // Routed through the ordinary frame path rather than answered
+                    // here. The adapter was built with an event-loop proxy, so it
+                    // cannot take a synchronous initial tree; the answer has to be
+                    // the next frame's full snapshot, and `a11y.update` runs before
+                    // `request_redraw` in that frame, which is what guarantees the
+                    // snapshot describes the state that is on screen.
+                    self.request_redraw();
+                }
+                accesskit_winit::WindowEvent::ActionRequested(req) => {
+                    let request = self
+                        .windowed
+                        .as_mut()
+                        .and_then(|w| w.a11y.core().on_action(&req, &self.ctx));
+                    match request {
+                        Some(Request::Command(cmd)) => {
+                            self.queued.push(cmd);
+                            self.request_redraw();
+                        }
+                        Some(Request::TogglePlayback) => {
+                            self.paused = !self.paused;
+                            self.request_redraw();
+                        }
+                        None => {}
+                    }
+                }
+                // Nothing to do: the next `update` is a full snapshot anyway, and
+                // `update_if_active` will not even build one while inactive.
+                accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+            },
+            AppEvent::Command { seq, line } => {
+                // Queued, not applied: this runs on the event loop's thread but
+                // outside the frame, and applying here would mutate the tree
+                // between a `build_draw_list` and the blit that consumes it. The
+                // frame the line belongs to is the one it asks for.
+                self.pending.push((seq, line));
                 self.request_redraw();
             }
-            accesskit_winit::WindowEvent::ActionRequested(req) => {
-                let request = self
-                    .windowed
-                    .as_mut()
-                    .and_then(|w| w.a11y.core().on_action(&req, &self.ctx));
-                match request {
-                    Some(Request::Command(cmd)) => {
-                        self.queued.push(cmd);
-                        self.request_redraw();
-                    }
-                    Some(Request::TogglePlayback) => {
-                        self.paused = !self.paused;
-                        self.request_redraw();
-                    }
-                    None => {}
-                }
-            }
-            // Nothing to do: the next `update` is a full snapshot anyway, and
-            // `update_if_active` will not even build one while inactive.
-            accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
         }
     }
 
@@ -1349,13 +1443,34 @@ impl ApplicationHandler<AppEvent> for App {
                 // the key that caused it, and an animation applied at the end of
                 // the frame would arrive one frame late.
                 for cmd in std::mem::take(&mut self.queued) {
-                    if let Err(e) = self.ctx.handle(&cmd) {
+                    match self.ctx.handle(&cmd) {
+                        // The hook a scene reacts to commands through. Until
+                        // this line existed it was declared and never called,
+                        // so a scene could not have reacted to anything even in
+                        // principle.
+                        Ok(diff) => self.scene.on_command(&diff, &mut self.ctx),
                         // A refusal is a value, not a panic — the rule an AI's
                         // command follows, and this path is reachable by
                         // pressing a key or by an assistive technology naming a
                         // node that no longer exists.
-                        eprintln!("command refused: {e}");
+                        Err(e) => eprintln!("command refused: {e}"),
                     }
+                }
+
+                // The lines a feed delivered since the last frame. Through
+                // `feed::apply_all` rather than `ctx.handle` in a loop, so the
+                // windowed path and the headless one apply a script *identically*
+                // — including calling `on_command` and answering each line.
+                if !self.pending.is_empty() {
+                    let mut out = self.reply.then(|| std::io::stdout().lock());
+                    let counts = feed::apply_all(
+                        &mut *self.scene,
+                        &mut self.ctx,
+                        std::mem::take(&mut self.pending),
+                        out.as_mut().map(|w| w as &mut dyn std::io::Write),
+                    );
+                    self.feed.applied += counts.applied;
+                    self.feed.refused += counts.refused;
                 }
 
                 let t0 = Instant::now();
@@ -1419,15 +1534,18 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.frame.is_multiple_of(120) {
                     let recent = &self.render_ms[self.render_ms.len() - 120..];
                     let mean: f64 = recent.iter().sum::<f64>() / recent.len() as f64;
-                    println!(
-                        "frame {:>5}  {mean:.2} ms/frame  ({:.0} fps)  {} ops  focus {}",
-                        self.frame,
-                        1000.0 / mean.max(1e-9),
-                        self.list.ops.len(),
-                        self.windowed
-                            .as_ref()
-                            .and_then(|w| w.a11y.focused())
-                            .map_or_else(|| "—".to_string(), |id| id.raw().to_string()),
+                    note(
+                        self.reply,
+                        format_args!(
+                            "frame {:>5}  {mean:.2} ms/frame  ({:.0} fps)  {} ops  focus {}",
+                            self.frame,
+                            1000.0 / mean.max(1e-9),
+                            self.list.ops.len(),
+                            self.windowed
+                                .as_ref()
+                                .and_then(|w| w.a11y.focused())
+                                .map_or_else(|| "—".to_string(), |id| id.raw().to_string()),
+                        ),
                     );
                 }
                 if let Some(max) = self.max_frames
@@ -1449,7 +1567,10 @@ fn main() {
     let mut png: Option<String> = None;
     let mut inspect = false;
     let mut scene_name = DEFAULT_SCENE.to_string();
+    let mut scene_given = false;
     let mut motion: Option<Motion> = None;
+    let mut script: Option<String> = None;
+    let mut reply = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1486,19 +1607,44 @@ fn main() {
             "--scene" => {
                 if let Some(name) = args.get(i + 1) {
                     scene_name.clone_from(name);
+                    scene_given = true;
                 }
                 i += 2;
+            }
+            "--script" => {
+                if let Some(path) = args.get(i + 1) {
+                    script = Some(path.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--script takes a path, or `-` for stdin");
+                    std::process::exit(2);
+                }
+            }
+            "--reply" => {
+                reply = true;
+                i += 1;
             }
             "--help" | "-h" => {
                 println!(
                     "rustim-app [--frames N] [--png OUT.png | --inspect] [--scene NAME] \
-                     [--motion full|reduced]"
+                     [--motion full|reduced] [--script PATH|-] [--reply]"
                 );
                 println!("scenes: {}", scene_names());
                 println!("--inspect: print the accessibility tree as JSON to stdout");
                 println!(
                     "--motion: play every frame, or land each beat on its end state \
                      (default: this desktop's preference)"
+                );
+                println!(
+                    "--script: apply one JSON command per line (JSONL); `-` reads stdin, \
+                     and without --scene the script gets an empty one"
+                );
+                println!("--reply: answer each command with one JSON line on stdout");
+                println!("animations: {}", feed::animation_kinds());
+                println!();
+                println!("example --script line:");
+                println!(
+                    r#"  {{"action":"add","type":"circle","params":{{"radius":1.5,"label":"圆"}}}}"#
                 );
                 return;
             }
@@ -1517,6 +1663,22 @@ fn main() {
         std::process::exit(2);
     }
 
+    // The other two ways to ask for something this binary cannot do, both of
+    // them reported rather than silently ignored — a host that sent `--reply`
+    // and got no stream would conclude the engine was refusing its commands.
+    //
+    // `--reply` needs a script because a reply only exists per command, and two
+    // flags cannot both own stdout: a reader of the merged stream could not tell
+    // an accessibility tree from a reply.
+    if reply && script.is_none() {
+        eprintln!("--reply needs --script: there is nothing to answer");
+        std::process::exit(2);
+    }
+    if reply && inspect {
+        eprintln!("--reply and --inspect both write to stdout; run them separately");
+        std::process::exit(2);
+    }
+
     let viewport = Viewport {
         frame_width: WIDTH,
         frame_height: HEIGHT,
@@ -1529,12 +1691,30 @@ fn main() {
     // which platforms answer and which do not.
     let motion = motion.unwrap_or_else(rustim_app::motion::from_platform);
 
+    // A script with no `--scene` runs against an empty scene rather than the
+    // default one: a host that builds the picture out of commands did not ask
+    // for the Pythagorean figure, and `--scene pythagorean --script …` still
+    // asks for it explicitly. `--scene blank` is not a name — see `BlankScene`.
+    let blank = !scene_given && script.is_some();
+
     // A bad scene name is a refusal, not a panic — same rule the command layer
     // follows, and this one is reachable from a shell so it has to read well.
-    let Some(mut scene) = scene_by_name(&scene_name) else {
-        eprintln!("unknown scene: {scene_name}");
-        eprintln!("available scenes: {}", scene_names());
-        std::process::exit(2);
+    let mut scene: Box<dyn Scene> = if blank {
+        Box::new(BlankScene)
+    } else {
+        let Some(scene) = scene_by_name(&scene_name) else {
+            eprintln!("unknown scene: {scene_name}");
+            eprintln!("available scenes: {}", scene_names());
+            std::process::exit(2);
+        };
+        scene
+    };
+    // The title names the scene a *human* would recognise, and an empty scene is
+    // named by what it is rather than by the default it is not.
+    let scene_name = if blank {
+        "blank".to_string()
+    } else {
+        scene_name
     };
 
     // Headless paths: no event loop, no window. This is the same scene and the
@@ -1548,6 +1728,12 @@ fn main() {
     if inspect {
         let mut ctx = SceneContext::new(viewport, motion);
         scene.construct(&mut ctx);
+        // After `construct`, so the scene's own objects keep the ids they always
+        // had and a script's ids follow them deterministically — and before
+        // `settle`, so the tree this prints is the tree the script built.
+        if let Some(path) = &script {
+            apply_script(path, &mut *scene, &mut ctx, reply);
+        }
         let mut list = DrawList::default();
         settle(&mut *scene, &mut ctx, &mut list);
         // No `live` text: the announcement node exists only where there is a
@@ -1564,13 +1750,19 @@ fn main() {
     if let Some(path) = png {
         let mut ctx = SceneContext::new(viewport, motion);
         scene.construct(&mut ctx);
+        if let Some(script) = &script {
+            apply_script(script, &mut *scene, &mut ctx, reply);
+        }
         let mut list = DrawList::default();
         settle(&mut *scene, &mut ctx, &mut list);
 
         let mut renderer = CpuRenderer::new(WIDTH, HEIGHT);
         renderer.render(&list).expect("render");
         rustim_export::write_png(&renderer, &path).expect("write png");
-        println!("wrote {path} ({}x{})", renderer.width(), renderer.height());
+        note(
+            reply,
+            format_args!("wrote {path} ({}x{})", renderer.width(), renderer.height()),
+        );
         return;
     }
 
@@ -1584,6 +1776,19 @@ fn main() {
     let mut ctx = SceneContext::new(viewport, motion);
     scene.construct(&mut ctx);
 
+    // The feed, connected *before* the loop runs. A file is applied here, at
+    // virtual time zero, exactly as a headless run applies it; stdin is read on
+    // its own thread, because the event loop must not block on a pipe that may
+    // never send anything. Both then reach the same `feed::apply_all` — the file
+    // through the call below, stdin through `AppEvent::Command`.
+    if let Some(path) = &script {
+        if path == feed::STDIN {
+            feed::spawn_stdin(proxy.clone());
+        } else {
+            apply_script(path, &mut *scene, &mut ctx, reply);
+        }
+    }
+
     let mut app = App {
         windowed: None,
         proxy,
@@ -1593,6 +1798,9 @@ fn main() {
         scene,
         ctx,
         queued: Vec::new(),
+        pending: Vec::new(),
+        reply,
+        feed: feed::Counts::default(),
         mods: ModifiersState::empty(),
         paused: false,
         step: 0,
@@ -1604,16 +1812,24 @@ fn main() {
         last: Instant::now(),
     };
     event_loop.run_app(&mut app).expect("run_app");
+    // What a live session's feed did, on stderr so it cannot be mistaken for a
+    // reply line. Silent unless something was refused.
+    if let Some(line) = app.feed.report() {
+        eprintln!("{line}");
+    }
     if !app.render_ms.is_empty() {
         let mean: f64 = app.render_ms.iter().sum::<f64>() / app.render_ms.len() as f64;
         let mut sorted = app.render_ms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!(
-            "{} frames: mean {mean:.2} ms, p50 {:.2} ms, max {:.2} ms  ({:.0} fps)",
-            app.render_ms.len(),
-            sorted[sorted.len() / 2],
-            sorted[sorted.len() - 1],
-            1000.0 / mean.max(1e-9)
+        note(
+            reply,
+            format_args!(
+                "{} frames: mean {mean:.2} ms, p50 {:.2} ms, max {:.2} ms  ({:.0} fps)",
+                app.render_ms.len(),
+                sorted[sorted.len() / 2],
+                sorted[sorted.len() - 1],
+                1000.0 / mean.max(1e-9)
+            ),
         );
     }
 }

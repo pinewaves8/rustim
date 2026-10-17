@@ -1,0 +1,11 @@
+{"action":"add","type":"circle","params":{"radius":1.6,"color":[100,181,246],"label":"圆"}}
+
+{"action":"add","type":"square","params":{"width":2.4,"color":[255,213,79],"label":"方"}}
+{"action":"set","target":4294967298,"property":{"name":"opacity","value":0.0}}
+{"action":"add","type":"arrow","params":{"width":2.0,"thickness":0.08,"label":"箭头"}}
+{"action":"remove","target":4294967299}
+{"action":"play","animation":{"target":4294967297,"type":"fade_in","duration":1.0}}
+{"action":"play","animation":{"target":4294967298,"type":"fade_in","duration":1.0}}
+{"action":"play","animation":{"target":4294967298,"type":"move_to","to":[-2.4,-1.2],"duration":1.0}}
+{"action":"play","animation":{"target":4294967298,"type":"rotate","angle":0.5,"duration":1.0}}
+{"action":"play","animation":{"target":4294967297,"type":"scale","factor":1.4,"duration":1.0}}

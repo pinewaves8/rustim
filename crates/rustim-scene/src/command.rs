@@ -120,15 +120,34 @@ pub enum CommandError {
         property: String,
         detail: String,
     },
+    /// The request was not a command at all — whoever read the wire could not
+    /// turn it into one, and the transport's parser says why.
+    ///
+    /// **Nothing here constructs it.** `apply` never sees text, and this crate
+    /// has no JSON parser on purpose (it compiles to wasm and the browser build
+    /// reaches the engine through the same commands, from a host that does own
+    /// one). It is part of *this* vocabulary anyway, because a host reading a
+    /// reply stream has to tell "the engine refused what I asked for" from "the
+    /// engine could not read what I sent" — and one error type on the wire is
+    /// simpler for that host than two.
+    Unparseable {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for CommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoSuchNode { target } => write!(f, "no such node: {target:?}"),
+            // The opaque integer, not the `Debug` of the id. `NodeId`'s internal
+            // spelling is `NodeId(999v1)` — slot and generation — which is
+            // neither what a host sent nor anything it could act on, and this
+            // string is what a refusal says to a human. The wire form is the
+            // number, so the message uses the number.
+            Self::NoSuchNode { target } => write!(f, "no such node: {}", target.raw()),
             Self::OutOfRange { property, detail } => {
                 write!(f, "{property} out of range: {detail}")
             }
+            Self::Unparseable { detail } => write!(f, "not a command: {detail}"),
         }
     }
 }
@@ -150,6 +169,50 @@ pub struct StateDiff {
 impl StateDiff {
     pub fn is_empty(&self) -> bool {
         self.created.is_empty() && self.modified.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// What a host gets back for one line of a command feed.
+///
+/// **Exactly one of `diff` and `error` is present, and the presence is the
+/// discriminant.** The absent one is omitted rather than written as `null`, the
+/// same rule the commands themselves follow — these are a model's output too.
+///
+/// A host that sent a `play` gets a `diff` that is present and *empty*: queueing
+/// a beat changes nothing in the tree, and saying so is more useful than saying
+/// nothing. A host that sent an `add` gets the new id in `created`, which is the
+/// whole reason this type exists — it is the only way to learn the id of what
+/// was just created, and without it nothing could be done to that object
+/// afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandReply {
+    /// The 1-based *physical* line the command came from, so a human reading a
+    /// session log and a host reading the stream count the same way.
+    pub seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<StateDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<CommandError>,
+}
+
+impl CommandReply {
+    /// The reply to a command that was applied, or queued as a beat.
+    pub fn applied(seq: u64, diff: StateDiff) -> Self {
+        Self {
+            seq,
+            diff: Some(diff),
+            error: None,
+        }
+    }
+
+    /// The reply to a command that was not — refused by the engine, or not
+    /// readable as a command at all.
+    pub fn refused(seq: u64, error: CommandError) -> Self {
+        Self {
+            seq,
+            diff: None,
+            error: Some(error),
+        }
     }
 }
 
@@ -437,6 +500,82 @@ mod tests {
                 serde_json::from_str(&json).unwrap_or_else(|e| panic!("parsing {json}: {e}"));
             assert_eq!(serde_json::to_string(&cmd).unwrap(), json, "{json}");
         }
+    }
+
+    /// The other half of the wire: what comes *back* has to round-trip too, and
+    /// has to keep the "absent, never null" rule — a host that echoed a reply
+    /// into a transcript must get the same bytes out of it.
+    #[test]
+    fn replies_round_trip_through_json() {
+        let cases = [
+            r#"{"seq":1,"diff":{"created":[],"modified":[],"removed":[]}}"#.to_owned(),
+            r#"{"seq":2,"diff":{"created":[4294967296],"modified":[],"removed":[]}}"#.to_owned(),
+            r#"{"seq":3,"error":{"error":"no_such_node","target":4294967299}}"#.to_owned(),
+            r#"{"seq":4,"error":{"error":"out_of_range","property":"opacity","detail":"1.5 is not in 0.0..=1.0"}}"#
+                .to_owned(),
+            r#"{"seq":5,"error":{"error":"unparseable","detail":"expected `,` at line 1 column 12"}}"#
+                .to_owned(),
+        ];
+        for json in cases {
+            let reply: CommandReply =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("parsing {json}: {e}"));
+            assert_eq!(serde_json::to_string(&reply).unwrap(), json, "{json}");
+        }
+    }
+
+    /// The two constructors are the only way to build one, so neither can
+    /// accidentally produce a reply carrying both halves or neither.
+    #[test]
+    fn a_reply_carries_exactly_one_half() {
+        let ok = CommandReply::applied(7, StateDiff::default());
+        assert!(ok.diff.is_some() && ok.error.is_none());
+        assert!(!serde_json::to_string(&ok).unwrap().contains("error"));
+
+        let no = CommandReply::refused(
+            8,
+            CommandError::Unparseable {
+                detail: "nope".into(),
+            },
+        );
+        assert!(no.diff.is_none() && no.error.is_some());
+        assert!(!serde_json::to_string(&no).unwrap().contains("null"));
+    }
+
+    /// An unreadable line is a *refusal*, not a panic, and it reads as one to a
+    /// human in the log.
+    #[test]
+    fn an_unparseable_command_displays_as_such() {
+        let e = CommandError::Unparseable {
+            detail: "expected value".into(),
+        };
+        assert_eq!(e.to_string(), "not a command: expected value");
+    }
+
+    /// A refusal names the id the way the wire does.
+    ///
+    /// `NodeId`'s `Debug` is `NodeId(999v1)` — slot and generation, the *internal*
+    /// spelling, which is neither what a host sent nor anything it could act on.
+    /// This string is what a live session's `command refused:` line prints, so it
+    /// has to be a number somebody can find in their own script.
+    ///
+    /// Note the number is not the `999` that went in: `KeyData::from_ffi`
+    /// normalises the generation to `… | 1`, so `from_raw(999)` is `4294968295`
+    /// on the way out. The property this test can hold is that the message and
+    /// the wire agree — both are `raw()`, and a host is never shown one and
+    /// answered in the other.
+    #[test]
+    fn a_refusal_names_the_id_the_way_the_wire_does() {
+        let target = NodeId::from_raw(999);
+        let e = CommandError::NoSuchNode { target };
+        assert_eq!(e.to_string(), format!("no such node: {}", target.raw()));
+        assert!(
+            !e.to_string().contains("NodeId"),
+            "the internal spelling must not leak into a message a user reads"
+        );
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            format!(r#"{{"error":"no_such_node","target":{}}}"#, target.raw()),
+        );
     }
 
     #[test]

@@ -36,13 +36,20 @@
 //! back to what they parsed from, so a host can log, replay and diff them. That
 //! is also why absent shape parameters are omitted rather than written as
 //! `null`.
+//!
+//! [`CommandReply`] is the other half of the same wire — one per command, back
+//! to whoever sent it. It lives here rather than in the application because it
+//! is protocol, not transport: the same reply describes a command a browser
+//! build delivers and one an editor's process does. What does *not* live here
+//! is the reading and writing of a stream: this crate has no I/O and no JSON
+//! parser, by the same rule that keeps `accesskit` out of it.
 
 pub mod a11y;
 pub mod command;
 pub mod context;
 
 pub use a11y::{SemanticNode, SemanticRole, SemanticTree, SemanticValue};
-pub use command::{Command, CommandError, StateDiff};
+pub use command::{Command, CommandError, CommandReply, StateDiff};
 pub use context::{Scene, SceneContext};
 
 /// Re-exported so scene authors do not have to depend on the mobject crate
