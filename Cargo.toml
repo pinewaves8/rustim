@@ -84,12 +84,15 @@ typst-assets = { version = "0.15.1", features = ["fonts"] }
 # without a second compiler.
 typst-html = "0.15.1"
 
-# Test-only in the six kernel crates: used there to read the Manim fixtures
-# (`crates/rustim-math/tests/fixtures/`) and to round-trip the command layer
-# through JSON, and deliberately not a real dependency of any of them, so it
-# cannot reach the `wasm32-unknown-unknown` build. `rustim-app` is not a kernel
-# crate and is the one place it is a real dependency — the `--inspect` surface
-# has to emit JSON for a host to read (`crates/rustim-app/src/main.rs`).
+# A real dependency of exactly two crates. `rustim-scene` carries the wire
+# protocol's text half, because `parse_command` and `reply_line` belong beside
+# the command types they read and write — a host (desktop, browser, a future
+# exporter) must not be able to answer in a dialect of its own; `rustim-app` is
+# the other, because `--inspect` emits JSON. Everything else uses it only in
+# tests: reading the Manim fixtures in `crates/rustim-math/tests/fixtures/` and
+# round-tripping the command layer. It sits in `rustim-scene`, one of the six
+# wasm kernel crates, without weakening that guard: serde_json is pure Rust and
+# wasm-clean, and what the guard forbids is a *platform binding*, not a parser.
 #
 # `float_roundtrip` is not an optimisation: without it serde_json's float parser
 # can land one ULP from the number it wrote, so `to_string(from_str(s)) == s`

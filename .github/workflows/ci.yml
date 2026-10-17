@@ -62,6 +62,23 @@ jobs:
           -p rustim-math -p rustim-color -p rustim-mobject
           -p rustim-anim -p rustim-scene -p rustim-render
 
+      # The browser host, and the scene it shares with the desktop binary. The
+      # second line is the only build in this repository where a Typst crate
+      # reaches wasm32 on purpose: `formula` is an opt-in feature of
+      # `rustim-web` alone, which is what keeps Typst out of the kernel build
+      # above and out of the plain page's download (`tools/build-web.sh`).
+      - name: the browser host builds, with and without Typst
+        run: |
+          cargo build --target wasm32-unknown-unknown -p rustim-scenes -p rustim-web
+          cargo build --target wasm32-unknown-unknown -p rustim-web --features formula
+
+      # What this job cannot check: the canvas and the accessibility tree. Those
+      # need a real Chrome, so they live in `tools/web-check.mjs` (zero npm
+      # dependencies, Node 24's own WebSocket) and are run by hand. The GitHub
+      # runner images do ship Chrome, but pinning a check to an image's browser
+      # version without ever having run it there would be a claim, not a test —
+      # what is checked in CI is that both artifacts *compile*.
+
       # The half of the guard a build cannot make. `accesskit` is platform
       # agnostic enough to compile to wasm32, so a stray dependency would not
       # fail the build above — it would silently put a desktop accessibility

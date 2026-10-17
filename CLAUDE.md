@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **581 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **589 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -41,7 +41,11 @@ six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` 
 baselines, a script replays to a byte-identical frame, an exported frame equals the still pixel for
 pixel, and `rustim-app --png out.png` reproduces the
 Manim reference frame with an **identical content bounding box** (`343,90,936,629`); only 0.012% of
-pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The count is not
+pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The browser host
+builds both ways (with and without Typst) and was **run in Chrome 151**, where its canvas matches the
+desktop still's content bounding box with a maximum channel error of 1 on 16 pixels, Chrome's own
+accessibility tree holds the four named figures, and a formula reaches it as `<math>` structure —
+see "Web (WASM)". The count is not
 decoration — every one of those claims is re-run by the commands below, and the P2 rows in the
 roadmap say which step last moved it.
 
@@ -69,8 +73,9 @@ These are decided. Do not re-litigate them without new evidence.
 - **Cross-platform is a hard requirement: Linux, macOS and Windows.** Hence a CPU-first renderer, a
   bundled CJK font (a bare Linux has none), video encoding as a pluggable sink rather than a call to
   a system `ffmpeg` (macOS and Windows ship none), and **per-platform** golden-image baselines —
-  float results are not bit-identical across NEON and SSE. Web (WASM) is a Phase-2 target; the
-  day-one guards for it are listed in `方案建议.md` §10.6.
+  float results are not bit-identical across NEON and SSE. Web (WASM) is a *host*, not a port of
+  `rustim-app`: it is `rustim-web`, and the day-one guards from `方案建议.md` §10.6 are what made it
+  possible without touching the kernel (see "Web (WASM)").
 - **Concept compatibility, not API compatibility.** Keep the names a Manim user knows (`Scene` /
   `Mobject` / `Animation`, `construct()` / `play()`), but do **not** build a layer that runs existing
   Manim Python scripts. Manim's 343 classes / 1379 methods include 3D, boolean ops, `skia-pathops`
@@ -120,6 +125,8 @@ cargo test -p rustim-app --test export          # the export loop, the sinks and
 cargo test -p rustim-app --test formula         # formula structure reaches --inspect, via the binary
 cargo test -p rustim-export --test compare_cli  # the visual-regression CLI's exit codes
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
+cargo test -p rustim-web             # the browser session core, natively (no Chrome, no wasm)
+cargo test -p rustim-web --features formula  # ...and the scene Typst creates
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo doc --open -p rustim-math      # trait-heavy API; docs are the primary reference
@@ -142,6 +149,23 @@ It also asserts with `cargo tree` that `accesskit` reaches `rustim-app` and **no
 `accesskit` compiles to wasm32 happily, so a stray dependency there would not fail the build above;
 it would silently put a desktop accessibility binding inside the kernel. Checked both ways round,
 so it cannot pass vacuously if the dependency is ever renamed away.
+
+The browser host and its two artifacts (see "Web (WASM)"):
+
+```bash
+cargo build --target wasm32-unknown-unknown -p rustim-scenes -p rustim-web
+cargo build --target wasm32-unknown-unknown -p rustim-web --features formula   # Typst, deliberately
+tools/build-web.sh                     # both artifacts + their raw/gzip sizes, printed
+node tools/web-check.mjs               # real Chrome: pixels, AX tree, command bridge, MathML
+tools/build-web.sh && (cd web && python3 -m http.server 8000)   # ...or look at it by hand
+gzip -9 -c web/pkg-formula/rustim_web_bg.wasm | wc -c            # the formula page's download
+```
+
+`tools/build-web.sh` writes `web/pkg/` and `web/pkg-formula/`, both gitignored; `web-check.mjs` needs
+Chrome (`$CHROME`, default `google-chrome`) and no npm install, and exits 2 rather than 1 when it
+cannot ask the question (no browser, no DevTools endpoint). It is not in CI: the runner has a Chrome,
+but a check never run against an image is a claim rather than a test — what CI does is compile both
+artifacts.
 
 Always benchmark in `--release`. The debug profile is not meaningfully representative for a
 rasteriser — and *not at all* for an **export**: `--video-png` in a debug build spends ~0.6 s per
@@ -297,10 +321,14 @@ last property.
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
+| `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
 | `rustim-app` | The winit event loop, softbuffer presentation, keyboard input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
+| `rustim-web` | The browser host: `Session` (scene + context + renderer + draw list, target-independent and testable natively), `aria` (the semantic tree → flat ARIA projection), `web` (the wasm shell: canvas, rAF loop, DOM/ARIA overlay), the command bridge and the optional `formula` scene | Real (Chrome-verified) |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
-if the renderer ever grows a heavier surface, `DrawList` should move down instead.
+if the renderer ever grows a heavier surface, `DrawList` should move down instead. `rustim-web` sits
+beside `rustim-app`, not under it: both are hosts of the same kernel, and neither depends on the
+other.
 
 ### The frame
 
@@ -1072,6 +1100,84 @@ node; the declared box described under "Accessibility" fixed both, and the shape
 72 to the world unit. Measured, not derived — see the constant's doc and
 `tests/manim_text_scale.rs`; multiplying Manim's `TEXT2SVG_ADJUSTMENT_FACTOR` by
 `TEXT_MOB_SCALE_FACTOR` gives `0.5` and is wrong by a third.
+
+### Web (WASM)
+
+`rustim-web` is a **host**, like `rustim-app` — not a port of it. It runs the same kernel, the same
+`SceneContext` and, through `rustim-scenes`, literally the same `Pythagorean` scene the desktop
+binary renders, which is what lets the browser's canvas be compared against the golden baseline
+rather than against a screenshot. `rustim-app` is not involved: winit, softbuffer and
+`accesskit_unix` have no wasm32 build, and `accesskit` has no web adapter, so the Web path is the one
+§10.6 named — `vello_cpu` → canvas pixels, `SemanticTree` → DOM/ARIA, the existing serde commands.
+
+Three pieces, with the same "pure core, thin shell" split as the desktop:
+
+| Piece | What it is |
+|---|---|
+| `session.rs` | `Session`: scene + `SceneContext` + `CpuRenderer` + `DrawList`, **no wasm types**, so `cargo test -p rustim-web` runs the real frame path natively |
+| `aria.rs` | `SemanticTree` → `Vec<AriaNode>`: a pure projection to roles, names, descriptions, bounds and MathML. No `web-sys`, no `accesskit` |
+| `web.rs` | `#[cfg(target_arch = "wasm32")]` `WebApp`: the canvas, the rAF loop, the DOM/ARIA overlay, the command bridge |
+
+**Presentation.** `Renderer::pixels()` is **premultiplied** RGBA; the browser wants straight. The
+copy is one `straight_rgba_in_place` into a `Vec<u8>` that `Session` owns and every frame reuses, then
+a `Uint8ClampedArray` **shared** with a single `ImageData` (`new_with_js_u8_clamped_array_and_sh` —
+no per-frame copy), then `putImageData`. Measured in Chrome 151 on linux-aarch64 against
+`rustim-app --png` at the same virtual time: **identical content bounding box**
+(`343, 90`)..(`936, 629`), 16 pixels differ by one LSB (0.002%), max channel error **1**. That is not colour management —
+`putImageData` is byte-exact; `toDataURL` has to un-premultiply, and the alpha-254 edge pixels where
+the translucent square meets the background round one LSB differently there. The §5.2 tolerance is
+met with room, and `max == 0` is not a property the canvas API offers — `tools/web-check.mjs` records
+the number rather than asserting a fairytale.
+
+**The rAF loop holds no global state.** `WebApp` owns the `Closure<dyn FnMut(f64)>`; the callback
+captures `Weak<RefCell<Inner>>` plus a `Weak` of its own slot, and `Drop` cancels the pending frame
+by its stored handle and takes the closure. Nothing is `forget()`ed, `Box::leak`ed or put in a
+`thread_local!`. `dt` comes from `performance.now()` clamped to `0.0..=0.1`, so returning to a
+backgrounded tab does not fast-forward ten seconds. `?paused=1` draws virtual time zero and waits for
+`advance(seconds)` — that is how the acceptance check gets a deterministic frame.
+
+**The rasteriser is single-threaded here.** `rustim-render` gained
+`default = ["multithreading"]` / `multithreading = ["vello_cpu/multithreading"]`, and `rustim-web`
+takes `default-features = false`. That is §10.6's guard 2 as a cargo feature instead of a promise;
+the desktop default is unchanged, and `ctx.flush()` is harmless on the single-threaded path.
+
+**Accessibility is a projection, not an adapter.** There is no `accesskit_web`, so `aria::project`
+flattens the semantic tree the same way the AccessKit adapter consumes it and the shell writes one
+absolutely-positioned `<div>` per node: `role`, `aria-label`, `aria-description`, `aria-hidden` for
+hidden nodes, and a `role="status" aria-live="polite"` region for `tree.live`. A formula keeps its
+`<math>` — `innerHTML` of the MathML Typst emitted, which is the *engine's* output and the trust
+boundary, never user input — because ARIA has no math role while the browser gives MathML elements
+one; this is §10.6's "the Web does not have to flatten a formula". The overlay is `opacity: 0` rather
+than `display: none`/`visibility: hidden`, both of which prune the node; Chrome 151 was measured to
+keep `opacity: 0` in its AX tree (`Accessibility.getFullAXTree` finds all four figures), so the
+`.sr-only` fallback was not needed. The DOM is rebuilt only when `SemanticTree` changes (`PartialEq`
+on the whole tree).
+
+**Two artifacts, because Typst costs an order of magnitude.** `tools/build-web.sh` emits `web/pkg`
+(the Pythagorean page) and `web/pkg-formula` (the same shell with `--features formula`, which is the
+only place a Typst crate reaches wasm32 on purpose). Measured 2026-10-17, `rustim_web_bg.wasm`:
+
+| Artifact | raw | gzip -9 | JS glue |
+|---|---|---|---|
+| `web/pkg` | 1 774 906 B | 629 375 B | 20 214 B |
+| `web/pkg-formula` | 33 968 987 B | **14 353 728 B** | 20 215 B |
+
+The second number is §10.6's "Typst's WASM size needs measuring", measured. It is dominated by
+Typst's compiler, ICU data and the nine megabytes of `typst-assets` fonts, and the answer to it is
+packaging, not denial: the pages load **different modules**, so a reader of the Pythagorean scene
+never downloads a typesetting engine. Two profiles, because the obvious choice was wrong twice:
+`opt-level = "z"` + fat LTO makes the plain artifact *larger* (3 316 720 / 734 319) and the formula
+one smaller, so `[profile.web]` keeps release's optimisations and only strips (`debug = 0`,
+`strip = "symbols"`), and `[profile.web-formula]` adds the size-shaped pair. The formula page also
+uses `FormulaCompiler::from_embedded` — `typst-assets` only, no filesystem — because a browser has
+no `BUNDLED_DIR`; the embedded half is shared with `new()` so a fragment compiles on both hosts or
+neither.
+
+Deferred, deliberately: keyboard/pointer input and focus commands (the Web version promises "a
+screen reader can read the structure", not interaction); font subsetting and lazy loading (the
+two-page split is the packaging answer for now, and a CJK formula on the web needs fonts
+`from_embedded` does not carry); WebCodecs/`MediaRecorder` export (the `VideoSink` seam is the
+place it goes); and the query command, which is missing on both hosts.
 
 ### Naming
 
@@ -1990,7 +2096,18 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   moved** — the field is metadata and the draw walk never reads it. The compiler's own deferrals
   (per-run colour, link annotations, `GroupItem::clip`) are unchanged: this step carries structure,
   not style.
-- **P3+** — the AI command surface at full width; Web (WASM).
+- **Web (WASM) is done** — item 11 of the development list, and P7's three acceptance criteria are
+  measured rather than asserted. `rustim-scenes` holds `Pythagorean` so the browser runs the scene
+  the golden was made from; `rustim-web` holds the target-independent `Session`, the `aria`
+  projection and the wasm shell (see "Web (WASM)"); `rustim-render`'s `multithreading` became an
+  opt-out feature rather than an assumption. Evidence: `tools/web-check.mjs` in Chrome 151 —
+  canvas vs. `--png` identical bounding box with max channel error 1 on 16 pixels, the AX tree
+  holding the four figures with measured descriptions and no positions, `role: math` named 公式 on
+  the formula page with `<mfrac>`/`<msup>` in the DOM, and the command bridge answering `add` with
+  an id and refusing broken JSON; two artifacts at 629 375 B and 14 353 728 B gzip -9; 589 workspace
+  tests and both wasm clippy runs clean. Deferred: keyboard/pointer input, font subsetting,
+  WebCodecs export (above).
+- **P3+** — the AI command surface at full width.
 
 ## AI integration
 
