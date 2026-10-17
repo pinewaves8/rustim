@@ -3304,6 +3304,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustim-director"
+version = "0.0.0"
+dependencies = [
+ "rustim-math",
+ "rustim-mobject",
+]
+
+[[package]]
 name = "rustim-export"
 version = "0.0.0"
 dependencies = [

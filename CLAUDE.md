@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **803 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **818 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -171,6 +171,7 @@ cargo test -p rustim-daemon          # sessions, RPC envelope, and real loopback
 cargo test -p rustim-daemon --test daemon   # ...only the socket-level integration suite
 cargo test -p rustim-mcp            # the MCP envelope and tools, natively
 cargo test -p rustim-mcp --test mcp # ...only the real-process stdio suite
+cargo test -p rustim-director       # the teaching tier's layout, over real scene trees
 cargo test -p rustim-export --test compare_cli  # the visual-regression CLI's exit codes
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo test -p rustim-web             # the browser session core, natively (no Chrome, no wasm)
@@ -372,6 +373,7 @@ last property.
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it) and `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) | Real |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform). Annotation, attention, templates, the linter and `ScenePlan` are deferred; nothing here does I/O and nothing names a model | Real (layout) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -382,7 +384,10 @@ last property.
 | `rustim-client` | The **client half** of the command protocol: `read_reply` (one reply line, the presence rule enforced) and `StdioClient` (spawn, `send`, `send_raw`, `write_raw`, `hello`, `close`, seq checking). No engine logic, no rendering, no platform code — it spawns a process, which is a host's job, so it is **not** one of the six wasm kernel crates | Real |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
-if the renderer ever grows a heavier surface, `DrawList` should move down instead. `rustim-web` sits
+if the renderer ever grows a heavier surface, `DrawList` should move down instead. `rustim-director`
+sits between the kernel crates and the hosts and depends only on `rustim-math` and `rustim-mobject`;
+it must never pull `rustim-text` into that position, because the seam that puts the teaching tier
+behind the protocol has to be a trait, not a dependency (see "The teaching tier"). `rustim-web` sits
 beside `rustim-app`, not under it: both are hosts of the same kernel, and neither depends on the
 other. `rustim-daemon` is a third host on the same shelf — it depends on `rustim-scene`,
 `rustim-scenes` and `rustim-text`, never on `rustim-app` or `rustim-web`, and it names no
@@ -1873,6 +1878,58 @@ Issues the tutorial's sketches leave open, and where each stands now:
   over rather than about it being queued.
 - **No `Box::leak`, no global mutable state, no `unwrap()` on a size that came from a window.**
 
+### The teaching tier (`rustim-director`)
+
+A competent planner can drive the primitive protocol; a real-time model, or a template, should not
+have to compute where a caption goes. `rustim-director` is the layer that turns the three sentences a
+lesson actually uses — *next to that*, *in a row*, *fit the frame* — into tree mutations. Its first
+slice is `layout`: `next_to`, `arrange`, `fit`, pure functions over a `SceneTree` and node ids.
+
+Four decisions are the whole design:
+
+- **Everything is measured, in world space, from `SceneTree::world_bounds`** — the box of a node's
+  materialised anchors with every ancestor fold in, the same primitive the accessibility tree and
+  `camera focus` use. So a rotated object is placed by the box a viewer sees, a nested node is placed
+  correctly, and a text or formula node is placed by its declared box like any other. A node with no
+  box is refused (`Unmeasurable`), never treated as a point.
+- **Placement composes onto the deferred transform**: `translate(δ) · transform`, never a rewritten
+  point array, so a placement costs O(1) and does not disturb a rotation or scale the object
+  already carries — the contract `set position` established. `fit` composes a uniform scale about the
+  group's centre in the same way.
+- **The delta is converted into the node's parent space** before it is written, because that is the
+  space `Mobject::transform` maps from. `SceneTree::to_parent_space` is the public spelling of the
+  check `rustim_anim::ops` already carried privately: `kurbo`'s `Affine::inverse` is infallible and
+  returns `NaN`s for a collapsed matrix, so the determinant is checked and the caller gets
+  `Singular` instead of a blank frame.
+- **Refusals are values**: an unknown or unmeasurable node, a target nested inside another target
+  (it would move or scale twice), a non-finite buff, a box with no extent. Duplicate ids are
+  collapsed, first occurrence wins. A placement that changes nothing writes nothing, so a diff does
+  not report a frame that did not move.
+
+`next_to` is Manim's `next_to` with the default aligned edge: near edges separated by exactly `buff`
+(a world-space gap a viewer can see), perpendicular coordinates centred on the reference. `arrange`
+uses Manim's arrange-with-`center=True` semantics — equal *gaps*, not equal widths, and the
+arrangement is centred on the group's original box — with a column running top to bottom in reading
+order. `fit` is `scale_to_fit_width/height` collapsed into one call: the tighter axis decides, so a
+circle stays a circle.
+
+Deferred, and named so they are not rediscovered as gaps: annotation that follows its subject,
+attention animations (`highlight` / `point_at`), the six `explain.*` templates, the linter
+(out of frame, overlap, size, contrast, pacing) and `ScenePlan`. When a teaching-tier **wire action**
+lands (`compose`), the seam is a trait in `rustim-scene` that a host installs — the `Typesetter`
+pattern — not a dependency from `rustim-scene` to `rustim-director`: templates will compile formulas,
+and `rustim-text` must never reach the six wasm kernel crates.
+
+Evidence: fifteen layout tests over real `SceneTree`s — all four directions and the perpendicular
+centring, a negative buff, a self-placement refusal, row and column arrangements with equal gaps and a
+preserved group centre, duplicate collapsing, `fit` by the tighter axis with the aspect and centre
+kept, an identity fit writing nothing, refusals for a degenerate box and an unmeasurable node, nested
+targets refused in both orders, a child of a translated parent placed by its world box, a child of a
+**scaled** parent moved by a world-space delta (the `to_parent_space` conversion), a rotated square
+placed by its 2√2 box with its rotation intact, and a point-less node placed by its declared box.
+**All eight goldens are unchanged** — the crate draws nothing and no scene calls it yet — and the
+count moved 803 → 818.
+
 ## Roadmap
 
 Phase 0 (risk elimination) is done **and the skeleton it produced is verified green** — the toolchain,
@@ -2647,6 +2704,19 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   streamable-HTTP transports (stdio only, per `贾维斯集成方案.md`'s local-first rule); forwarding
   the event stream as MCP notifications; and any rendering or frame snapshot — a host that needs
   pixels uses the daemon or `--png`.
+- **Phase 2's first slice — the teaching tier's layout — is done.** `rustim-director` now exists,
+  with `layout`'s three operations and nothing else: `next_to`, `arrange`, `fit`, pure functions over
+  a `SceneTree`. The design decisions are in "The teaching tier" — world-space boxes measured from
+  `world_bounds`, placement composed onto the deferred transform, the delta converted into the
+  node's parent space via the new `SceneTree::to_parent_space` (the determinant guard `ops::Rotate`
+  already carried, now public), and every refusal a value. The step touched `rustim-mobject` once
+  (that method) and added a crate; no wire action, no host, no scene. Evidence: fifteen layout tests
+  over real trees, including a child of a **scaled** parent (the parent-space conversion) and a
+  rotated square placed by its 2√2 world box with its rotation intact. **All eight goldens are
+  unchanged** — nothing draws through this crate yet — and the count moved 803 → 818. Deliberately
+  deferred: the `compose` wire action (which will arrive through a `Typesetter`-style trait in
+  `rustim-scene`, never a dependency — templates will compile formulas), annotation, attention
+  animations, the `explain.*` templates, the linter and `ScenePlan`.
 
 ## AI integration
 

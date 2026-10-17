@@ -7,6 +7,7 @@ members = [
     "crates/rustim-anim",
     "crates/rustim-text",
     "crates/rustim-scene",
+    "crates/rustim-director",
     "crates/rustim-render",
     "crates/rustim-export",
     "crates/rustim-scenes",
@@ -32,6 +33,7 @@ rustim-mobject = { path = "crates/rustim-mobject" }
 rustim-anim = { path = "crates/rustim-anim" }
 rustim-text = { path = "crates/rustim-text" }
 rustim-scene = { path = "crates/rustim-scene" }
+rustim-director = { path = "crates/rustim-director" }
 rustim-render = { path = "crates/rustim-render" }
 rustim-export = { path = "crates/rustim-export" }
 rustim-scenes = { path = "crates/rustim-scenes" }

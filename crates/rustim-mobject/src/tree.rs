@@ -738,6 +738,33 @@ impl SceneTree {
         t
     }
 
+    /// Carry a world point into the space a node's own [`Mobject::transform`]
+    /// maps *from*.
+    ///
+    /// The frame [`Mobject::critical_point`] answers in, and the pivot space
+    /// [`Mobject::rotate_about`] / [`Mobject::scale_about`] take. A caller
+    /// holding a world point (the centre of a layout box, a focus target) has to
+    /// bring it here before composing a transform onto a nested node; for a
+    /// root node this is the identity.
+    ///
+    /// `None` when the ancestor chain collapses the plane. `kurbo`'s
+    /// `Affine::inverse` is infallible (`affine.rs:426`): on a singular matrix it
+    /// divides by a zero determinant and returns infinities and `NaN`s, which
+    /// would then be written into a point array and come out as a blank frame.
+    /// So the determinant is checked first and the caller degrades to a no-op —
+    /// "a scene scaled to nothing" has no answer to "where is this point".
+    ///
+    /// `rustim_anim::ops` carries the same check as a private helper for the
+    /// pivot of a `Rotate`; this is the public spelling of it.
+    pub fn to_parent_space(&self, id: NodeId, p: Point) -> Option<Point> {
+        let parent = self.parent_transform(id);
+        let det = parent.determinant();
+        if !det.is_finite() || det == 0.0 {
+            return None;
+        }
+        Some(parent.inverse() * p)
+    }
+
     /// Ids in draw order, parents before their children.
     pub fn draw_order(&self) -> Vec<NodeId> {
         let mut out = Vec::with_capacity(self.nodes.len());
