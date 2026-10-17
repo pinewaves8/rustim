@@ -141,6 +141,49 @@ fn the_semantic_tree_names_the_figure() {
     }
 }
 
+/// A pointer gesture writes its camera through [`Session::set_camera`], which
+/// is the command layer — so the projection moves, and a malformed camera is a
+/// refusal rather than a corrupted view.
+#[test]
+fn a_gesture_camera_reaches_the_projection() {
+    use rustim_math::Camera;
+
+    let mut session = Session::new(WIDTH, HEIGHT, "pythagorean").expect("the scene builds");
+    assert_eq!(session.camera(), Camera::default());
+
+    let before = session
+        .semantic()
+        .nodes
+        .into_iter()
+        .find(|node| node.name == "a 的正方形")
+        .and_then(|node| node.bounds)
+        .expect("the square has measured bounds");
+
+    // 90 px is one world unit at zoom 1; dragging right moves the content
+    // right, so the camera centre moves left.
+    let panned = session.camera().panned(&session.viewport(), (90.0, 0.0));
+    session
+        .set_camera(panned)
+        .expect("a gesture camera is valid");
+    assert_eq!(session.camera(), Camera::new((-1.0, 0.0), 1.0));
+
+    let after = session
+        .semantic()
+        .nodes
+        .into_iter()
+        .find(|node| node.name == "a 的正方形")
+        .and_then(|node| node.bounds)
+        .expect("the square still has measured bounds");
+    assert_eq!(after.x0 - before.x0, 90.0, "the whole projection moved");
+    assert_eq!(after.y0, before.y0);
+
+    // A camera the command layer cannot accept stays a value, and the view is
+    // exactly as it was.
+    let broken = Camera::new((0.0, 0.0), f64::NAN);
+    assert!(session.set_camera(broken).is_err());
+    assert_eq!(session.camera(), Camera::new((-1.0, 0.0), 1.0));
+}
+
 /// `apply` is the browser's command bridge, and it answers exactly as the
 /// desktop feed does — because it calls the same two functions.
 #[test]

@@ -48,12 +48,18 @@ use std::rc::{Rc, Weak};
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
-use web_sys::{CanvasRenderingContext2d, Document, Element, HtmlCanvasElement, ImageData};
+use web_sys::{
+    CanvasRenderingContext2d, Document, Element, Event, EventTarget, HtmlCanvasElement, ImageData,
+    PointerEvent, WheelEvent,
+};
 
+use rustim_math::Camera;
+use rustim_math::gesture::Pointer;
 use rustim_render::straight_rgba_in_place;
 use rustim_scene::a11y::SemanticTree;
 
 use crate::aria::{self, AriaNode};
+use crate::pointer;
 use crate::session::{STEP, Session};
 
 /// The longest wall-clock step a frame is allowed to represent.
@@ -75,10 +81,53 @@ fn describe(error: &JsValue) -> String {
         .unwrap_or_else(|| "a JavaScript exception with no message".to_owned())
 }
 
+/// One registered DOM listener, kept so it can be removed again.
+///
+/// A `Closure` given to `add_event_listener` is owned by JavaScript, but the
+/// closure's *memory* is ours, and an element that outlives the host would call
+/// into a dropped `WebApp`. `Drop` removes the listener before the closure is
+/// freed; `Weak` inside every callback is the second line of defence.
+struct Listener {
+    target: EventTarget,
+    kind: &'static str,
+    callback: Closure<dyn FnMut(Event)>,
+}
+
+impl Listener {
+    fn add(
+        target: &EventTarget,
+        kind: &'static str,
+        callback: Closure<dyn FnMut(Event)>,
+    ) -> Result<Self, JsValue> {
+        target.add_event_listener_with_callback(kind, callback.as_ref().unchecked_ref())?;
+        Ok(Self {
+            target: target.clone(),
+            kind,
+            callback,
+        })
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = self
+            .target
+            .remove_event_listener_with_callback(self.kind, self.callback.as_ref().unchecked_ref());
+    }
+}
+
 /// The state one animation frame touches.
 struct Inner {
     session: Session,
     document: Document,
+    canvas: HtmlCanvasElement,
+    /// True while the rAF loop owns presentation; false means the host draws on
+    /// demand, so a gesture must repaint itself.
+    autoplay: bool,
+    /// The shared drag/wheel state — the same type the desktop host uses.
+    pointer: Pointer,
+    /// Removed on drop; see [`Listener`].
+    listeners: Vec<Listener>,
     context: CanvasRenderingContext2d,
     /// Shares its buffer with `array`; built once, drawn every frame.
     image: ImageData,
@@ -99,7 +148,11 @@ struct Inner {
 }
 
 impl Inner {
-    fn new(canvas_id: &str, scene: &str) -> Result<(Self, web_sys::Window), JsValue> {
+    fn new(
+        canvas_id: &str,
+        scene: &str,
+        autoplay: bool,
+    ) -> Result<(Self, web_sys::Window), JsValue> {
         let window =
             web_sys::window().ok_or_else(|| jserr("no window: this module is a browser host"))?;
         let document = window.document().ok_or_else(|| jserr("no document"))?;
@@ -152,6 +205,10 @@ impl Inner {
             Self {
                 session,
                 document,
+                canvas,
+                autoplay,
+                pointer: Pointer::new(),
+                listeners: Vec::new(),
                 context,
                 image,
                 array,
@@ -183,6 +240,45 @@ impl Inner {
         self.session.refresh();
         self.blit();
         self.sync_a11y();
+    }
+
+    /// A client-space pointer position in the canvas's own pixel grid.
+    fn canvas_point(&self, client_x: f64, client_y: f64) -> Option<(f64, f64)> {
+        let rect = self.canvas.get_bounding_client_rect();
+        let rect = rustim_math::Rect::new(
+            rect.x(),
+            rect.y(),
+            rect.x() + rect.width(),
+            rect.y() + rect.height(),
+        );
+        let viewport = self.session.viewport();
+        pointer::canvas_point(
+            (client_x, client_y),
+            rect,
+            viewport.frame_width,
+            viewport.frame_height,
+        )
+    }
+
+    /// Write the camera a gesture produced, and present it if nobody else will.
+    ///
+    /// `end_frame` immediately follows the write: unlike the desktop host, the
+    /// browser applies each event to the live camera as it arrives, so there is
+    /// no batch of queued commands for a later frame to drain. Clearing the
+    /// pending camera keeps the "start from what is on screen" rule true even if
+    /// a script moves the view between two pointer events.
+    fn apply_gesture(&mut self, camera: Option<Camera>) {
+        let Some(camera) = camera else {
+            self.pointer.end_frame();
+            return;
+        };
+        if let Err(error) = self.session.set_camera(camera) {
+            self.error = Some(format!("the camera command was refused: {error}"));
+        }
+        self.pointer.end_frame();
+        if !self.autoplay {
+            self.refresh();
+        }
     }
 
     /// Project the semantic tree into the overlay, when it changed.
@@ -334,6 +430,109 @@ fn placement(bounds: Option<rustim_math::Rect>) -> String {
     style
 }
 
+/// Wire the canvas's pointer and wheel events to the shared gesture state.
+///
+/// Every callback holds a `Weak`, never the `Rc` — the same rule the rAF loop
+/// follows. A wheel listener on an element is not passive by default in Chrome,
+/// so `preventDefault` really does stop the page from scrolling under the zoom.
+fn install_listeners(inner: &Rc<RefCell<Inner>>) -> Result<Vec<Listener>, JsValue> {
+    let canvas = inner.borrow().canvas.clone();
+    let target: EventTarget = canvas.unchecked_into();
+
+    let down = {
+        let weak = Rc::downgrade(inner);
+        Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            // Left button, primary pointer only: a touch's contact reports
+            // button 0, and a second finger must not fight the first for the
+            // pan. Right/middle clicks are left to the browser.
+            let contact = event.dyn_ref::<PointerEvent>().and_then(|event| {
+                (event.is_primary() && event.button() == 0)
+                    .then(|| (f64::from(event.client_x()), f64::from(event.client_y())))
+            });
+            let Some((x, y)) = contact else {
+                return;
+            };
+            let mut inner = inner.borrow_mut();
+            if let Some(at) = inner.canvas_point(x, y) {
+                // Record the press position *before* arming the drag. A mouse
+                // has already sent a hover move, so this only confirms the
+                // anchor; a touch has not, and without it the first finger
+                // movement would be swallowed establishing one.
+                let viewport = inner.session.viewport();
+                let live = inner.session.camera();
+                inner.pointer.cursor_moved(at, &viewport, live);
+            }
+            inner.pointer.press();
+        })
+    };
+
+    let moved = {
+        let weak = Rc::downgrade(inner);
+        Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let Some(event) = event.dyn_ref::<PointerEvent>() else {
+                return;
+            };
+            let (x, y) = (f64::from(event.client_x()), f64::from(event.client_y()));
+            let mut inner = inner.borrow_mut();
+            let Some(at) = inner.canvas_point(x, y) else {
+                return;
+            };
+            let viewport = inner.session.viewport();
+            let live = inner.session.camera();
+            let next = inner.pointer.cursor_moved(at, &viewport, live);
+            inner.apply_gesture(next);
+        })
+    };
+
+    // A pointer that leaves the canvas ends the drag: its `pointerup` may land
+    // on another element, and a drag that "stays held" after that would pan
+    // whenever the pointer came back. Three events, three closures — a
+    // `Closure` is not cloneable, and sharing one would need an `Rc` only to
+    // register the same function three times.
+    let release = |inner: &Rc<RefCell<Inner>>| {
+        let weak = Rc::downgrade(inner);
+        Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+            if let Some(inner) = weak.upgrade() {
+                inner.borrow_mut().pointer.release();
+            }
+        })
+    };
+
+    let wheel = {
+        let weak = Rc::downgrade(inner);
+        Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let Some(event) = event.dyn_ref::<WheelEvent>() else {
+                return;
+            };
+            event.prevent_default();
+            let delta = pointer::scroll_delta(event.delta_y(), event.delta_mode());
+            let mut inner = inner.borrow_mut();
+            let viewport = inner.session.viewport();
+            let live = inner.session.camera();
+            let next = inner.pointer.scroll(delta, &viewport, live);
+            inner.apply_gesture(next);
+        })
+    };
+
+    Ok(vec![
+        Listener::add(&target, "pointerdown", down)?,
+        Listener::add(&target, "pointermove", moved)?,
+        Listener::add(&target, "pointerup", release(inner))?,
+        Listener::add(&target, "pointercancel", release(inner))?,
+        Listener::add(&target, "pointerleave", release(inner))?,
+        Listener::add(&target, "wheel", wheel)?,
+    ])
+}
+
 /// Ask the browser for the next frame, recording the handle for `Drop`.
 ///
 /// A free function rather than a method because the callback must reschedule
@@ -375,9 +574,14 @@ impl WebApp {
     /// browser frame reproducible enough to compare against the desktop still.
     #[wasm_bindgen(constructor)]
     pub fn new(canvas_id: &str, scene: &str, autoplay: bool) -> Result<WebApp, JsValue> {
-        let (inner, window) = Inner::new(canvas_id, scene)?;
+        let (inner, window) = Inner::new(canvas_id, scene, autoplay)?;
         let inner = Rc::new(RefCell::new(inner));
         let tick: Rc<RefCell<Option<Tick>>> = Rc::new(RefCell::new(None));
+
+        // Registered before the first frame so a gesture that arrives while the
+        // scene is still fading in is not dropped.
+        let listeners = install_listeners(&inner)?;
+        inner.borrow_mut().listeners = listeners;
 
         let weak_inner = Rc::downgrade(&inner);
         let weak_tick = Rc::downgrade(&tick);
@@ -430,6 +634,15 @@ impl WebApp {
         self.inner.borrow_mut().refresh();
     }
 
+    /// The view, as `[center.x, center.y, zoom]`.
+    ///
+    /// The observable side of a pointer gesture: a browser check can drag and
+    /// then ask what the camera became, instead of inferring it from pixels.
+    pub fn camera(&self) -> Vec<f64> {
+        let camera = self.inner.borrow().session.camera();
+        vec![camera.center.0, camera.center.1, camera.zoom]
+    }
+
     /// The last presentation or rasterisation failure, if any.
     pub fn render_error(&self) -> Option<String> {
         let inner = self.inner.borrow();
@@ -443,6 +656,9 @@ impl WebApp {
 
 impl Drop for WebApp {
     fn drop(&mut self) {
+        // Listeners first: the rAF callback is already `Weak`, but a DOM event
+        // could still be dispatched into a half-dropped host otherwise.
+        self.inner.borrow_mut().listeners.clear();
         if let Some(handle) = self.inner.borrow_mut().handle.take()
             && let Some(window) = web_sys::window()
         {

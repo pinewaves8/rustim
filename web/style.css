@@ -22,6 +22,14 @@ canvas {
   max-width: 100%;
   height: auto;
   image-rendering: auto;
+  /* Drag pans and wheel zooms; without this a touch drag would scroll the page
+     instead of moving the figure. */
+  touch-action: none;
+  cursor: grab;
+}
+
+canvas:active {
+  cursor: grabbing;
 }
 
 #a11y {
@@ -32,11 +40,17 @@ canvas {
 }
 
 form,
-pre {
+pre,
+.hint {
   max-width: 1280px;
   margin: 12px auto;
   padding: 0 12px;
   box-sizing: border-box;
+}
+
+.hint {
+  color: #757575;
+  font-size: 12px;
 }
 
 label {

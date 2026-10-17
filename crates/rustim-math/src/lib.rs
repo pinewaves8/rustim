@@ -19,6 +19,7 @@
 //! its formulas.
 
 pub mod bezier;
+pub mod gesture;
 pub mod paths;
 pub mod rate;
 pub mod space_ops;

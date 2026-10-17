@@ -22,10 +22,10 @@
 //! loop exactly: it updates `n` times and presents once.
 
 use rustim_anim::Motion;
-use rustim_math::Viewport;
+use rustim_math::{Camera, Viewport};
 use rustim_render::{CpuRenderer, DrawList, Renderer};
 use rustim_scene::a11y::SemanticTree;
-use rustim_scene::command::{parse_command, reply_line};
+use rustim_scene::command::{Command, parse_command, reply_line};
 use rustim_scene::{Scene, SceneContext};
 
 /// The virtual timestep the still path, the exporter and the browser's
@@ -215,6 +215,39 @@ impl Session {
 
     pub fn viewport(&self) -> Viewport {
         self.viewport
+    }
+
+    /// The view as it stands — the base a pointer gesture reads.
+    pub fn camera(&self) -> Camera {
+        *self.ctx.camera()
+    }
+
+    /// Write a camera a pointer gesture produced, through the command layer.
+    ///
+    /// The gesture arithmetic already produces a camera that is finite and
+    /// outlives [`rustim_math::gesture::MIN_ZOOM`]..=[`MAX_ZOOM`], so this
+    /// normally cannot fail — but the *command layer* is where every value from
+    /// outside the engine is validated, and a host that wrote the camera field
+    /// directly would be the one caller in the workspace to skip it. The reply
+    /// is a value rather than a panic for the same reason every other refusal
+    /// is.
+    ///
+    /// Instant, not a beat: the user is dragging the view, and a queued
+    /// `CameraMove` would lag the pointer. An animation already owns the camera
+    /// until it ends, exactly as an instant `{"action":"camera"}` does on the
+    /// desktop.
+    pub fn set_camera(&mut self, camera: Camera) -> Result<(), String> {
+        let command = Command::Camera {
+            center: Some([camera.center.0, camera.center.1]),
+            zoom: Some(camera.zoom),
+            focus: None,
+            duration: None,
+        };
+        let outcome = self.ctx.handle(&command).map_err(|e| e.to_string())?;
+        if let Some(diff) = outcome.diff() {
+            self.scene.on_command(diff, &mut self.ctx);
+        }
+        Ok(())
     }
 
     /// Frames whose state was built (not just presented).

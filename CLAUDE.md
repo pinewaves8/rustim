@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **621 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **628 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -44,8 +44,9 @@ Manim reference frame with an **identical content bounding box** (`343,90,936,62
 pixels differ by more than 2/255, and none by more than 8. See `方案建议.md` §5.2. The browser host
 builds both ways (with and without Typst) and was **run in Chrome 151**, where its canvas matches the
 desktop still's content bounding box with a maximum channel error of 1 on 16 pixels, Chrome's own
-accessibility tree holds the four named figures, and a formula reaches it as `<math>` structure —
-see "Web (WASM)". The count is not
+accessibility tree holds the four named figures, a formula reaches it as `<math>` structure, and a
+drag and a wheel dispatched through Chrome's input pipeline move the camera exactly as the desktop's
+shared gesture code does — see "Web (WASM)". The count is not
 decoration — every one of those claims is re-run by the commands below, and the P2 rows in the
 roadmap say which step last moved it.
 
@@ -156,7 +157,7 @@ The browser host and its two artifacts (see "Web (WASM)"):
 cargo build --target wasm32-unknown-unknown -p rustim-scenes -p rustim-web
 cargo build --target wasm32-unknown-unknown -p rustim-web --features formula   # Typst, deliberately
 tools/build-web.sh                     # both artifacts + their raw/gzip sizes, printed
-node tools/web-check.mjs               # real Chrome: pixels, AX tree, command bridge, MathML
+node tools/web-check.mjs               # real Chrome: pixels, AX tree, drag/wheel, command bridge, MathML
 tools/build-web.sh && (cd web && python3 -m http.server 8000)   # ...or look at it by hand
 gzip -9 -c web/pkg-formula/rustim_web_bg.wasm | wc -c            # the formula page's download
 ```
@@ -318,7 +319,7 @@ last property.
 
 | Crate | Contents | Status |
 |---|---|---|
-| `rustim-math` | Points, `Affine2`, rate functions and the `Rate` wire vocabulary, the pixel-only `Viewport` and the `Camera` view (world→screen), and literal ports of Manim's `bezier` / `space_ops` / `paths` / `rate_functions` | Real |
+| `rustim-math` | Points, `Affine2`, rate functions and the `Rate` wire vocabulary, the pixel-only `Viewport` and the `Camera` view (world→screen), the pointer gesture vocabulary (`gesture`: drag, scroll, zoom factor, zoom range) shared by both hosts, and literal ports of Manim's `bezier` / `space_ops` / `paths` / `rate_functions` | Real |
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / declared `local_bounds` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors`, `ids_with_label` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
@@ -328,7 +329,7 @@ last property.
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
 | `rustim-app` | The winit event loop, softbuffer presentation, keyboard and pointer input, announcements, the AccessKit adapter, the shaper↔rasteriser bridge, the command feed (`feed`: JSONL in, replies out, the one apply point), the caption band (`caption`) and self-voicing (`speech`) — all as a **lib** target — the export loop (`export_timeline`), eight `--scene` entries, the golden, script, caption and export suites | Real |
-| `rustim-web` | The browser host: `Session` (scene + context + renderer + draw list, target-independent and testable natively), `aria` (the semantic tree → flat ARIA projection), `web` (the wasm shell: canvas, rAF loop, DOM/ARIA overlay), the command bridge and the optional `formula` scene | Real (Chrome-verified) |
+| `rustim-web` | The browser host: `Session` (scene + context + renderer + draw list, target-independent and testable natively), `aria` (the semantic tree → flat ARIA projection), `pointer` (DOM wheel/pointer units and signs → `rustim-math::gesture`, pure and natively tested), `web` (the wasm shell: canvas, rAF loop, pointer/wheel listeners, DOM/ARIA overlay), the command bridge and the optional `formula` scene | Real (Chrome-verified) |
 
 Dependencies point downwards only. `rustim-scene` depends on `rustim-render` for the `DrawList` type;
 if the renderer ever grows a heavier surface, `DrawList` should move down instead. `rustim-web` sits
@@ -466,23 +467,24 @@ The window handles three pointer events and they are the camera's manual control
 drag pans**, **wheel/trackpad scroll zooms about the cursor**. Before this there were no pointer
 events at all — the event loop matched keys, resize and redraw and dropped everything else.
 
-- **The arithmetic is pure, in `rustim-math`.** `Camera::panned(viewport, delta_px)` is one division
-  by `pixels_per_unit`: dragging 90 px at zoom 1 moves the centre by one world unit, with the y sign
-  flipped because winit's y runs down. `Camera::zoomed_about(viewport, factor, cursor_px)` zooms
-  first, then shifts the centre by the displacement that puts the **same world point back under the
-  cursor**, so the view grows around the pointer rather than jumping. Both return `self` on a
-  degenerate viewport, zoom or delta: pointer input has no error channel, and the tree's invariant —
-  finite, positive zoom — has to survive whatever the platform sends.
+- **The arithmetic is pure, in `rustim-math::gesture`.** `Camera::panned(viewport, delta_px)` is one
+  division by `pixels_per_unit`: dragging 90 px at zoom 1 moves the centre by one world unit, with
+  the y sign flipped because screen y runs down. `Camera::zoomed_about(viewport, factor, cursor_px)`
+  zooms first, then shifts the centre by the displacement that puts the **same world point back
+  under the cursor**, so the view grows around the pointer rather than jumping. Both return `self` on
+  a degenerate viewport, zoom or delta: pointer input has no error channel, and the tree's
+  invariant — finite, positive zoom — has to survive whatever the platform sends.
 - **The wheel's factor is multiplicative, `exp(k · delta)`.** Equal scroll steps multiply the zoom by
   equal ratios, so ten notches in and ten out return to the start and a notch feels the same at every
   scale; adding a constant would be a huge jump zoomed out and invisible zoomed in. winit reports
   notches (`LineDelta`) and trackpad pixels (`PixelDelta`), which are not convertible — the OS decides
-  how many pixels a notch is — so `input::WheelDelta` keeps the unit and gives each its own rate
-  (`0.25`/line ⇒ ×1.284 per notch, `0.002`/px). Horizontal scroll is dropped rather than folded in.
+  how many pixels a notch is — so `gesture::ScrollDelta` keeps the unit and `zoom_factor` gives each
+  its own rate (`0.25`/line ⇒ ×1.284 per notch, `0.002`/px). Horizontal scroll is dropped rather than
+  folded in.
 - **The clamp is the host's, and it clamps the factor rather than the zoom.** `0.05..=64` is the range
   in which a gesture stays reversible; a script may still ask the command layer for any positive
-  zoom. `input::clamped_zoom_factor(current, factor)` re-expresses the factor so the product lands on
-  the limit exactly — clamping the resulting zoom instead would move the centre and break the
+  zoom. `gesture::clamped_zoom_factor(current, factor)` re-expresses the factor so the product lands
+  on the limit exactly — clamping the resulting zoom instead would move the centre and break the
   cursor-anchor invariant.
 - **Both gestures end at the command layer**, as `{"action":"camera","center":…,"zoom":…}` with no
   `duration` — the same command an AI or a script sends, through the same validator. A pointer is one
@@ -490,19 +492,23 @@ events at all — the event loop matched keys, resize and redraw and dropped eve
   animation, so pointer input is motion-mode independent; and an in-flight `CameraMove` still owns
   its subject, so a drag during one is overwritten until the move ends (the documented contract
   `Set position` has with `MoveTo`).
-- **`MouseWheel` and `MouseInput` carry no position**, so `App` tracks the last `CursorMoved` in
-  `cursor: Option<(f64, f64)>`; a wheel before the pointer ever entered has no anchor and is ignored.
-  The drag is released on `CursorLeft` and on losing focus, because the button-up can happen outside
-  the window where no `MouseInput` follows — coming back in must not pan with a button nobody holds.
-  `Drag::press` deliberately keeps the last position, so the first movement after the button goes
-  down produces a correct delta instead of being swallowed as the anchor.
+- **The state a gesture needs is `gesture::Pointer`, shared with the browser.** It owns the cursor
+  (winit's `MouseWheel` and `MouseInput` carry no position; a wheel before the pointer ever entered
+  has no anchor and is ignored), the drag (`Drag`), and the camera the current gesture has built. The
+  desktop releases the drag on `CursorLeft` and on losing focus, because the button-up can happen
+  outside the window where no `MouseInput` follows — coming back in must not pan with a button nobody
+  holds. `Drag::press` deliberately keeps the last position, so the first movement after the button
+  goes down produces a correct delta instead of being swallowed as the anchor.
 - **A gesture continues from the previous gesture, not from the screen.** A cursor can move several
   times between two frames, and each delta has to apply to the camera the *earlier delta of that
   frame* produced — reading `tree.camera` every time keeps only the last move and makes a fast drag
-  trail the pointer. `input::gesture_base(pending, live)` is that one decision; `App` clears the
-  pending camera once the frame has applied its commands.
+  trail the pointer. `Pointer` keeps that pending camera in `record`; `App` calls `end_frame()` once
+  the frame has applied its queued commands.
+- **The browser host is the second consumer**, not a reimplementation: `rustim-web` feeds the same
+  `Pointer` and writes the resulting camera through `Session::set_camera`, which is `Command::Camera`
+  through `Session::apply`'s `handle`. See "Web (WASM)" for the DOM side of the translation.
 
-The classifier is winit-free except for two-line adapters (`WheelDelta::from_winit`,
+The classifier is winit-free except for two-line adapters (`input::wheel_delta`,
 `KeyPress::from_event`), so the gesture arithmetic is tested in CI where there is no window: the pan
 follows the pointer at every zoom, zooming about a cursor keeps its world point fixed to `1e-12` at
 four start zooms × four cursor corners × four factors, malformed factors are the identity, and the
@@ -1186,9 +1192,10 @@ Three pieces, with the same "pure core, thin shell" split as the desktop:
 
 | Piece | What it is |
 |---|---|
-| `session.rs` | `Session`: scene + `SceneContext` + `CpuRenderer` + `DrawList`, **no wasm types**, so `cargo test -p rustim-web` runs the real frame path natively |
+| `session.rs` | `Session`: scene + `SceneContext` + `CpuRenderer` + `DrawList`, **no wasm types**, so `cargo test -p rustim-web` runs the real frame path natively. `set_camera` writes a gesture's view through `Command::Camera` |
 | `aria.rs` | `SemanticTree` → `Vec<AriaNode>`: a pure projection to roles, names, descriptions, bounds and MathML. No `web-sys`, no `accesskit` |
-| `web.rs` | `#[cfg(target_arch = "wasm32")]` `WebApp`: the canvas, the rAF loop, the DOM/ARIA overlay, the command bridge |
+| `pointer.rs` | DOM `WheelEvent`/client coordinates → `rustim_math::gesture`: the sign flip, the delta unit, and the canvas-pixel conversion. Pure, natively tested |
+| `web.rs` | `#[cfg(target_arch = "wasm32")]` `WebApp`: the canvas, the rAF loop, the six pointer/wheel listeners, the DOM/ARIA overlay, the command bridge |
 
 **Presentation.** `Renderer::pixels()` is **premultiplied** RGBA; the browser wants straight. The
 copy is one `straight_rgba_in_place` into a `Vec<u8>` that `Session` owns and every frame reuses, then
@@ -1207,6 +1214,27 @@ by its stored handle and takes the closure. Nothing is `forget()`ed, `Box::leak`
 `thread_local!`. `dt` comes from `performance.now()` clamped to `0.0..=0.1`, so returning to a
 backgrounded tab does not fast-forward ten seconds. `?paused=1` draws virtual time zero and waits for
 `advance(seconds)` — that is how the acceptance check gets a deterministic frame.
+
+**Pointer input is the desktop's gesture code, reached through the DOM.** The wasm shell owns no
+gesture arithmetic: `rustim-web::pointer` only translates. `scroll_delta` flips `WheelEvent.deltaY`
+(a DOM positive is scrolling down; the gesture's positive is zoom-in) and maps `deltaMode` onto
+`ScrollDelta` — pixel and line directly, a page as `PAGE_LINES = 10` — and `canvas_point` scales a
+client position by `canvas.width / rect.width`, which is the one conversion right for both a
+CSS-shrunk canvas (`max-width: 100%`) and a HiDPI one. `web.rs` installs six listeners on the canvas
+— `pointerdown` (left button, primary pointer), `pointermove`, `pointerup`, `pointercancel`,
+`pointerleave`, `wheel` — keeps each in a `Listener` whose `Drop` removes it, and feeds the shared
+`rustim_math::gesture::Pointer` exactly as `main.rs` does. The press handler records the contact
+point *before* arming the drag: a mouse has already sent a hover move, a touch has not, and without
+that the first finger movement would only establish the anchor. Every resulting camera goes through
+`Session::set_camera`, i.e. `Command::Camera` through `handle` — the same validator a script meets.
+`preventDefault` on the wheel keeps the page from scrolling under the zoom, and `touch-action: none`
+does the same for a drag.
+
+Measured by `tools/web-check.mjs` in Chrome 151 through `Input.dispatchMouseEvent` — the browser's
+own input pipeline, so the listeners see real `PointerEvent`s rather than a synthetic dispatch — at a
+1:1 canvas: a 200 px drag moves `center.x` to `-2.2222222222222223` (= −200/90, exact, with a
+vertical component of zero), and `deltaY: -100` sets `zoom` to `1.2214027581601699 = e^0.2` while
+the world point under the cursor moves `6.3e-16`. The values are asserted, not printed hopefully.
 
 **The rasteriser is single-threaded here.** `rustim-render` gained
 `default = ["multithreading"]` / `multithreading = ["vello_cpu/multithreading"]`, and `rustim-web`
@@ -1231,26 +1259,27 @@ only place a Typst crate reaches wasm32 on purpose). Measured 2026-10-17, `rusti
 
 | Artifact | raw | gzip -9 | JS glue |
 |---|---|---|---|
-| `web/pkg` | 1 774 906 B | 629 375 B | 20 214 B |
-| `web/pkg-formula` | 33 968 987 B | **14 353 728 B** | 20 215 B |
+| `web/pkg` | 1 807 846 B | 639 863 B | 24 485 B |
+| `web/pkg-formula` | 33 996 198 B | **14 361 238 B** | 24 487 B |
 
 The second number is §10.6's "Typst's WASM size needs measuring", measured. It is dominated by
 Typst's compiler, ICU data and the nine megabytes of `typst-assets` fonts, and the answer to it is
 packaging, not denial: the pages load **different modules**, so a reader of the Pythagorean scene
 never downloads a typesetting engine. Two profiles, because the obvious choice was wrong twice:
-`opt-level = "z"` + fat LTO makes the plain artifact *larger* (3 316 720 / 734 319) and the formula
-one smaller, so `[profile.web]` keeps release's optimisations and only strips (`debug = 0`,
+`opt-level = "z"` + fat LTO made the plain artifact *larger* and the formula one smaller, so
+`[profile.web]` keeps release's optimisations and only strips (`debug = 0`,
 `strip = "symbols"`), and `[profile.web-formula]` adds the size-shaped pair. The formula page also
 uses `FormulaCompiler::from_embedded` — `typst-assets` only, no filesystem — because a browser has
 no `BUNDLED_DIR`; the embedded half is shared with `new()` so a fragment compiles on both hosts or
 neither.
 
-Deferred, deliberately: keyboard/pointer input and focus commands (the Web version promises "a
-screen reader can read the structure", not interaction); font subsetting and lazy loading (the
-two-page split is the packaging answer for now, and a CJK formula on the web needs fonts
-`from_embedded` does not carry); and WebCodecs/`MediaRecorder` export (the `VideoSink` seam is the
-place it goes). The query command is *not* deferred any more — `Session::apply` answers it through
-the same `reply_line` the desktop feed uses.
+Deferred, deliberately: **keyboard input and focus commands** (the Web version promises "a screen
+reader can read the structure", not interaction; pointer pan/zoom has landed — see above); pinch
+gestures and inertial scrolling; font subsetting and lazy loading (the two-page split is the
+packaging answer for now, and a CJK formula on the web needs fonts `from_embedded` does not carry);
+and WebCodecs/`MediaRecorder` export (the `VideoSink` seam is the place it goes). The query command
+is *not* deferred any more — `Session::apply` answers it through the same `reply_line` the desktop
+feed uses.
 
 ### Naming
 
@@ -2244,20 +2273,36 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   stdout, which is a transport question rather than a protocol one.
 - **P3+ step 23 — pointer interaction is done**, and it is a host-layer step: no kernel, renderer or
   protocol change, and no scene has one more draw op. `Camera::panned` / `Camera::zoomed_about` are
-  pure functions in `rustim-math`; `rustim-app::input` gained `Drag`, `WheelDelta`, `zoom_factor`
-  and `clamped_zoom_factor` as winit-free state and arithmetic; `main.rs` handles `CursorMoved`,
-  `MouseInput` and `MouseWheel` and pushes `Command::Camera` through the ordinary queue. See
-  "Pointer input" for the pan/zoom algebra, why the wheel is `exp(k · delta)`, and why the clamp is
-  applied to the factor rather than the zoom. Evidence: three `rustim-math` tests (pointer-following,
-  cursor-anchor invariance to `1e-12` over a 4×4×4 grid, degenerate inputs) and seven `input.rs` tests
-  (drag state, first-move anchoring, unit-preserving scroll adapter, multiplicative zoom, malformed
-  deltas, the clamp's exact limits, and per-frame gesture accumulation), plus an **external** real-machine check with `xdotool`: a
+  pure functions in `rustim-math`; step 24 then moved the gesture *state* to
+  `rustim_math::gesture` so both hosts share it, leaving `rustim-app::input` with the winit adapter
+  only; `main.rs` handles `CursorMoved`, `MouseInput` and `MouseWheel` and pushes `Command::Camera`
+  through the ordinary queue. See "Pointer input" for the pan/zoom algebra, why the wheel is
+  `exp(k · delta)`, and why the clamp is applied to the factor rather than the zoom. Evidence: three
+  `rustim-math` tests (pointer-following, cursor-anchor invariance to `1e-12` over a 4×4×4 grid,
+  degenerate inputs) and seven `input.rs` tests (drag state, first-move anchoring, unit-preserving
+  scroll adapter, multiplicative zoom, malformed deltas, the clamp's exact limits, and per-frame
+  gesture accumulation), plus an **external** real-machine check with `xdotool`: a
   100 px drag over a 1600×900 frame makes the `query` reply's `camera.center.x` exactly
   `-0.888888…`, and one wheel event (`xdotool mousedown 4`) makes `zoom` exactly
   `1.2840254166877414 = e^0.25`, with the cursor's world point unchanged. (`xdotool click 4`
   would zoom twice — see the measurement trap under "Pointer input".) **All eight goldens
   are unchanged**, and the count moved 611 → 621. Deferred: touch/pinch, inertia, right- and
   middle-button gestures, capture outside the window, and click-to-focus.
+- **P3+ step 24 — Web pointer interaction is done**, the second consumer of step 23's arithmetic and
+  no new notion of a gesture: `rustim_math::gesture` holds `ScrollDelta`, `Drag`, `Pointer`,
+  `zoom_factor` and `clamped_zoom_factor` (nine tests, including per-frame accumulation and the
+  cursor-anchor invariant); `rustim-web::pointer` adds only the DOM translation — `deltaY`'s sign
+  flip, `deltaMode` → unit (`PAGE_LINES = 10`), and `canvas.width / rect.width` scaling — in three
+  natively-tested pure functions; `Session::set_camera` routes the result through `Command::Camera`
+  and `handle`, so the browser cannot write the view by a path a script lacks; `web.rs` registers six
+  listeners and removes them in `Drop`. Evidence: `tools/web-check.mjs` through Chrome's real input
+  pipeline — a 200 px drag gives `center.x = -2.2222222222222223` exactly, a `deltaY: -100` wheel
+  gives `zoom = 1.2214027581601699 = e^0.2` with the anchor moved `6.3e-16` — plus a natively-run
+  session test asserting that a gesture camera moves every projected bound by the drag and that a
+  `NaN` zoom is refused without changing the view. **All eight goldens are unchanged** (the browser
+  frame still matches `linux-aarch64` with max channel error 1), and the count moved 621 → 628.
+  Deferred: pinch gestures and inertial scrolling, and keyboard/focus commands (still the one
+  interaction the Web version does not promise).
 
 ## AI integration
 

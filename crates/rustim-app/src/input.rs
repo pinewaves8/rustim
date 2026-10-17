@@ -2,10 +2,10 @@
 //!
 //! Two families live here. The **keyboard** maps a key press to an [`Intent`] and
 //! tracks which object the focus is on ([`FocusState`]). The **pointer** turns a
-//! drag into a pan delta ([`Drag`]) and a scroll into a multiplicative zoom factor
-//! ([`WheelDelta`], [`zoom_factor`], [`clamped_zoom_factor`]). The wheel's factor
-//! is applied by `rustim_math::Camera::panned` / `zoomed_about`; the clamp here is
-//! the host's range, not the kernel's.
+//! drag into a pan delta and a scroll into a multiplicative zoom factor. The
+//! gesture arithmetic itself is shared with the browser host and lives in
+//! [`rustim_math::gesture`] — this module only adapts winit's event shapes onto
+//! it, so both hosts run one implementation.
 //!
 //! The engine had neither subsystem at first: `window_event` matched
 //! `CloseRequested`, `Resized` and `RedrawRequested` and dropped everything else.
@@ -32,7 +32,10 @@
 //! same rule at the call site in `main.rs`: they become `Command::Camera`, not
 //! writes to `tree.camera`.
 
-use rustim_math::Camera;
+// The gesture vocabulary is shared with the browser host (`rustim-web`), so the
+// pan/zoom algebra has one implementation rather than two that drift. What stays
+// here is the winit adapter and the host's event wiring.
+pub use rustim_math::gesture::{Drag, Pointer, ScrollDelta, clamped_zoom_factor, zoom_factor};
 use rustim_mobject::NodeId;
 use rustim_scene::SceneTree;
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta};
@@ -169,160 +172,19 @@ pub fn classify(press: &KeyPress) -> Option<Intent> {
     Some(intent)
 }
 
-/// A wheel or trackpad scroll, reduced to the one axis zoom reads.
+/// Lift the vertical amount and its unit out of a winit scroll event.
 ///
-/// winit reports two shapes of scroll and they are not convertible into one
-/// another — a wheel emits *notches* (`LineDelta`) while a trackpad emits
-/// *pixels* (`PixelDelta`), and the number of pixels in a notch is an OS
-/// setting, not a constant. So the delta keeps its unit and the conversion to a
-/// zoom factor happens in [`zoom_factor`], where each unit gets its own rate.
+/// This is the same "two-line adapter, no decisions" shape as
+/// [`KeyPress::from_event`], and it exists for the same reason: the gesture
+/// arithmetic in [`rustim_math::gesture`] can be tested without a window.
 ///
-/// The sign convention is winit's: positive `y` is a scroll away from the user,
-/// which is zoom in. Horizontal scroll is dropped rather than folded in —
-/// nothing in the engine pans sideways without a drag, and silently reusing the
-/// x axis for zoom would make a two-finger horizontal swipe change the scale.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum WheelDelta {
-    /// Wheel notches (`MouseScrollDelta::LineDelta`).
-    Lines(f64),
-    /// Platform pixels (`MouseScrollDelta::PixelDelta`).
-    Pixels(f64),
-}
-
-impl WheelDelta {
-    /// Lift the vertical amount and its unit out of a winit scroll event.
-    ///
-    /// This is the same "two-line adapter, no decisions" shape as
-    /// [`KeyPress::from_event`], and it exists for the same reason: the
-    /// arithmetic above it can be tested without a window.
-    pub fn from_winit(delta: MouseScrollDelta) -> Self {
-        match delta {
-            MouseScrollDelta::LineDelta(_, y) => Self::Lines(f64::from(y)),
-            MouseScrollDelta::PixelDelta(position) => Self::Pixels(position.y),
-        }
-    }
-
-    /// The vertical amount, in this variant's own unit.
-    pub fn y(self) -> f64 {
-        match self {
-            Self::Lines(y) | Self::Pixels(y) => y,
-        }
-    }
-}
-
-/// Zoom change per wheel notch: one notch is `e^0.25 ≈ 1.284`, about 28%.
-pub const WHEEL_ZOOM_PER_LINE: f64 = 0.25;
-
-/// Zoom change per platform pixel of trackpad scroll.
-///
-/// A trackpad sends many small events where a wheel sends one, so the rate is
-/// correspondingly smaller; 100 px of two-finger travel is `e^0.2 ≈ 1.22`.
-pub const WHEEL_ZOOM_PER_PIXEL: f64 = 0.002;
-
-/// The host's zoom range. `0.05` shows 160 world units, `64` shows an eighth.
-///
-/// The kernel accepts any finite positive zoom — a script may ask for a
-/// specific view — so this clamp belongs to the pointer, not to the camera: it
-/// is the range in which a *gesture* remains reversible. Without it a stuck
-/// wheel reaches the floating point floor and the scene is gone.
-pub const MIN_ZOOM: f64 = 0.05;
-/// See [`MIN_ZOOM`].
-pub const MAX_ZOOM: f64 = 64.0;
-
-/// A scroll's zoom **factor** — multiplicative, not additive.
-///
-/// `exp` is the whole reason: equal scroll steps multiply the zoom by equal
-/// ratios, so ten notches in and ten out return to exactly where the user
-/// started (up to rounding), and the gesture feels the same at every scale.
-/// Adding a constant would make a notch a huge jump when zoomed out and an
-/// invisible one when zoomed in.
-///
-/// A non-finite amount returns `1.0`, the identity, rather than poisoning the
-/// camera — the same posture [`Drag`] has toward malformed positions.
-pub fn zoom_factor(delta: WheelDelta) -> f64 {
-    let rate = match delta {
-        WheelDelta::Lines(_) => WHEEL_ZOOM_PER_LINE,
-        WheelDelta::Pixels(_) => WHEEL_ZOOM_PER_PIXEL,
-    };
-    let exponent = delta.y() * rate;
-    if exponent.is_finite() {
-        exponent.exp()
-    } else {
-        1.0
-    }
-}
-
-/// Re-express `factor` so that `current * factor` lands inside the host range.
-///
-/// Returns `1.0` — no zoom — for a camera or factor the multiplication cannot
-/// survive, and when the camera is already at the limit in the direction the
-/// scroll asks for. The result is a factor, not a zoom, because
-/// [`Camera::zoomed_about`](rustim_math::Camera::zoomed_about) is what applies
-/// it and it must keep the point under the cursor invariant.
-pub fn clamped_zoom_factor(current: f64, factor: f64) -> f64 {
-    if !current.is_finite() || current <= 0.0 || !factor.is_finite() || factor <= 0.0 {
-        return 1.0;
-    }
-    (current * factor).clamp(MIN_ZOOM, MAX_ZOOM) / current
-}
-
-/// The camera a new pointer delta applies to.
-///
-/// A cursor can move several times between two frames — a 1000 Hz mouse, a slow
-/// frame — and each delta has to continue from the **previous gesture's**
-/// result, not from the camera still on screen. Reading the tree every time
-/// computes every move of the frame from the same starting point and keeps only
-/// the last, so a fast drag trails the pointer. `pending` is `None` once the
-/// frame has applied the commands the gesture produced.
-pub fn gesture_base(pending: Option<Camera>, live: Camera) -> Camera {
-    pending.unwrap_or(live)
-}
-
-/// The left button's drag state, as much as panning needs.
-///
-/// `last` is **not** cleared on [`Self::press`]: the last cursor position winit
-/// reported is normally the position of the press itself, so keeping it means
-/// the first movement after the button goes down produces a correct delta
-/// instead of being swallowed as the anchor. It is cleared on release, because
-/// a drag that ends off-window must not leave a stale anchor for the next one.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Drag {
-    active: bool,
-    last: Option<(f64, f64)>,
-}
-
-impl Drag {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The button went down.
-    pub fn press(&mut self) {
-        self.active = true;
-    }
-
-    /// The button came up, or focus was lost.
-    pub fn release(&mut self) {
-        self.active = false;
-        self.last = None;
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    /// Feed one cursor position; answer the screen-space delta to pan by.
-    ///
-    /// `None` when the button is not down, or when this is the first position
-    /// the drag has seen — there is nothing to subtract from yet, and guessing
-    /// would jump the scene by an arbitrary amount.
-    pub fn moved(&mut self, at: (f64, f64)) -> Option<(f64, f64)> {
-        let previous = self.last.replace(at);
-        if !self.active {
-            return None;
-        }
-        let (x0, y0) = previous?;
-        Some((at.0 - x0, at.1 - y0))
+/// Horizontal scroll is dropped rather than folded in — nothing in the engine
+/// pans sideways without a drag, and silently reusing the x axis for zoom would
+/// make a two-finger horizontal swipe change the scale.
+pub fn wheel_delta(delta: MouseScrollDelta) -> ScrollDelta {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => ScrollDelta::Lines(f64::from(y)),
+        MouseScrollDelta::PixelDelta(position) => ScrollDelta::Pixels(position.y),
     }
 }
 
@@ -427,7 +289,6 @@ impl FocusState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustim_math::Viewport;
     use rustim_mobject::shapes::{ShapeKind, ShapeParams};
 
     /// A press of `logical`, with an unrelated physical key so that a test
@@ -703,111 +564,20 @@ mod tests {
 
     // ---- pointer input -------------------------------------------------
 
-    /// A drag reports a delta only while the button is held, and the delta is
-    /// the pointer's own screen-space travel.
-    #[test]
-    fn a_drag_pans_only_while_the_button_is_down() {
-        let mut drag = Drag::new();
-        assert_eq!(drag.moved((100.0, 100.0)), None, "not dragging yet");
-        assert_eq!(drag.moved((110.0, 105.0)), None);
-
-        drag.press();
-        // The press did not clear the anchor, so the first move after it is
-        // measured from where the pointer already was.
-        assert_eq!(drag.moved((120.0, 100.0)), Some((10.0, -5.0)));
-        assert!(drag.is_active());
-
-        drag.release();
-        assert_eq!(drag.moved((200.0, 200.0)), None);
-        assert!(!drag.is_active());
-    }
-
-    /// A drag that goes down before winit has reported a position has no
-    /// anchor; the first movement establishes one instead of panning by the
-    /// distance from the origin.
-    #[test]
-    fn a_drag_with_no_previous_position_does_not_jump() {
-        let mut drag = Drag::new();
-        drag.press();
-        assert_eq!(drag.moved((640.0, 360.0)), None);
-        assert_eq!(drag.moved((641.0, 361.0)), Some((1.0, 1.0)));
-    }
-
-    /// A gesture in the same frame as an earlier one continues from it, so a
-    /// burst of cursor positions is not collapsed to the last delta.
-    #[test]
-    fn a_gesture_continues_from_the_previous_one_within_a_frame() {
-        let live = Camera::default();
-        let pending = Camera::new((-1.0, 0.5), 2.0);
-        assert_eq!(gesture_base(None, live), live);
-        assert_eq!(gesture_base(Some(pending), live), pending);
-        // Two 90 px deltas applied to the pending camera add up — at zoom 2 the
-        // scale is 180 px/unit, so each is half a world unit, not the whole.
-        let vp = Viewport::default();
-        let step = pending.panned(&vp, (90.0, 0.0));
-        let twice = gesture_base(Some(step), live).panned(&vp, (90.0, 0.0));
-        assert_eq!(twice.center, (-2.0, 0.5));
-    }
-
-    /// Wheel and trackpad deltas keep their unit through the adapter.
+    /// Winit's two scroll shapes keep their unit through the adapter; the
+    /// arithmetic on them lives in `rustim_math::gesture` and is tested there.
     #[test]
     fn winit_scrolls_keep_their_unit() {
         use winit::dpi::PhysicalPosition;
         assert_eq!(
-            WheelDelta::from_winit(MouseScrollDelta::LineDelta(0.0, 2.0)),
-            WheelDelta::Lines(2.0)
+            wheel_delta(MouseScrollDelta::LineDelta(0.0, 2.0)),
+            ScrollDelta::Lines(2.0)
         );
         assert_eq!(
-            WheelDelta::from_winit(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            wheel_delta(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
                 3.0, -7.5
             ))),
-            WheelDelta::Pixels(-7.5)
+            ScrollDelta::Pixels(-7.5)
         );
-    }
-
-    /// Zoom is multiplicative: two notches are one notch squared, in either
-    /// unit, and scrolling back out cancels the scroll in.
-    #[test]
-    fn wheel_zoom_is_multiplicative() {
-        let one = zoom_factor(WheelDelta::Lines(1.0));
-        let two = zoom_factor(WheelDelta::Lines(2.0));
-        assert!((two - one * one).abs() < 1e-12);
-        assert!(one > 1.0, "a notch away from the user zooms in");
-
-        let pixel = zoom_factor(WheelDelta::Pixels(125.0));
-        assert!(pixel > 1.0);
-        assert!(zoom_factor(WheelDelta::Pixels(-125.0)) < 1.0);
-
-        // In and out by the same amount returns to 1.0 to within rounding.
-        let round_trip = zoom_factor(WheelDelta::Lines(3.0)) * zoom_factor(WheelDelta::Lines(-3.0));
-        assert!((round_trip - 1.0).abs() < 1e-15, "{round_trip}");
-    }
-
-    #[test]
-    fn a_malformed_scroll_is_the_identity() {
-        assert_eq!(zoom_factor(WheelDelta::Lines(f64::NAN)), 1.0);
-        assert_eq!(zoom_factor(WheelDelta::Pixels(f64::INFINITY)), 1.0);
-    }
-
-    /// The host clamp is reached from both directions and never overshoots.
-    #[test]
-    fn the_pointer_zoom_is_clamped_to_its_range() {
-        assert_eq!(clamped_zoom_factor(1.0, 2.0), 2.0);
-        // At the top, zooming in is a no-op...
-        let at_top = clamped_zoom_factor(MAX_ZOOM, 2.0);
-        assert_eq!(at_top, 1.0);
-        assert_eq!(MAX_ZOOM * at_top, MAX_ZOOM);
-        // ...and from just below it, the factor is cut to land exactly on the
-        // limit rather than beyond it.
-        let near = clamped_zoom_factor(MAX_ZOOM / 2.0, 4.0);
-        assert_eq!(near, 2.0);
-        assert_eq!(clamped_zoom_factor(MIN_ZOOM, 0.5), 1.0);
-        let near_bottom = clamped_zoom_factor(MIN_ZOOM * 2.0, 0.25);
-        assert_eq!(near_bottom, 0.5);
-        // Nonsense in either argument is "do not zoom".
-        assert_eq!(clamped_zoom_factor(0.0, 2.0), 1.0);
-        assert_eq!(clamped_zoom_factor(-1.0, 2.0), 1.0);
-        assert_eq!(clamped_zoom_factor(1.0, f64::NAN), 1.0);
-        assert_eq!(clamped_zoom_factor(1.0, 0.0), 1.0);
     }
 }

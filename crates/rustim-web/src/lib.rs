@@ -24,6 +24,7 @@
 //! everywhere else.
 
 pub mod aria;
+pub mod pointer;
 pub mod session;
 
 #[cfg(target_arch = "wasm32")]

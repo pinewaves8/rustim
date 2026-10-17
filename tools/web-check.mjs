@@ -10,7 +10,11 @@
 //     measured descriptions — the overlay is `opacity: 0`, and this proves
 //     Chrome did not prune it;
 //  5. the command bridge answers an `add` with the id it created and refuses
-//     broken JSON.
+//     broken JSON;
+//  6. a pointer drag and a wheel event, dispatched through Chrome's own input
+//     pipeline, move the camera the way the desktop's shared gesture code does:
+//     200 CSS px of drag is 200 canvas px of pan, and a -100 px wheel is a
+//     zoom factor of `e^0.2` about the point under the cursor.
 //
 // Measured on 2026-10-17 (Chrome 151, linux-aarch64): the canvas agrees with
 // the binary's PNG to a maximum channel error of **1** on 16 pixels (0.002%).
@@ -305,6 +309,87 @@ try {
     exitCode = 1;
   }
   console.log(`apply  created ${created}, ${figuresAfter} figures in the overlay, refusal ok`);
+
+  // Pointer gestures, through `Input.dispatchMouseEvent` rather than
+  // `dispatchEvent`: Chrome builds the real pointer/wheel events from this, so
+  // the shell's own listeners are exercised rather than a synthetic event that
+  // happens to have the fields we chose.
+  const box = await cdp.evaluate(`(() => {
+    const canvas = document.getElementById("canvas");
+    const rect = canvas.getBoundingClientRect();
+    return { x: rect.x, y: rect.y, w: rect.width, h: rect.height,
+             cw: canvas.width, ch: canvas.height };
+  })()`);
+  // A CSS pixel is `canvas.width / rect.width` canvas pixels. The page caps the
+  // canvas at `max-width: 100%`, so this is not always 1.
+  const scale = box.cw / box.w;
+  const start = { x: Math.round(box.x + box.w * 0.3), y: Math.round(box.y + box.h * 0.5) };
+  const end = { x: start.x + 200, y: start.y };
+  const cameraBefore = await cdp.evaluate('[...window.rustim.camera()]');
+
+  const mouse = (type, x, y, extra = {}) =>
+    cdp.send('Input.dispatchMouseEvent', { type, x, y, ...extra });
+
+  // Hover, press, one move, release — the sequence a real drag produces. The
+  // hover matters: it establishes the anchor before the button goes down.
+  await mouse('mouseMoved', start.x, start.y);
+  await mouse('mousePressed', start.x, start.y, { button: 'left', buttons: 1, clickCount: 1 });
+  await mouse('mouseMoved', end.x, end.y, { button: 'left', buttons: 1 });
+  await mouse('mouseReleased', end.x, end.y, { button: 'left', buttons: 0, clickCount: 1 });
+  await sleep(100);
+  const dragged = await cdp.evaluate('[...window.rustim.camera()]');
+
+  const dragPx = 200 * scale;
+  const perUnit = (box.ch / 8) * cameraBefore[2];
+  const expectedCenterX = cameraBefore[0] - dragPx / perUnit;
+  const dragOk =
+    Math.abs(dragged[0] - expectedCenterX) < 1e-9 &&
+    dragged[1] === cameraBefore[1] &&
+    dragged[2] === cameraBefore[2];
+  if (!dragOk) {
+    console.error(
+      `web-check: a ${dragPx} px drag moved the centre to ${dragged[0]}, expected ${expectedCenterX}`,
+    );
+    exitCode = 1;
+  } else {
+    console.log(
+      `gesture  drag ${dragPx} canvas px  ->  centre.x ${dragged[0]} (expected ${expectedCenterX})`,
+    );
+  }
+
+  // A -100 px DOM wheel is 100 px "away from the user": `exp(100 * 0.002)`.
+  await mouse('mouseWheel', end.x, end.y, { deltaX: 0, deltaY: -100, button: 'none' });
+  await sleep(100);
+  const zoomed = await cdp.evaluate('[...window.rustim.camera()]');
+
+  const expectedZoom = dragged[2] * Math.exp(0.2);
+  const zoomOk = Math.abs(zoomed[2] - expectedZoom) < 1e-9;
+  // The world point under the cursor must not move. Recomputed independently
+  // from the projection's own definition, not from the engine's helper.
+  const px = (end.x - box.x) * scale;
+  const py = (end.y - box.y) * scale;
+  const under = (camera) => {
+    const s = (box.ch / 8) * camera[2];
+    return [(px - box.cw / 2) / s + camera[0], camera[1] + (box.ch / 2 - py) / s];
+  };
+  const anchorBefore = under(dragged);
+  const anchorAfter = under(zoomed);
+  const anchorMoved = Math.hypot(
+    anchorAfter[0] - anchorBefore[0],
+    anchorAfter[1] - anchorBefore[1],
+  );
+  if (!zoomOk || anchorMoved > 1e-9) {
+    console.error(
+      `web-check: the wheel zoomed to ${zoomed[2]}, expected ${expectedZoom}; ` +
+        `the anchor moved ${anchorMoved}`,
+    );
+    exitCode = 1;
+  } else {
+    console.log(
+      `gesture  wheel -100 px  ->  zoom ${zoomed[2]} (expected ${expectedZoom}); ` +
+        `anchor moved ${anchorMoved}`,
+    );
+  }
 
   // The second artifact. Typst is linked only into `pkg-formula`, and this is
   // the only place its wasm build is actually *run* rather than compiled.

@@ -40,15 +40,23 @@ wasm-bindgen = "=0.2.100"
 js-sys = "=0.3.77"
 web-sys = { version = "=0.3.77", features = [
     "CanvasRenderingContext2d",
+    # Pointer gestures: the canvas is an `EventTarget`, and the events arrive as
+    # DOM `PointerEvent` / `WheelEvent` values whose fields the shell reads.
+    "DomRect",
     "Document",
     "Element",
+    "Event",
+    "EventTarget",
     "HtmlCanvasElement",
     "HtmlElement",
     "ImageData",
+    "MouseEvent",
     # `append_child` / `set_text_content`: the DOM/ARIA overlay is built from
     # these, not from an HTML string.
     "Node",
     "Performance",
+    "PointerEvent",
+    "WheelEvent",
     "Window",
 ] }
 
