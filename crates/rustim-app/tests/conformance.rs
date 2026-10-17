@@ -11,7 +11,8 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (11 shapes, 11 animations, 10 properties, 45 rates);
+//!    the build actually has (18 actions, 11 shapes, 11 animations, 10
+//!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
 //!    against the parser rather than trusted;
@@ -21,6 +22,9 @@
 //!    feed continues afterwards (exit code still 0);
 //! 6. **two independent clients replaying one log produce the same semantic
 //!    tree** — the switch-clients property, in the transport v1 has.
+//! 7. a command list is one command: `batch` answers with its net diff,
+//!    `validate` with an empty one, and a refusal in the middle names the
+//!    member without stopping the feed.
 //!
 //! Each test owns a distinct PNG path: two tests must never render to the same
 //! artifact path (the golden suite learned this the hard way — see `CLAUDE.md`),
@@ -151,7 +155,12 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.profiles, ["primitive".to_owned()]);
+    assert_eq!(caps.actions.len(), 18, "{:?}", caps.actions);
+    assert_eq!(
+        caps.profiles,
+        ["primitive".to_owned(), "teaching".to_owned()],
+        "`teaching` is advertised because the build accepts command lists"
+    );
     assert_eq!(caps.limits.max_ticks, 256);
 
     finish(client, &png);
@@ -228,6 +237,74 @@ fn every_advertised_word_is_accepted_by_the_binary() {
         expect_diff(&mut client, &line);
         expect_diff(&mut client, r#"{"action":"stop"}"#);
     }
+
+    finish(client, &png);
+}
+
+/// A command list is answered like any other command: one reply, the **net**
+/// change for a `batch`, an empty diff for a `validate` — and a refusal in the
+/// middle stops at that member and says which one, while the feed continues.
+#[test]
+fn batch_and_validate_answer_through_the_wire() {
+    let (mut client, png) = client("batch");
+
+    // A dry run answers "nothing changed" and really changes nothing: the
+    // query afterwards cannot see the circle it checked. The second member
+    // names the first member's label, which is the property that makes a dry
+    // run worth sending an interdependent plan to.
+    let dry = expect_diff(
+        &mut client,
+        r#"{"action":"validate","commands":[{"action":"add","type":"circle","params":{"label":"预演"}},{"action":"set","target":"预演","property":{"name":"opacity","value":0.5}}]}"#,
+    );
+    assert!(dry.is_empty(), "a dry run changes nothing: {dry:?}");
+    let reply = client
+        .send_raw(r#"{"action":"query","target":"预演"}"#)
+        .expect("a refusal is a reply");
+    assert!(reply.error.is_some(), "the dry run created nothing");
+
+    // The real list reports the tree *before* against *after*: a node created
+    // and then written is one `created` and no `modified`, and a node created
+    // and removed inside the list is in neither half.
+    let diff = expect_diff(
+        &mut client,
+        r#"{"action":"batch","commands":[{"action":"add","type":"circle","params":{"radius":1.0,"label":"圆"}},{"action":"set","target":"圆","property":{"name":"opacity","value":0.5}},{"action":"add","type":"square","params":{"label":"临时"}},{"action":"remove","target":"临时"}]}"#,
+    );
+    assert_eq!(diff.created.len(), 1, "{diff:?}");
+    assert!(
+        diff.modified.is_empty() && diff.removed.is_empty(),
+        "the net change is one creation: {diff:?}"
+    );
+
+    // A refusal names the member's position, and the prefix stays applied —
+    // the documented half-application, not a rollback.
+    let reply = client
+        .send_raw(
+            r#"{"action":"batch","commands":[{"action":"add","type":"square","params":{"label":"前缀"}},{"action":"remove","target":"没有这个"}]}"#,
+        )
+        .expect("a refusal is a reply");
+    match reply.error.expect("the second member is refused") {
+        rustim_client::CommandError::InBatch { index, cause } => {
+            assert_eq!(index, 1);
+            assert!(
+                matches!(*cause, rustim_client::CommandError::NoSuchLabel { .. }),
+                "{cause:?}"
+            );
+        }
+        other => panic!("the refusal has to name the member: {other:?}"),
+    }
+    let prefix = expect_diff(
+        &mut client,
+        r#"{"action":"set","target":"前缀","property":{"name":"opacity","value":0.25}}"#,
+    );
+    assert_eq!(prefix.modified.len(), 1, "the prefix was applied");
+
+    // A member whose answer is not a diff is refused as a *shape* error, at
+    // its own position, before anything runs.
+    let reply = client
+        .send_raw(r#"{"action":"batch","commands":[{"action":"query"}]}"#)
+        .expect("a refusal is a reply");
+    let error = reply.error.expect("a query cannot live in a list");
+    assert!(format!("{error}").contains("commands[0]"), "{error}");
 
     finish(client, &png);
 }

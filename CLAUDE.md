@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **722 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **734 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -2538,6 +2538,27 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   snapshotting the animation timeline itself, unwinding narration already spoken, and undoing across
   a `reset` (there is nothing left to undo into). See "AI integration" for the semantics a driver
   sees.
+- **Phase 1's fifth slice — the list commands `batch` / `validate` and the `teaching` profile — is
+  done**, and it is the step that turns "a scene build" from a round trip per step into one plan per
+  command. Both are `handle`-intercepted because a list may contain commands only the context can
+  run (`play`, `camera`, `undo`), and the reply machinery is shared with everything else: `batch`
+  returns the **net** diff (`diff_trees`, the function `undo` now uses too — one notion of "what
+  changed", not a second copy), `validate` returns an empty one. The design's load-bearing choices:
+  **not a transaction** — a refusal stops at `InBatch { index, cause }` with the prefix applied, so a
+  host wanting atomicity takes a checkpoint; **shape checked first** — empty lists and
+  `hello`/`query`/`batch`/`validate` members are `OutOfRange` under `commands`/`commands[i]` before
+  anything runs; and **`validate` is a real run on scratch state** — same `handle`, same order, tree /
+  camera / clock / pause / tempo / motion / checkpoint stack copied, the host's `Typesetter` moved in
+  and back, scheduler and narration track deliberately not copied. `capabilities` grew `actions` (18
+  verbs, from `Command::action_name`, asserted against the round-trip fixtures' action set) and
+  `profiles: ["primitive", "teaching"]`, advisory beside the exact list. Evidence: nine
+  `playback_control_tests` in `context.rs` (net diff, stop-at-index with the prefix applied, atomic
+  shape refusals, a queued beat inside a batch, the dry run's identical refusal, label
+  interdependence, a checked-but-unqueued `play`, the copied checkpoint stack, and the typesetter
+  moved in and back), one conformance arm over `rustim-client`, two `--script` tests (a batch renders
+  **pixel-identical** to its members written out, and a refused batch names its member while the
+  feed continues), and the fixture-set assertion in the round-trip test. **All eight goldens are
+  unchanged** (a list draws nothing on its own), and the count moved 722 → 734.
 
 ## AI integration
 
@@ -2561,12 +2582,16 @@ the AI surface" below.
 
 **The handshake is `{"action":"hello","protocol":1}`**, and it is the recommended first line of every
 session. It does not touch the tree; it answers with a `capabilities` document — the protocol version,
-the engine's version string, and the exact shape / animation / property / rate names this build
-accepts, plus its limits. The lists are **derived from serde over the same enums the parser uses**,
-so an advertised name is accepted by construction, and a conformance test feeds every advertised word
-back through the binary (see `crates/rustim-app/tests/conformance.rs`). `PROPERTY_NAMES`,
-`AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` are what supply the lists, and a new variant
-that misses its `ALL`/name table fails a count assertion rather than silently not being advertised.
+the engine's version string, and the exact action / shape / animation / property / rate names this
+build accepts, plus its limits and two advisory profiles. The lists are **derived from serde over the
+same enums the parser uses** — `actions` from `Command::action_name` (18 verbs), `PROPERTY_NAMES`,
+`AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` for the nouns — so an advertised name is
+accepted by construction, and a conformance test feeds every advertised word back through the binary
+(see `crates/rustim-app/tests/conformance.rs`). A new variant that misses its `ALL`/name table fails a
+count assertion rather than silently not being advertised, and the round-trip fixtures assert their
+action set *is* `ACTIONS`. `profiles` is `["primitive", "teaching"]`: `teaching` means the build
+accepts command lists (`batch`/`validate`), **not** that the director's templates exist. It is
+advisory; `actions` is the exact answer a driver should test.
 A foreign version is refused in `SceneContext::handle` (not at parse time, so both numbers can be
 named) as `OutOfRange { property: "protocol", detail: "client speaks 2; this engine speaks 1" }`;
 the refusal round-trips as JSON like any other command. A driver that skips the handshake still
@@ -2631,11 +2656,12 @@ tree; `reset` returns to playing at 1×.
 below; `checkpoint` is a mark and answers with an empty diff, `undo` is the one host-answered
 command whose diff names nodes.
 
-`stop`, `pause`, `resume`, `seek`, `tempo`, `checkpoint`, `undo`, `camera`, `motion` and `narrate`
-are the commands intercepted by `SceneContext::handle`
-rather than by the pure `command::apply`; all but `undo` return an **empty** `StateDiff` for `play`'s
-reason — the timeline, the view, the motion policy and a spoken line are not nodes, and `undo`'s
-non-empty diff is the honest exception because restoring a tree *is* a tree change. `camera` writes the view now or queues a
+`stop`, `pause`, `resume`, `seek`, `tempo`, `checkpoint`, `undo`, `batch`, `validate`, `camera`,
+`motion` and `narrate` are the commands intercepted by `SceneContext::handle`
+rather than by the pure `command::apply`; all but `undo` and `batch` return an **empty** `StateDiff`
+for `play`'s reason — the timeline, the view, the motion policy and a spoken line are not nodes, and
+the two non-empty diffs are the honest exceptions because restoring a tree or running a list of
+mutations *is* a tree change. `camera` writes the view now or queues a
 `CameraMove`; `motion` (`{"action":"motion","mode":"full"|"reduced"}`) writes the policy the **next
 beat started** will be given, without touching the beat already running; `narrate` queues a line on
 the narration track, due `at` seconds after it arrived (see "Narration, captions and
@@ -2687,6 +2713,23 @@ add → undo is pixel-identical to never adding, with the retained circle as the
 a refusal that does not stop the feed), and one conformance arm over `rustim-client`. **All eight
 goldens are unchanged** — a snapshot draws nothing — and the count moved 707 → 722.
 
+**`batch` / `validate` are the list commands**, and they compress a scene build from a round trip per
+step to one command per plan. `batch` runs its members in order through the same `handle` — so a
+later member can address a label an earlier one created — and answers with the **net** tree change
+computed from before and after (`diff_trees`, shared with `undo`): a node created and then written is
+one `created` and no `modified`, and a node created and removed inside the list is in neither half.
+It is **not a transaction**: the first refusal stops the list with `CommandError::InBatch { index,
+cause }`, the prefix stays applied and nothing after the index ran, which is why a host wanting
+all-or-nothing takes a checkpoint first. The list's *shape* is checked before anything runs — empty,
+or a member that is `hello`/`query`/`batch`/`validate` — so a malformed list is atomic and refused as
+`OutOfRange` under `commands`/`commands[i]`, never as `InBatch`. `validate` is the dry run: the same
+members through the same `handle` on a scratch context (tree, camera, clock, pause, tempo, motion and
+the checkpoint stack copied; the host's `Typesetter` moved in for the duration and back, so `text` /
+`formula` validate against the provider that would really build them), answering an empty diff on
+success and the identical error on failure. The scheduler and narration track are deliberately not
+copied — a queued animation captured its start and is not replayable data, and a dry run must not
+speak.
+
 `CommandOutcome` is the in-memory vocabulary that keeps the three answers apart — `Applied(StateDiff)`,
 `Queried(SemanticTree)` and `Greeted(Capabilities)` — and `reply_line` is the only thing that turns it
 into JSON, so the desktop feed and the browser bridge cannot answer one command two different ways.
@@ -2734,8 +2777,10 @@ the feed continues, that blank lines are skipped and counted, and that two clien
 one tree. A planned WebSocket/JSON-RPC transport (`rustim-daemon`, for the Jarvis UI) and an MCP
 tool surface (`rustim-mcp`) are **not implemented** and must map onto the same `SceneContext::handle`
 — a second transport is a wrapper around this protocol, never a second dialect of it.
-Checkpoint/undo/seek, the teaching-tier tools (`rustim-director`) and the two tool tiers are roadmap
-items in `贾维斯集成方案.md`; nothing in this repository currently claims them.
+The teaching-tier tools (`rustim-director`), the two tool tiers, events and the daemon/MCP
+transports are roadmap items in `贾维斯集成方案.md`; nothing in this repository currently claims
+them. (Checkpoint/undo/seek, `pause`/`resume`/`tempo` and the list commands **are** implemented —
+see "AI integration".)
 
 ### The feed: a session is a file of commands
 

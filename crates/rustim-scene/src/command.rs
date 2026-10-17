@@ -218,6 +218,56 @@ pub enum Command {
     /// it refuses with [`CommandError::NoCheckpoint`], a state error rather than
     /// a malformed payload.
     Undo,
+    /// Apply several commands in one round trip, in order.
+    ///
+    /// The reply is one `diff` — the **net** change of the whole list, computed
+    /// by comparing the tree before and after rather than by concatenating the
+    /// members' diffs. That distinction is the honest one for a host that
+    /// redraws from the reply: a node added and then removed in the same batch
+    /// appears in neither list, and one added and then moved appears in
+    /// `created` and not in `modified`, because that is what the tree looks
+    /// like afterwards. `created` follows the final draw order — the same order
+    /// `query` reports — so a model that builds five objects in one turn learns
+    /// their five ids from one reply.
+    ///
+    /// **It is not a transaction.** Members run in order through
+    /// [`crate::SceneContext::handle`], and the first refusal stops the list:
+    /// the answer is [`CommandError::InBatch`] naming the index, and every
+    /// member *before* it has been applied. That half-application is a
+    /// documented promise rather than a silent one, and the all-or-nothing
+    /// spellings are already commands — `checkpoint` before and `undo` after,
+    /// or a [`Command::Validate`] of the same list first.
+    ///
+    /// Only primitive commands may be members. `hello` (which answers with
+    /// capabilities), `query` (a tree), and `batch` / `validate` themselves (a
+    /// reply cannot carry a list of replies) are refused **before anything
+    /// runs**, so a structurally invalid batch is atomic: nothing is applied.
+    /// An empty `commands` is refused under that field, because "do nothing" is
+    /// spelled by sending nothing.
+    Batch { commands: Vec<Command> },
+    /// Dry-run a command list: apply it to a copy, report only what would fail.
+    ///
+    /// The same `commands` and the same shape rules as [`Command::Batch`], run
+    /// through the same [`crate::SceneContext::handle`] — but against a scratch
+    /// state that is thrown away, so the live tree, camera, clock, checkpoint
+    /// stack, pause, tempo and motion mode are untouched whatever the answer.
+    /// Success is the **empty diff**: a validation changes nothing, and the
+    /// absence of an error is the answer. Failure is [`CommandError::InBatch`]
+    /// with the same index and the same refusal the real batch would produce,
+    /// which is the half a model actually needs — the exact member and the
+    /// exact field.
+    ///
+    /// Members see each other, and that is the point: a label created by member
+    /// 0 resolves for member 1, and a node member 0 removed is gone for member
+    /// 2, so a whole interdependent plan can be checked before any of it is
+    /// sent for real. Two pieces of live state are deliberately not copied —
+    /// the scheduler and the narration track — because queued animations are
+    /// values that captured their start state, not replayable data. A
+    /// `validate` of `play` therefore checks the animation's spec and target,
+    /// not how the beat will look; a `validate` of `seek` checks the bounds
+    /// against the copied clock, and its empty scratch queue is why the dry run
+    /// costs no rendering.
+    Validate { commands: Vec<Command> },
     /// Point the camera, now or over a beat.
     ///
     /// All four fields are optional and omitted when absent, like every other
@@ -291,6 +341,70 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<Target>,
     },
+}
+
+/// Every action name the wire accepts, alphabetically.
+///
+/// This is the `actions` list [`Capabilities`] advertises, and the reason a
+/// client can ask "does this build have `batch`?" instead of inferring it from
+/// the protocol number or from a document. Kept beside [`Command::action_name`]
+/// on purpose: that method is an exhaustive `match`, so a new variant is a
+/// compile error there, and
+/// `commands_round_trip_through_json` asserts the fixtures reach exactly this
+/// set — an action that was added to the enum but not to this list, or the
+/// reverse, fails the suite rather than quietly shipping an incomplete
+/// handshake.
+pub const ACTIONS: &[&str] = &[
+    "add",
+    "batch",
+    "camera",
+    "checkpoint",
+    "hello",
+    "motion",
+    "narrate",
+    "pause",
+    "play",
+    "query",
+    "remove",
+    "resume",
+    "seek",
+    "set",
+    "stop",
+    "tempo",
+    "undo",
+    "validate",
+];
+
+impl Command {
+    /// The wire's name for this command's action.
+    ///
+    /// The tag serde writes for the variant, made available without
+    /// serialising an instance — a capability list has no commands to
+    /// serialise. The `match` is exhaustive by construction, which is the
+    /// guard: a new variant cannot be added without naming it here, and the
+    /// round-trip fixtures then check the name against what the parser accepts.
+    pub fn action_name(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "hello",
+            Self::Add { .. } => "add",
+            Self::Set { .. } => "set",
+            Self::Remove { .. } => "remove",
+            Self::Play { .. } => "play",
+            Self::Stop => "stop",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Seek { .. } => "seek",
+            Self::Tempo { .. } => "tempo",
+            Self::Checkpoint => "checkpoint",
+            Self::Undo => "undo",
+            Self::Batch { .. } => "batch",
+            Self::Validate { .. } => "validate",
+            Self::Camera { .. } => "camera",
+            Self::Narrate { .. } => "narrate",
+            Self::Motion { .. } => "motion",
+            Self::Query { .. } => "query",
+        }
+    }
 }
 
 /// How a command names a node: by its opaque id, or by the human-readable label.
@@ -669,16 +783,32 @@ pub struct Limits {
 /// What this build of the engine can do, in the protocol's own vocabulary.
 ///
 /// The answer to a [`Command::Hello`], and the reason a client never has to
-/// guess what a build supports: `shapes`, `animations`, `properties` and
-/// `rates` are the sets the parser in this crate actually accepts, derived from
-/// the same serde definitions, not a hand-copied excerpt of the documentation.
-/// A client is expected to check this rather than assume, which is what makes
-/// a build that drops or adds a vocabulary item a compatible change.
+/// guess what a build supports: `actions`, `shapes`, `animations`, `properties`
+/// and `rates` are the sets the parser in this crate actually accepts, derived
+/// from the same serde definitions, not a hand-copied excerpt of the
+/// documentation. A client is expected to check this rather than assume, which
+/// is what makes a build that drops or adds a vocabulary item a compatible
+/// change.
 ///
 /// `engine` is an opaque string for humans and logs — a client must not parse
-/// it to decide what it can send. `profiles` names the tool tiers above the
-/// primitive layer; only `"primitive"` exists today (the teaching profile
-/// arrives with `rustim-director`).
+/// it to decide what it can send.
+///
+/// `actions` is the verb list: the four noun lists say what can be *named*, and
+/// this one says what can be *asked*. It is the field that makes
+/// [`Command::Batch`] and [`Command::Validate`] discoverable — without it a
+/// client would have to infer their presence from the protocol number, which is
+/// exactly the guess the handshake exists to remove.
+///
+/// `profiles` names the tool tiers, and is **advisory**: a client checks
+/// `actions` for a specific verb and reads a profile as a floor, never as a
+/// promise about a particular name. Two exist:
+///
+/// * `"primitive"` — the §3 command surface: the vocabulary in this struct.
+/// * `"teaching"` — the batch layer, i.e. `batch` and `validate` are accepted,
+///   which is the tier a model that wants fewer round trips and cheap trial and
+///   error asks for. `rustim-director`'s tools (`compose`, `explain.*`, …) will
+///   widen this tier later; the meaning only grows, and a client that needs one
+///   of those checks `actions`, where it is absent today.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     /// The protocol version this reply describes — the same
@@ -687,6 +817,8 @@ pub struct Capabilities {
     /// Free-form build identity, e.g. `rustim/0.0.0`. Never parsed for
     /// capability decisions.
     pub engine: String,
+    /// The wire's action names, from [`ACTIONS`].
+    pub actions: Vec<String>,
     pub shapes: Vec<String>,
     pub animations: Vec<String>,
     pub properties: Vec<String>,
@@ -727,11 +859,15 @@ impl Capabilities {
         Self {
             protocol: PROTOCOL_VERSION,
             engine: format!("rustim/{}", env!("CARGO_PKG_VERSION")),
+            actions: ACTIONS.iter().map(|name| (*name).to_owned()).collect(),
             shapes: wire_names(&shapes),
             animations: wire_names(&AnimationKind::ALL),
             properties: PROPERTY_NAMES.iter().map(|n| (*n).to_owned()).collect(),
             rates: wire_names(&Rate::ALL),
-            profiles: vec!["primitive".to_owned()],
+            // `teaching` is the batch layer: this build accepts `batch` and
+            // `validate`, so it can offer the round-trip-reducing tier. The
+            // direct check is `actions`; the profile is the coarse answer.
+            profiles: vec!["primitive".to_owned(), "teaching".to_owned()],
             limits: Limits {
                 max_ticks: MAX_TICKS,
             },
@@ -828,6 +964,24 @@ pub enum CommandError {
     /// [`CommandError::NoSuchNode`]: a host reading a log has to tell a model's
     /// mistake from the session's history.
     NoCheckpoint,
+    /// A command list was refused at one of its members, with that member's
+    /// position.
+    ///
+    /// The wrapper exists so a refusal from inside a [`Command::Batch`] or a
+    /// [`Command::Validate`] is *locatable*: the cause says what was wrong, and
+    /// this says where. `index` is **0-based**, the position in the JSON array
+    /// the client wrote — matching the client's own counting is the only way the
+    /// number is actionable to a model that generated the list.
+    ///
+    /// It is the one wrapped error, and deliberately so: everything else is
+    /// reported at the top level because there is only ever one command in
+    /// flight. A refusal of the list's *shape* — an empty list, a nested
+    /// `batch`, a `query` member — is raised before any member runs and is
+    /// **not** wrapped: no member's execution failed, and nothing was applied.
+    InBatch {
+        index: usize,
+        cause: Box<CommandError>,
+    },
     /// The request was not a command at all — whoever read the wire could not
     /// turn it into one, and [`parse_command`] says why.
     ///
@@ -869,6 +1023,11 @@ impl std::fmt::Display for CommandError {
             }
             Self::Typeset { detail } => write!(f, "typesetting failed: {detail}"),
             Self::NoCheckpoint => write!(f, "no checkpoint to restore"),
+            // Position first, for the same reason a compiler prints the line
+            // before the message: the number is what the caller edits.
+            Self::InBatch { index, cause } => {
+                write!(f, "command {index} in the list was refused: {cause}")
+            }
             Self::Unparseable { detail } => write!(f, "not a command: {detail}"),
         }
     }
@@ -1179,6 +1338,14 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // ingredient: projecting a `SemanticTree` needs the viewport, and
             // that lives on the context, not in the tree. Also, a query would
             // not fit this function's return type — it has no diff to give.
+        }
+        Command::Batch { .. } | Command::Validate { .. } => {
+            // Answered by `SceneContext::handle` because a list may contain
+            // commands only the context can run (`play`, `camera`, …), so
+            // `apply` cannot recurse into one and stay faithful. The arm keeps
+            // it total: a direct caller replays the whole log without a panic,
+            // and the empty diff is the same no-op the other host-answered
+            // commands give it.
         }
     }
     Ok(diff)
@@ -1939,6 +2106,15 @@ mod tests {
             // The session pair: both unit variants, so both are the bare tag.
             r#"{"action":"checkpoint"}"#.to_owned(),
             r#"{"action":"undo"}"#.to_owned(),
+            // A command list is a command: the members round-trip inside it by
+            // the same rules, and the list itself gains no field it did not
+            // receive. A label member is deliberate — resolution happens per
+            // member, against the tree as the earlier members left it.
+            r#"{"action":"batch","commands":[{"action":"add","type":"circle","params":{"radius":2.0,"label":"圆"}},{"action":"set","target":"圆","property":{"name":"opacity","value":0.5}}]}"#
+                .to_owned(),
+            format!(
+                r#"{{"action":"validate","commands":[{{"action":"remove","target":{id}}},{{"action":"play","animation":{{"target":{id},"type":"fade_in"}}}}]}}"#
+            ),
             // The handshake, in both spellings. An absent `protocol` is a client
             // that does not claim a version, and it must not come back as a
             // `null`; a *mismatched* version still parses — the refusal belongs
@@ -1958,11 +2134,23 @@ mod tests {
             r#"{"action":"camera","focus":"方块"}"#.to_owned(),
             r#"{"action":"query","target":"方块"}"#.to_owned(),
         ];
+        let mut seen = std::collections::BTreeSet::new();
         for json in cases {
             let cmd: Command =
                 serde_json::from_str(&json).unwrap_or_else(|e| panic!("parsing {json}: {e}"));
             assert_eq!(serde_json::to_string(&cmd).unwrap(), json, "{json}");
+            seen.insert(cmd.action_name());
         }
+        // The fixtures above are the vocabulary's proof of life. Every action
+        // `Capabilities` advertises must have a fixture here, and every action
+        // a fixture reaches must be advertised — an action added to the enum
+        // (which `action_name`'s exhaustive match forces into existence) but
+        // not to `ACTIONS` would otherwise ship a handshake with a hole in it.
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            ACTIONS.to_vec(),
+            "the round-trip fixtures and the advertised actions have to be the same set"
+        );
     }
 
     /// The commands `SceneContext::handle` answers are **no-ops** in `apply`, not
@@ -1989,6 +2177,12 @@ mod tests {
             Command::Tempo { factor: 2.0 },
             Command::Checkpoint,
             Command::Undo,
+            Command::Batch {
+                commands: vec![Command::Pause],
+            },
+            Command::Validate {
+                commands: vec![Command::Pause],
+            },
             Command::Motion {
                 mode: MotionMode::Reduced,
             },
@@ -2075,8 +2269,17 @@ mod tests {
         let caps = Capabilities::current();
         assert_eq!(caps.protocol, PROTOCOL_VERSION);
         assert!(caps.engine.starts_with("rustim/"));
-        assert_eq!(caps.profiles, ["primitive".to_owned()]);
+        assert_eq!(
+            caps.profiles,
+            ["primitive".to_owned(), "teaching".to_owned()],
+            "the teaching profile is advertised because `batch`/`validate` are"
+        );
         assert_eq!(caps.limits.max_ticks, MAX_TICKS);
+
+        // Every verb is advertised, and every advertised verb round-trips:
+        // the fixtures in the round-trip test are the parse half of this
+        // claim, and that test asserts its action set *is* `ACTIONS`.
+        assert_eq!(caps.actions, ACTIONS);
 
         assert_eq!(caps.shapes.len(), ShapeKind::ALL.len());
         for name in &caps.shapes {

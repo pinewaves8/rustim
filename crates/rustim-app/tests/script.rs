@@ -662,6 +662,127 @@ fn an_undo_without_a_checkpoint_is_refused_and_the_feed_continues() {
 /// make after all: the settle runs ten virtual seconds, and a paused scene does
 /// not spend one of them. The still is therefore exactly the script without the
 /// beat, while the same script unpaused removes its square.
+/// **A batch is the same session as its members written out.** The same
+/// commands as five lines and as one list render to a byte-identical still:
+/// the list goes through the same `SceneContext::handle` per member, so
+/// batching is a transport saving and not a second semantics.
+#[test]
+fn a_batch_is_the_same_session_as_its_members_written_out() {
+    let add = r#"{"action":"add","type":"circle","params":{"radius":1.2,"label":"圆","color":[100,181,246]}}"#;
+    let style = r#"{"action":"set","target":"圆","property":{"name":"opacity","value":0.5}}"#;
+    let temp = r#"{"action":"add","type":"square","params":{"width":1.0,"label":"临时"}}"#;
+    let drop = r#"{"action":"remove","target":"临时"}"#;
+    let fade = r#"{"action":"play","animation":{"target":"圆","type":"fade_in","duration":1.0}}"#;
+
+    let lines = scratch(
+        "batch-lines",
+        &format!("{add}\n{style}\n{temp}\n{drop}\n{fade}\n"),
+    );
+    let list = scratch(
+        "batch-list",
+        &(format!(r#"{{"action":"batch","commands":[{add},{style},{temp},{drop},{fade}]}}"#)
+            + "\n"),
+    );
+
+    let lines_png = out_path("batch-lines");
+    run(&[
+        "--script",
+        lines.to_str().unwrap(),
+        "--png",
+        lines_png.to_str().unwrap(),
+    ])
+    .ok("the members as separate lines");
+
+    let list_png = out_path("batch-list");
+    let ran = run(&[
+        "--script",
+        list.to_str().unwrap(),
+        "--reply",
+        "--png",
+        list_png.to_str().unwrap(),
+    ]);
+    ran.ok("the members as one list");
+
+    // One line, one reply, and it is the *net* change: the circle was created
+    // (and then written), the temporary square never appears in either half.
+    let replies = ran.replies();
+    assert_eq!(replies.len(), 1, "a list is one command and one reply");
+    let diff = replies[0].diff.as_ref().expect("a batch is applied");
+    assert_eq!(diff.created.len(), 1, "{diff:?}");
+    assert!(
+        diff.modified.is_empty() && diff.removed.is_empty(),
+        "the net change is one creation: {diff:?}"
+    );
+
+    let tolerance = Tolerance::default();
+    let same =
+        compare_png_files(&list_png, &lines_png, &tolerance).expect("both files are one frame");
+    assert_eq!(
+        same.max,
+        0,
+        "a batch must render exactly as its members written out.\n{}",
+        same.report(&tolerance),
+    );
+    assert!(same.diff_bbox.is_none());
+}
+
+/// A refused member names its position, the prefix stays applied and the feed
+/// continues: the documented half-application, seen from the transport.
+#[test]
+fn a_refused_batch_names_the_member_and_the_feed_continues() {
+    let body = concat!(
+        r#"{"action":"batch","commands":[{"action":"add","type":"square","params":{"label":"前缀"}},{"action":"remove","target":"没有这个"}]}"#,
+        "\n",
+        r#"{"action":"set","target":"前缀","property":{"name":"opacity","value":0.25}}"#,
+        "\n",
+        r#"{"action":"add","type":"circle","params":{"radius":1.0}}"#,
+        "\n",
+    );
+    let script = scratch("batch-refused", body);
+    let png = out_path("batch-refused");
+    let ran = run(&[
+        "--script",
+        script.to_str().unwrap(),
+        "--reply",
+        "--png",
+        png.to_str().unwrap(),
+    ]);
+    ran.ok("a refused member is not a failed run");
+
+    let replies = ran.replies();
+    assert_eq!(replies.len(), 3);
+    let error = replies[0]
+        .error
+        .as_ref()
+        .expect("the second member is refused");
+    assert!(
+        matches!(
+            error,
+            rustim_scene::command::CommandError::InBatch { index: 1, .. }
+        ),
+        "{error:?}"
+    );
+    assert!(format!("{error}").contains("command 1"), "{error}");
+    assert_eq!(
+        replies[1]
+            .diff
+            .as_ref()
+            .expect("the prefix was applied")
+            .modified
+            .len(),
+        1
+    );
+    assert_eq!(
+        replies[2]
+            .diff
+            .as_ref()
+            .expect("the feed continued")
+            .created
+            .len(),
+        1
+    );
+}
+
 #[test]
 fn a_pause_holds_a_beat_for_the_whole_run() {
     let add = r#"{"action":"add","type":"square","params":{"width":2.0,"label":"方块"}}"#;

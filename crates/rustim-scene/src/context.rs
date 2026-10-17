@@ -63,12 +63,43 @@ pub trait Scene {
 /// playback policy it was being shown under. The timeline is deliberately
 /// absent: queued and running animations are values with captured `begin`
 /// states, and there is no sound way to replay them against a different tree.
+#[derive(Clone)]
 struct Checkpoint {
     tree: SceneTree,
     clock: f64,
     paused: bool,
     tempo: f64,
     motion: Motion,
+}
+
+/// The net difference between two trees, as a [`StateDiff`].
+///
+/// One function for the two places that report a **computed** change — an
+/// [`SceneContext::undo`] and a [`SceneContext::batch`] — because "what a diff
+/// means" must not have two spellings; `rebless`-style bugs start as a second
+/// copy of a comparison. The order follows [`SceneTree::draw_order`] on the
+/// side each id came from: created and modified walk the *after* tree, removed
+/// walks the *before* tree, so replaying the same change produces the same
+/// document.
+///
+/// The comparison is [`Mobject::differs_from`], not `PartialEq`: every write
+/// sets `dirty`, and a `set` that changed nothing must not read as a
+/// modification (see [`Mobject::differs_from`]).
+fn diff_trees(before: &SceneTree, after: &SceneTree) -> StateDiff {
+    let mut diff = StateDiff::default();
+    for id in after.draw_order() {
+        match (before.get(id), after.get(id)) {
+            (None, Some(_)) => diff.created.push(id),
+            (Some(past), Some(now)) if past.differs_from(now) => diff.modified.push(id),
+            _ => {}
+        }
+    }
+    for id in before.draw_order() {
+        if after.get(id).is_none() {
+            diff.removed.push(id);
+        }
+    }
+    diff
 }
 
 /// Everything a scene is allowed to touch.
@@ -434,20 +465,9 @@ impl SceneContext {
         let checkpoint = self.checkpoints.pop().ok_or(CommandError::NoCheckpoint)?;
         self.stop();
 
-        let mut diff = StateDiff::default();
-        for id in self.tree.draw_order() {
-            match (self.tree.get(id), checkpoint.tree.get(id)) {
-                (Some(now), Some(past)) if !now.differs_from(past) => {}
-                (Some(_), Some(_)) => diff.modified.push(id),
-                (Some(_), None) => diff.removed.push(id),
-                (None, _) => {}
-            }
-        }
-        for id in checkpoint.tree.draw_order() {
-            if self.tree.get(id).is_none() {
-                diff.created.push(id);
-            }
-        }
+        // The diff describes what the undo does to the tree the host is
+        // looking at: the checkpoint is the *after* side.
+        let diff = diff_trees(&self.tree, &checkpoint.tree);
 
         let mut restored = checkpoint.tree;
         restored.retire_ids_of(&self.tree);
@@ -457,6 +477,145 @@ impl SceneContext {
         self.tempo = checkpoint.tempo;
         self.motion = checkpoint.motion;
         Ok(diff)
+    }
+
+    /// Apply a list of commands in order and report the **net** change.
+    ///
+    /// The reply is computed from the tree before and after — [`diff_trees`],
+    /// the same function `undo` uses — not by concatenating the members' own
+    /// diffs. That is what makes it the honest answer for a host that redraws
+    /// from it: a node created and then removed in the same list is in neither
+    /// half, and one created and then moved is `created` and not `modified`.
+    /// `created` follows the final draw order, so the ids match what a query
+    /// would show.
+    ///
+    /// **Not a transaction.** The first refusal stops the list and comes back
+    /// as [`CommandError::InBatch`] with the member's index; everything before
+    /// that index has been applied, and nothing after it has. A host that wants
+    /// all-or-nothing takes a [`SceneContext::checkpoint`] first and an
+    /// [`SceneContext::undo`] on refusal, or validates the same list with
+    /// [`SceneContext::validate`] before sending it for real.
+    ///
+    /// The list's *shape* is checked before anything runs
+    /// ([`SceneContext::check_batchable`]), so a malformed list — empty, or
+    /// containing a command whose reply cannot be a diff — leaves the tree
+    /// untouched and is refused at the top level rather than as `InBatch`.
+    pub fn batch(&mut self, commands: &[Command]) -> Result<StateDiff, CommandError> {
+        Self::check_batchable(commands)?;
+        let before = self.tree.clone();
+        self.run_batch(commands)?;
+        Ok(diff_trees(&before, &self.tree))
+    }
+
+    /// Try a command list against a copy of the session and report only what
+    /// would fail.
+    ///
+    /// The dry run is a real run — the same [`SceneContext::handle`], in the
+    /// same order — against scratch state that is thrown away, so the live
+    /// tree, camera, clock, pause, tempo, checkpoint stack and motion mode are
+    /// untouched whichever way it goes. Members see each other's effects, which
+    /// is the property that makes it worth having: a label created by the first
+    /// member resolves for the second, and a node the first removed is gone for
+    /// the third, so an interdependent plan can be checked as a whole.
+    ///
+    /// The scratch copy carries the tree, the clock, the pause, the tempo, the
+    /// motion mode and the checkpoint stack, and the host's typesetter is moved
+    /// into it for the duration and moved back afterwards — so a `text` or
+    /// `formula` member is checked by the provider that would really build it.
+    /// The scheduler and the narration track are **not** copied: a queued
+    /// animation is a value that captured its start state, not replayable data.
+    /// A dry run therefore checks a `play`'s spec and target rather than how
+    /// the beat would look, and the scratch queue's emptiness is why a `seek`
+    /// costs no rendering.
+    ///
+    /// `Ok(())` says the list would be accepted; every refusal is the same
+    /// [`CommandError::InBatch`] (or top-level shape refusal) the real call
+    /// would produce, at the same index.
+    pub fn validate(&mut self, commands: &[Command]) -> Result<(), CommandError> {
+        Self::check_batchable(commands)?;
+        let mut scratch = self.scratch();
+        let result = scratch.run_batch(commands);
+        // The typesetter is the one object the two contexts share: it went into
+        // the copy and comes back whether the run succeeded or not.
+        self.typesetter = scratch.typesetter;
+        result
+    }
+
+    /// The rules a command list obeys, checked before anything runs.
+    ///
+    /// Two rules, both structural rather than semantic:
+    ///
+    /// * **Non-empty.** A list with nothing in it is not a batch; "do nothing"
+    ///   is spelled by sending nothing, and a model that generated an empty
+    ///   array has a bug worth hearing about.
+    /// * **Primitive members only.** `hello` answers with capabilities, `query`
+    ///   with a tree, and a batch replies with one diff — a reply has no field
+    ///   for a list of replies, so nesting them would silently drop the
+    ///   document the member asked for. `batch` and `validate` cannot nest for
+    ///   the same reason.
+    ///
+    /// The position is named as `commands[i]`, the same field spelling every
+    /// other refusal uses, so a model reads the index it wrote.
+    fn check_batchable(commands: &[Command]) -> Result<(), CommandError> {
+        if commands.is_empty() {
+            return Err(CommandError::OutOfRange {
+                property: "commands".to_owned(),
+                detail: "a command list needs at least one command".to_owned(),
+            });
+        }
+        for (index, member) in commands.iter().enumerate() {
+            let why = match member {
+                Command::Hello { .. } => "hello answers with capabilities, not a diff",
+                Command::Query { .. } => "query answers with a tree, not a diff",
+                Command::Batch { .. } | Command::Validate { .. } => {
+                    "a command list cannot be nested"
+                }
+                _ => continue,
+            };
+            return Err(CommandError::OutOfRange {
+                property: format!("commands[{index}]"),
+                detail: why.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Run a checked list through the one apply point, locating a refusal.
+    ///
+    /// The [`CommandError::InBatch`] wrapper is added here rather than in
+    /// [`SceneContext::batch`] so the dry run reports exactly the same shape: a
+    /// validation and the real call agree about *where* a list fails, which is
+    /// the whole promise of validating first.
+    fn run_batch(&mut self, commands: &[Command]) -> Result<(), CommandError> {
+        for (index, member) in commands.iter().enumerate() {
+            self.handle(member).map_err(|cause| CommandError::InBatch {
+                index,
+                cause: Box::new(cause),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A throwaway copy of the session for [`SceneContext::validate`].
+    ///
+    /// Everything a refusal could depend on is copied: the tree (camera
+    /// included), the clock a `seek` is measured against, the pause and tempo
+    /// the playback checks read, the motion mode a queued beat would take, and
+    /// the checkpoint stack an `undo` member pops. The typesetter is **moved**,
+    /// not cloned — the trait has no clone, and the host installs one provider
+    /// per build — and the caller moves it back.
+    ///
+    /// The scheduler and the narration track are deliberately fresh; see
+    /// [`SceneContext::validate`] for why.
+    fn scratch(&mut self) -> SceneContext {
+        let mut scratch = SceneContext::new(self.viewport, self.motion);
+        scratch.tree = self.tree.clone();
+        scratch.clock = self.clock;
+        scratch.paused = self.paused;
+        scratch.tempo = self.tempo;
+        scratch.checkpoints = self.checkpoints.clone();
+        scratch.typesetter = self.typesetter.take();
+        scratch
     }
 
     /// Play the timeline at a different speed from now on.
@@ -668,14 +827,15 @@ impl SceneContext {
     /// [`Command::Hello`], [`Command::Play`], [`Command::Stop`],
     /// [`Command::Pause`], [`Command::Resume`], [`Command::Tempo`],
     /// [`Command::Seek`], [`Command::Checkpoint`], [`Command::Undo`],
-    /// [`Command::Camera`], [`Command::Motion`],
-    /// [`Command::Narrate`] and [`Command::Query`] are answered **here** rather
-    /// than in `command::apply`:
+    /// [`Command::Batch`], [`Command::Validate`], [`Command::Camera`],
+    /// [`Command::Motion`], [`Command::Narrate`] and [`Command::Query`] are
+    /// answered **here** rather than in `command::apply`:
     /// a hello answers with capabilities rather than a diff — a shape `apply`
     /// cannot return — a play needs the playback machine, a stop needs it *and*
     /// the scheduler, the playback controls name fields on this context beside
-    /// the clock they scale (a seek additionally drives the machine), a camera
-    /// command needs the playback machine *or* the
+    /// the clock they scale (a seek additionally drives the machine), a command
+    /// list may contain any of the above and so can only be run by recursing
+    /// into this function, a camera command needs the playback machine *or* the
     /// viewport's aspect ratio (for `focus`), a motion command names a field on
     /// this context rather than in the tree, a narration needs the virtual clock
     /// and its own track, a query needs the viewport to project bounds — and
@@ -698,6 +858,16 @@ impl SceneContext {
     /// playback, so it needs the scheduler and the queue too. See
     /// [`SceneContext::checkpoint`] and [`SceneContext::undo`] for what is and
     /// is not captured.
+    ///
+    /// A [`Command::Batch`] runs its members through this same function, in
+    /// order, and answers with the **net** diff of the whole list — computed by
+    /// comparing the tree before and after, so a create-then-remove cancels. A
+    /// member's refusal stops the list and comes back as
+    /// [`CommandError::InBatch`] with its index; the members before it stay
+    /// applied. A [`Command::Validate`] runs the same list against a scratch
+    /// copy and answers with an empty diff when all of it would be accepted.
+    /// Both are documented at [`SceneContext::batch`] and
+    /// [`SceneContext::validate`].
     ///
     /// A camera command without a `duration` writes `tree.camera` now; one with a
     /// duration (including `0.0`) queues a single `CameraMove` beat, so it is
@@ -819,6 +989,19 @@ impl SceneContext {
             // honestly so: restoring a tree changes it, so the reply has to say
             // what moved or a host would have to re-query to find out.
             return self.undo().map(CommandOutcome::Applied);
+        }
+        if let Command::Batch { commands } = cmd {
+            // The net diff comes from comparing the tree before and after the
+            // list, not from the members' own replies, so a create-then-remove
+            // cancels and a create-then-move is `created` alone.
+            return self.batch(commands).map(CommandOutcome::Applied);
+        }
+        if let Command::Validate { commands } = cmd {
+            // A dry run changes nothing, so the diff is present and empty:
+            // silence in the error channel is the answer, and an empty diff is
+            // the honest statement that the tree did not move.
+            self.validate(commands)?;
+            return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Motion { mode } = cmd {
             self.motion = (*mode).into();
@@ -2439,14 +2622,14 @@ mod tests {
     /// formula of one root and one square child. The point of the fake is that
     /// the kernel never learns what a font is; this test module need not either.
     #[derive(Clone, Default)]
-    struct FakeTypesetter {
+    pub(super) struct FakeTypesetter {
         text: bool,
         formula: bool,
         refuse: Option<TypesetError>,
     }
 
     impl FakeTypesetter {
-        fn both() -> Self {
+        pub(super) fn both() -> Self {
             Self {
                 text: true,
                 formula: true,
@@ -2506,13 +2689,13 @@ mod tests {
         }
     }
 
-    fn with_typesetter(typesetter: FakeTypesetter) -> SceneContext {
+    pub(super) fn with_typesetter(typesetter: FakeTypesetter) -> SceneContext {
         let mut ctx = scene();
         ctx.set_typesetter(Box::new(typesetter));
         ctx
     }
 
-    fn add_text() -> Command {
+    pub(super) fn add_text() -> Command {
         serde_json::from_str(
             r#"{"action":"add","type":"text","params":{"text":"你好","label":"字","position":[1,2],"size":0.5}}"#,
         )
@@ -2722,6 +2905,7 @@ mod playback_control_tests {
     //! is about the state a run passes through: the scheduler's delivery, the
     //! lecture clock, `is_playing`, and the narration track.
 
+    use super::tests::{FakeTypesetter, add_text, with_typesetter};
     use super::*;
     use rustim_anim::{FadeIn, FadeOut};
 
@@ -3318,5 +3502,263 @@ mod playback_control_tests {
         applied_diff(&mut ctx, &Command::Checkpoint);
         ctx.reset();
         assert_eq!(ctx.undo(), Err(CommandError::NoCheckpoint));
+    }
+
+    /// A command spelled as JSON. A batch is written as data on the wire, so
+    /// writing its members as data here is the same test the protocol makes.
+    fn command(json: &str) -> Command {
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("parsing {json}: {e}"))
+    }
+
+    /// The reply is the **net** change of the list, not the concatenation of
+    /// its members' diffs: an object created inside the list is `created` even
+    /// if a later member also modified it, and a pair that adds and removes
+    /// the same node appears in neither half.
+    #[test]
+    fn a_batch_applies_in_order_and_reports_the_net_change() {
+        let mut ctx = scene();
+        let diff = applied_diff(
+            &mut ctx,
+            &Command::Batch {
+                commands: vec![
+                    command(
+                        r#"{"action":"add","type":"circle","params":{"radius":1.0,"label":"圆"}}"#,
+                    ),
+                    command(
+                        r#"{"action":"set","target":"圆","property":{"name":"opacity","value":0.5}}"#,
+                    ),
+                    command(r#"{"action":"add","type":"square","params":{"label":"临时"}}"#),
+                    command(r#"{"action":"remove","target":"临时"}"#),
+                ],
+            },
+        );
+
+        assert_eq!(diff.created.len(), 1, "{diff:?}");
+        let circle = diff.created[0];
+        assert!(
+            diff.modified.is_empty(),
+            "a create-then-modify is one creation: {diff:?}"
+        );
+        assert!(
+            diff.removed.is_empty(),
+            "a create-then-remove cancels: {diff:?}"
+        );
+        assert_eq!(ctx.tree.len(), 1, "the temporary square is gone");
+        let m = ctx.tree.get(circle).unwrap();
+        assert_eq!(m.opacity, 0.5, "the members ran in order");
+        assert_eq!(m.label.as_deref(), Some("圆"));
+    }
+
+    /// A refusal stops the list at the member that caused it and names that
+    /// member's index: everything before it is applied, nothing after it runs.
+    /// That is the documented half-application — a host wanting all-or-nothing
+    /// takes a checkpoint first — and the index is what makes it actionable.
+    #[test]
+    fn a_batch_stops_at_the_first_refusal_and_names_the_member() {
+        let mut ctx = scene();
+        let error = ctx
+            .batch(&[
+                command(r#"{"action":"add","type":"circle","params":{"label":"圆"}}"#),
+                command(r#"{"action":"remove","target":"没有这个"}"#),
+                command(r#"{"action":"add","type":"square","params":{"label":"未执行"}}"#),
+            ])
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            CommandError::InBatch {
+                index: 1,
+                cause: Box::new(CommandError::NoSuchLabel {
+                    label: "没有这个".to_owned(),
+                }),
+            }
+        );
+        assert_eq!(ctx.tree.len(), 1, "the prefix stays, the suffix never ran");
+        assert_eq!(ctx.tree.ids_with_label("圆").len(), 1);
+        assert!(ctx.tree.ids_with_label("未执行").is_empty());
+    }
+
+    /// The list's *shape* is checked before anything runs, so a malformed list
+    /// is atomic. Each member kind that cannot live in a list is refused at its
+    /// own position — `commands[i]`, the field spelling every refusal uses.
+    #[test]
+    fn a_malformed_list_is_refused_before_anything_runs() {
+        let mut ctx = scene();
+        assert_eq!(
+            ctx.batch(&[]).unwrap_err(),
+            CommandError::OutOfRange {
+                property: "commands".to_owned(),
+                detail: "a command list needs at least one command".to_owned(),
+            }
+        );
+
+        for member in [
+            command(r#"{"action":"query"}"#),
+            command(r#"{"action":"hello"}"#),
+            Command::Batch {
+                commands: vec![Command::Pause],
+            },
+            Command::Validate {
+                commands: vec![Command::Pause],
+            },
+        ] {
+            let list = [
+                command(r#"{"action":"add","type":"circle"}"#),
+                member.clone(),
+            ];
+            let error = ctx.batch(&list).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    CommandError::OutOfRange { ref property, .. } if property == "commands[1]"
+                ),
+                "{member:?} was not refused at its position: {error:?}"
+            );
+            assert!(
+                ctx.tree.is_empty(),
+                "a shape refusal applied something: {error}"
+            );
+
+            // The dry run refuses the same list the same way.
+            assert_eq!(ctx.validate(&list).unwrap_err(), error);
+        }
+    }
+
+    /// A batch may queue beats; its diff still reports only the tree, which a
+    /// queued animation does not change.
+    #[test]
+    fn a_batch_can_queue_beats_and_reports_no_tree_change() {
+        let mut ctx = scene();
+        let id = invisible_square(&mut ctx);
+        let diff = applied_diff(
+            &mut ctx,
+            &Command::Batch {
+                commands: vec![command(&format!(
+                    r#"{{"action":"play","animation":{{"target":{},"type":"fade_in","duration":1.0}}}}"#,
+                    id.raw()
+                ))],
+            },
+        );
+        assert!(diff.is_empty(), "{diff:?}");
+        assert!(ctx.is_playing(), "the beat was queued");
+        tick(&mut ctx, 30);
+        assert!(opacity(&ctx, id) > 0.0, "and it runs");
+    }
+
+    /// A dry run and the real call agree about *where* a list fails, and only
+    /// the real call changes anything.
+    #[test]
+    fn validate_reports_the_refusal_the_real_call_would_give_and_changes_nothing() {
+        let mut ctx = scene();
+        let id = square(&mut ctx);
+        let commands = vec![
+            command(r#"{"action":"add","type":"circle","params":{"label":"圆"}}"#),
+            command(r#"{"action":"remove","target":"没有这个"}"#),
+        ];
+
+        let refusal = ctx.validate(&commands).unwrap_err();
+        assert_eq!(
+            refusal,
+            CommandError::InBatch {
+                index: 1,
+                cause: Box::new(CommandError::NoSuchLabel {
+                    label: "没有这个".to_owned(),
+                }),
+            }
+        );
+        assert_eq!(ctx.tree.len(), 1, "the dry run left a node behind");
+        assert!(ctx.tree.get(id).is_some());
+        assert!(ctx.tree.ids_with_label("圆").is_empty());
+
+        assert_eq!(ctx.batch(&commands).unwrap_err(), refusal);
+    }
+
+    /// Members see each other, which is what makes validating a plan worth
+    /// doing: a label created by member 0 resolves for member 1 even though the
+    /// live tree has never heard of it.
+    #[test]
+    fn validate_resolves_a_label_created_by_an_earlier_member() {
+        let mut ctx = scene();
+        ctx.validate(&[
+            command(r#"{"action":"add","type":"circle","params":{"label":"圆"}}"#),
+            command(r#"{"action":"set","target":"圆","property":{"name":"opacity","value":0.5}}"#),
+        ])
+        .expect("the second member names the first member's object");
+        assert!(ctx.tree.is_empty(), "and the live tree was not touched");
+    }
+
+    /// A `play` is checked by building the animation and dropping it: the spec
+    /// and its target are validated, no beat reaches the live queue.
+    #[test]
+    fn validate_checks_a_play_spec_without_queueing_a_beat() {
+        let mut ctx = scene();
+        let id = square(&mut ctx);
+        let error = ctx
+            .validate(&[
+                command(&format!(
+                    r#"{{"action":"play","animation":{{"target":{},"type":"fade_in"}}}}"#,
+                    id.raw()
+                )),
+                command(r#"{"action":"play","animation":{"target":999,"type":"fade_in"}}"#),
+            ])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CommandError::InBatch { index: 1, ref cause, .. }
+                    if matches!(**cause, CommandError::NoSuchNode { .. })
+            ),
+            "{error:?}"
+        );
+        assert!(!ctx.is_playing(), "the dry run queued a beat");
+    }
+
+    /// The scratch copy carries the checkpoint stack, so an `undo` member is
+    /// validated against the history a real one would unwind — and the live
+    /// stack is left for the real undo.
+    #[test]
+    fn validate_copies_the_checkpoint_stack_so_an_undo_member_is_checked() {
+        let mut ctx = scene();
+        square(&mut ctx);
+        applied_diff(&mut ctx, &Command::Checkpoint);
+        let second = square(&mut ctx);
+
+        ctx.validate(&[Command::Undo])
+            .expect("the scratch context has the stack");
+
+        assert!(
+            ctx.tree.get(second).is_some(),
+            "the dry run restored the live tree"
+        );
+        ctx.undo().expect("the live stack still holds the mark");
+        assert!(ctx.tree.get(second).is_none());
+    }
+
+    /// The host's typesetter travels into the copy and back: a `text` member is
+    /// checked by the provider that would really build it, and the live context
+    /// still has that provider afterwards.
+    #[test]
+    fn validate_typesets_on_the_copy_and_puts_the_provider_back() {
+        let mut bare = scene();
+        let error = bare.validate(&[add_text()]).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CommandError::InBatch { index: 0, ref cause, .. }
+                    if matches!(**cause, CommandError::Unsupported { .. })
+            ),
+            "a build with no provider must validate the same refusal: {error:?}"
+        );
+
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        ctx.validate(&[add_text()])
+            .expect("the provider went into the copy");
+        assert!(
+            ctx.tree.is_empty(),
+            "nothing was typeset into the real tree"
+        );
+
+        applied_diff(&mut ctx, &add_text());
+        assert_eq!(ctx.tree.len(), 1, "the provider came back");
     }
 }
