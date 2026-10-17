@@ -94,6 +94,23 @@ pub struct SceneContext {
     /// timeline*, and the only way to keep that from happening is to be the only
     /// thing that can advance it ([`SceneContext::advance`]).
     playback: Sequence,
+    /// Virtual time since the run began, in seconds.
+    ///
+    /// Advanced at the top of [`SceneContext::advance`], so a still (`settle`
+    /// steps a fixed grid) and a window (each frame's `dt`) share one notion of
+    /// time. Private for the same reason `playback` is: narration due times are
+    /// measured against it, and a second copy of "when are we" is a second answer.
+    ///
+    /// It is allowed to run backwards through the `,` key (which steps a frame
+    /// back) but never below zero; a narration already drained is gone, so
+    /// rewinding cannot replay it.
+    clock: f64,
+    /// Narration waiting for its due time, as `(due, text)`.
+    ///
+    /// Private because the track is ordered by virtual time and only
+    /// [`SceneContext::take_narration`] may drain it — a host that read it
+    /// directly would have to reproduce the "due at or before the clock" rule.
+    narration: Vec<(f64, String)>,
 }
 
 impl SceneContext {
@@ -109,6 +126,8 @@ impl SceneContext {
             viewport,
             motion,
             playback: Sequence::new(),
+            clock: 0.0,
+            narration: Vec::new(),
         }
     }
 
@@ -187,6 +206,12 @@ impl SceneContext {
     /// not this method, not [`SceneContext::is_playing`], not a scene reacting to
     /// the timeline having drained — needs to know the mode to stay correct.
     pub fn advance(&mut self, dt: f64) {
+        // The clock is the one time base narration is scheduled against. It
+        // never goes below zero: `,` steps a frame backwards, and a negative
+        // `at` is refused at the wire, so a rewind is a debug gesture and not a
+        // second start of the lecture. A narration already drained is gone, so
+        // stepping back cannot replay it — the track is a script, not a tape.
+        self.clock = (self.clock + dt).max(0.0);
         if self.animations.is_empty() {
             self.playback
                 .start_next(&mut self.animations, &mut self.tree, self.motion);
@@ -205,6 +230,38 @@ impl SceneContext {
     /// makes that true by construction rather than by luck.
     pub fn is_playing(&self) -> bool {
         !self.animations.is_empty() || !self.playback.is_empty()
+    }
+
+    /// Take every narration line whose time has come, oldest first.
+    ///
+    /// Draining rather than reading: a line is said once, and a frame that
+    /// called this twice would otherwise speak it twice. Entries are ordered by
+    /// their due time (an explicit `at` makes out-of-order arrival normal), and
+    /// lines that fall due at the same instant keep the order they arrived in.
+    ///
+    /// The caller decides what "saying" means — a live region, a caption, a
+    /// speech backend, or nothing at all — which is why this returns text and
+    /// does not know about any of them.
+    ///
+    /// Returns an empty vector **without allocating** when nothing is due, the
+    /// common case for every frame without a script.
+    pub fn take_narration(&mut self) -> Vec<String> {
+        if self.narration.iter().all(|(due, _)| *due > self.clock) {
+            return Vec::new();
+        }
+        let mut later = Vec::new();
+        let mut due = Vec::new();
+        for (at, text) in self.narration.drain(..) {
+            if at <= self.clock {
+                due.push((at, text));
+            } else {
+                later.push((at, text));
+            }
+        }
+        self.narration = later;
+        // Stable, so equal due times keep arrival order.
+        due.sort_by(|a, b| a.0.total_cmp(&b.0));
+        due.into_iter().map(|(_, text)| text).collect()
     }
 
     /// Insert a mobject at the root.
@@ -231,17 +288,25 @@ impl SceneContext {
         self.tree.clear();
         self.animations.clear();
         self.playback.clear();
+        // Narration is part of the timeline, so it goes with the queue: a
+        // rewritten scene that kept the previous one's due lines would speak
+        // them over a picture they were never written for. The clock starts
+        // over for the same reason — the new scene's `at: 0` means *its* zero.
+        self.clock = 0.0;
+        self.narration.clear();
     }
 
     /// Apply a command from outside the engine.
     ///
-    /// [`Command::Play`], [`Command::Camera`] and [`Command::Motion`] are answered
-    /// **here** rather than in `command::apply`: a play needs the playback
-    /// machine, a camera command needs the playback machine *or* the viewport's
-    /// aspect ratio (for `focus`), a motion command names a field on this context
-    /// rather than in the tree, and `apply`'s documented purity — "pure with
-    /// respect to everything except `tree`: no clock, no I/O, no renderer" — is
-    /// what makes the rest of the protocol testable in isolation and replayable.
+    /// [`Command::Play`], [`Command::Camera`], [`Command::Motion`] and
+    /// [`Command::Narrate`] are answered **here** rather than in `command::apply`:
+    /// a play needs the playback machine, a camera command needs the playback
+    /// machine *or* the viewport's aspect ratio (for `focus`), a motion command
+    /// names a field on this context rather than in the tree, a narration needs
+    /// the virtual clock and its own track, and `apply`'s documented purity —
+    /// "pure with respect to everything except `tree`: no clock, no I/O, no
+    /// renderer" — is what makes the rest of the protocol testable in isolation
+    /// and replayable.
     /// The wire→animation and wire→camera mappings still live in `command`, next
     /// to the wire types.
     ///
@@ -262,6 +327,12 @@ impl SceneContext {
     /// A [`Command::Motion`] writes `self.motion` and answers with an empty diff
     /// for the same reason; it reads back through [`SceneContext::motion`]'s field,
     /// not through the tree.
+    ///
+    /// A [`Command::Narrate`] is queued on the narration track at
+    /// `clock + at`, and answers with an empty diff because speaking is not a
+    /// tree change. It refuses two things a model can easily send: nothing to
+    /// say (`text` trims to empty) and a delay that is negative or not finite
+    /// (`at`). Both name the field that was wrong.
     pub fn handle(&mut self, cmd: &Command) -> Result<StateDiff, CommandError> {
         if let Command::Play { animation } = cmd {
             let anim = command::animation_for(&self.tree, animation)?;
@@ -270,6 +341,27 @@ impl SceneContext {
         }
         if let Command::Motion { mode } = cmd {
             self.motion = (*mode).into();
+            return Ok(StateDiff::default());
+        }
+        if let Command::Narrate { text, at } = cmd {
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(CommandError::OutOfRange {
+                    property: "text".to_owned(),
+                    detail: "narration needs something to say".to_owned(),
+                });
+            }
+            let delay = at.unwrap_or(0.0);
+            if !delay.is_finite() || delay < 0.0 {
+                return Err(CommandError::OutOfRange {
+                    property: "at".to_owned(),
+                    detail: format!("{delay} is not a finite, non-negative delay"),
+                });
+            }
+            // `at` is relative to arrival, and the clock is where the timeline
+            // already is: a file feed applies every line at t = 0, so the delay
+            // is the only thing that keeps the lecture in order.
+            self.narration.push((self.clock + delay, text.to_owned()));
             return Ok(StateDiff::default());
         }
         if let Command::Camera {
@@ -1185,5 +1277,138 @@ mod tests {
         ctx.reset();
         assert_eq!(ctx.camera(), &Camera::default());
         assert_eq!(ctx.pixels_per_unit(), 90.0);
+    }
+
+    fn narrate(
+        ctx: &mut SceneContext,
+        text: &str,
+        at: Option<f64>,
+    ) -> Result<StateDiff, CommandError> {
+        ctx.handle(&Command::Narrate {
+            text: text.to_owned(),
+            at,
+        })
+    }
+
+    #[test]
+    fn a_narration_without_a_time_is_due_immediately() {
+        let mut ctx = scene();
+        let diff = narrate(&mut ctx, "先看这个三角形", None).unwrap();
+        assert!(
+            diff.is_empty(),
+            "speaking is not a tree change, and the reply has to say so"
+        );
+        assert_eq!(ctx.take_narration(), ["先看这个三角形"]);
+        assert!(
+            ctx.take_narration().is_empty(),
+            "draining means a line is said once"
+        );
+    }
+
+    #[test]
+    fn a_delayed_narration_waits_for_the_virtual_clock() {
+        let mut ctx = scene();
+        narrate(&mut ctx, "两条直角边是 3 和 4", Some(2.0)).unwrap();
+
+        tick(&mut ctx, 114); // 1.9 s
+        assert!(ctx.take_narration().is_empty(), "not due yet");
+
+        tick(&mut ctx, 12); // 2.1 s
+        assert_eq!(ctx.take_narration(), ["两条直角边是 3 和 4"]);
+    }
+
+    /// `at` is measured from **arrival**, not from the start of the run — the
+    /// property a file feed (all lines applied at t = 0) depends on.
+    #[test]
+    fn a_delay_is_relative_to_when_the_command_arrived() {
+        let mut ctx = scene();
+        tick(&mut ctx, 180); // 3 s in
+        narrate(&mut ctx, "现在看斜边", Some(1.0)).unwrap();
+
+        tick(&mut ctx, 54); // 3.9 s
+        assert!(ctx.take_narration().is_empty());
+
+        tick(&mut ctx, 12); // 4.1 s
+        assert_eq!(ctx.take_narration(), ["现在看斜边"]);
+    }
+
+    #[test]
+    fn due_lines_come_out_oldest_first() {
+        let mut ctx = scene();
+        narrate(&mut ctx, "third", Some(2.0)).unwrap();
+        narrate(&mut ctx, "first", None).unwrap();
+        narrate(&mut ctx, "second", Some(1.0)).unwrap();
+        tick(&mut ctx, 180);
+
+        assert_eq!(ctx.take_narration(), ["first", "second", "third"]);
+        assert!(ctx.take_narration().is_empty());
+    }
+
+    #[test]
+    fn an_impossible_narration_is_refused_by_field() {
+        let mut ctx = scene();
+        for text in ["", "   ", "\n\t"] {
+            let err = narrate(&mut ctx, text, None).unwrap_err();
+            assert!(
+                matches!(&err, CommandError::OutOfRange { property, .. } if property == "text"),
+                "{text:?} refused as {err}"
+            );
+        }
+        for at in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = narrate(&mut ctx, "说点什么", Some(at)).unwrap_err();
+            assert!(
+                matches!(&err, CommandError::OutOfRange { property, .. } if property == "at"),
+                "{at} refused as {err}"
+            );
+        }
+        assert!(ctx.take_narration().is_empty(), "a refusal says nothing");
+    }
+
+    /// The pure `apply` still answers the command, as a no-op, so a caller that
+    /// replays a log through it does not panic and does not lose the rest.
+    #[test]
+    fn apply_treats_narration_as_a_harmless_no_op() {
+        let mut ctx = scene();
+        let diff = command::apply(
+            &mut ctx.tree,
+            &Command::Narrate {
+                text: "hello".to_owned(),
+                at: Some(1.0),
+            },
+        )
+        .unwrap();
+        assert!(diff.is_empty());
+        assert!(ctx.take_narration().is_empty());
+    }
+
+    #[test]
+    fn reset_clears_the_narration_track_and_its_clock() {
+        let mut ctx = scene();
+        narrate(&mut ctx, "old scene", Some(2.0)).unwrap();
+        tick(&mut ctx, 30);
+
+        ctx.reset();
+        tick(&mut ctx, 180);
+        assert!(
+            ctx.take_narration().is_empty(),
+            "a rewritten scene does not speak the old one's lines"
+        );
+
+        // And the clock started over, so `at` is measured from the reset: one
+        // second from now, not from the run's beginning.
+        narrate(&mut ctx, "new scene", Some(1.0)).unwrap();
+        tick(&mut ctx, 120);
+        assert_eq!(ctx.take_narration(), ["new scene"]);
+    }
+
+    #[test]
+    fn the_clock_rewinds_but_never_below_zero() {
+        let mut ctx = scene();
+        tick(&mut ctx, 30);
+        ctx.advance(-0.25);
+        assert!((ctx.clock - 0.25).abs() < 1e-12, "{}", ctx.clock);
+
+        ctx.advance(-10.0);
+        assert_eq!(ctx.clock, 0.0);
     }
 }

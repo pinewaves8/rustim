@@ -65,6 +65,24 @@ pub enum Command {
         #[serde(skip_serializing_if = "Option::is_none")]
         duration: Option<f64>,
     },
+    /// Say a line of narration now, or after a delay.
+    ///
+    /// Narration is not a tree change: it reaches the accessibility live region
+    /// and the caption track, and the reply is an empty [`StateDiff`], exactly
+    /// like a `play`. The engine keeps it on a track of its own, ordered by
+    /// **virtual** time, so a wall-clock delay in a host is not what paces a
+    /// recorded session — see [`crate::SceneContext::take_narration`].
+    ///
+    /// `at` is measured from the moment the command arrives, not from the start
+    /// of the run. That is what makes a file feed (which applies every line at
+    /// t = 0, the basis of replay determinism) able to write a paced lecture:
+    /// the lines are all accepted at once, and `at` is what tells them apart.
+    /// Absent is the same as `0.0`.
+    Narrate {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<f64>,
+    },
     /// Change how much motion the run plays from now on.
     ///
     /// The switch takes effect at the **next beat started**, not on whatever is
@@ -407,6 +425,12 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // the playback machine that consults it, not in the tree `apply` can
             // reach. Keeping the arm is what lets a direct `apply` caller replay
             // the same command log without a panic.
+        }
+        Command::Narrate { .. } => {
+            // Answered by `SceneContext::handle`, because scheduling narration
+            // needs the virtual clock and the narration track — neither of which
+            // is in the tree. A direct `apply` caller gets a harmless no-op, the
+            // same round-trip every other host-answered command gives it.
         }
     }
     Ok(diff)
@@ -1049,6 +1073,12 @@ mod tests {
             // and giving it one would tie the protocol to a library's naming.
             r#"{"action":"motion","mode":"reduced"}"#.to_owned(),
             r#"{"action":"motion","mode":"full"}"#.to_owned(),
+            // Narration: `text` then `at` (declaration order), and an absent
+            // delay is omitted rather than written as `null`. The text is UTF-8
+            // in the document — serde_json does not escape non-ASCII — so a
+            // round trip that mangled it would be visible here.
+            r#"{"action":"narrate","text":"先看这个三角形"}"#.to_owned(),
+            r#"{"action":"narrate","text":"两条直角边是 3 和 4","at":2.0}"#.to_owned(),
         ];
         for json in cases {
             let cmd: Command =

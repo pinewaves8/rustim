@@ -1989,6 +1989,10 @@ fn main() {
                 // So is `motion`, and it takes effect at the next beat started —
                 // a running beat keeps the policy it was handed.
                 println!(r#"  {{"action":"motion","mode":"reduced"}}"#);
+                // `narrate` is a command too: `at` is relative to when the line
+                // arrived, which is how a file feed (everything applied at t = 0)
+                // still paces itself.
+                println!(r#"  {{"action":"narrate","text":"先看这个三角形","at":2.0}}"#);
                 // `rate` names the easing curve by Manim's name; absent means the
                 // animation's own default. The full vocabulary is the line above.
                 println!(

@@ -439,6 +439,35 @@ mod tests {
         assert!(!animation_kinds().contains("camera"));
     }
 
+    /// A narration is a command like a `play`: applied, answered with an
+    /// **empty** diff (speaking is not a tree change), and scheduled against the
+    /// virtual clock rather than the feed's wall clock — which is what lets a
+    /// file script pace itself.
+    #[test]
+    fn a_narration_line_is_queued_and_answered_with_an_empty_diff() {
+        let mut scene = Recorder::default();
+        let mut ctx = context();
+        let (counts, replies) = feed(
+            &mut scene,
+            &mut ctx,
+            &[r#"{"action":"narrate","text":"先看这个三角形","at":2.0}"#],
+        );
+        assert_eq!(counts.applied, 1);
+        let diff = replies[0].diff.as_ref().expect("a narration is applied");
+        assert!(diff.is_empty(), "the narration track is not the tree");
+        assert!(
+            ctx.take_narration().is_empty(),
+            "the line arrived at t = 0 and is due at t = 2"
+        );
+
+        ctx.advance(2.1);
+        assert_eq!(ctx.take_narration(), ["先看这个三角形"]);
+        // The scene heard about it through the same `on_command` every applied
+        // command fires — with an empty diff, which is the honest report.
+        assert_eq!(scene.seen.len(), 1);
+        assert!(scene.seen[0].is_empty());
+    }
+
     /// The rate vocabulary `--help` prints is the one the wire parses.
     ///
     /// Every name is read back through the real command parser, so the check is
