@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **677 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **688 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -1697,8 +1697,8 @@ away the scale an earlier member applied. The rule that survives both: **a posit
 the state the object has when the animation starts**, and only `begin` knows the second half.
 
 **`serde` writes struct fields in declaration order, so a hand-written round-trip fixture must match
-it.** `AnimationSpec` declares `target, type, duration, to, angle, factor, about_point, into,
-animations, lag_ratio`; writing the nested-succession case as `{"type":"succession","animations":[...],
+it.** `AnimationSpec` declares `target, type, duration, to, angle, factor, property, about_point,
+into, path_arc, animations, lag_ratio, rate`; writing the nested-succession case as `{"type":"succession","animations":[...],
 "duration":2.0}` parses fine and then serialises back with `duration` first, so the byte-for-byte
 round-trip test fails on a command the engine understood. The fixture is not wrong about JSON — JSON
 objects are unordered — it is wrong about the protocol's canonical spelling, which is the thing the
@@ -2464,6 +2464,32 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   and the count moved 649 → 677. Deferred, deliberately: text styling on the wire (size and
   `max_width` only; no font family, weight or colour per run), formula styling per element, and a
   browser text path (the embedded font set has no CJK face).
+- **Phase 1's second slice — the property animation `animate` — is done.** `play` gained an
+  eleventh kind whose payload is `set`'s own `Property` object: `{"type":"animate","property":
+  {"name":"opacity","value":0.35}}` eases one style channel from the value the object has when the
+  beat begins to the value named. The kernel half is `rustim_anim::Animate` over a five-variant
+  `StyleProperty` (`opacity`, `fill_opacity`, `stroke_opacity`, `stroke_width`, `stroke_color`);
+  `Animate::begin` reads the start off the node, `interpolate` lerps with Manim's
+  `(1 - t)·a + t·b`, and `alpha == 1.0` assigns the target verbatim — so reduced motion and a
+  completed run settle on the same bits. Colour blends per channel in the sRGB encoding `Srgb`
+  holds, deliberately not through `Style::lerp` (which would touch every other style field, and
+  ulp drift compounds frame over frame). `Property::animatable` is the wire-side gate: it validates
+  the value through the same `unit_range` / `width_range` helpers `set` uses, and refuses the five
+  non-paint properties with an actionable `OutOfRange` naming the right tool — `position` →
+  `move_to`, `scale` → `scale`, `rotation` → `rotate`, `label` / `kind` → instantaneous `set`.
+  **Opacity does not inherit** in the draw walk, so animating a group's opacity is invisible unless
+  the group has geometry; the doc on `Animate` says so rather than changing the draw walk. Evidence:
+  six `rustim-anim` tests (per-channel motion, exact endpoints, colour blend, missing target is a
+  no-op, a non-finite end does not poison the style, interruption composes), four command-layer
+  tests (the channel moves, missing `property` is refused, the five refusals name their field,
+  values validate as `set` does), two round-trip fixtures, a conformance arm that accepts the
+  advertised kind, and an end-to-end `--script` still where a faded square is pixel-identical to a
+  blank scene while the counterfactual render differs. `AnimationKind::ALL` is now 11, and the
+  capabilities document therefore advertises 11 animations; **all eight goldens are unchanged**
+  (no compiled scene uses it), and the count moved 677 → 688. Deferred, deliberately: geometry
+  properties in one beat (use the dedicated animations), non-linear channel curves per property
+  beyond `rate`, and animating a group's inherited appearance (children must be addressed, or
+  `fade_out` used).
 
 ## AI integration
 

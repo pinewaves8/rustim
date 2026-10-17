@@ -188,6 +188,64 @@ fn replaying_a_script_twice_gives_the_same_frame() {
     );
 }
 
+/// `animate` is the command that makes a property change take time, and a still
+/// is exactly where its **end state** is observable: a square animated to
+/// opacity zero must leave a frame identical to an empty script's, while the
+/// same square without the beat is plainly there. The counterfactual is half the
+/// test — "the fade ran" is only meaningful next to "the square is visible when
+/// it does not".
+#[test]
+fn an_animate_script_settles_in_the_still() {
+    let add = r#"{"action":"add","type":"square","params":{"width":2.0,"color":[100,181,246],"label":"方块"}}"#;
+    let fade = r#"{"action":"play","animation":{"target":"方块","type":"animate","duration":0.5,"property":{"name":"opacity","value":0.0}}}"#;
+    let blank = scratch("animate-blank", "");
+    let faded = scratch("animate-faded", &format!("{add}\n{fade}\n"));
+    let shown = scratch("animate-shown", &format!("{add}\n"));
+
+    let render = |script: &Path, name: &str| {
+        let out = out_path(name);
+        run(&[
+            "--script",
+            script.to_str().unwrap(),
+            "--png",
+            out.to_str().unwrap(),
+        ])
+        .ok("--script … --png");
+        out
+    };
+    let blank = render(&blank, "animate-blank");
+    let faded = render(&faded, "animate-faded");
+    let shown = render(&shown, "animate-shown");
+
+    let tolerance = Tolerance::default();
+    let same = compare_png_files(&faded, &blank, &tolerance).unwrap_or_else(|e| {
+        panic!(
+            "comparing {} against {}: {e}",
+            faded.display(),
+            blank.display()
+        )
+    });
+    assert_eq!(
+        same.max,
+        0,
+        "the animated square did not fade to nothing:\n{}",
+        same.report(&tolerance),
+    );
+    assert!(same.diff_bbox.is_none());
+
+    let visible = compare_png_files(&shown, &blank, &tolerance).unwrap_or_else(|e| {
+        panic!(
+            "comparing {} against {}: {e}",
+            shown.display(),
+            blank.display()
+        )
+    });
+    assert!(
+        visible.max > 0,
+        "without the beat the square is on screen, so the faded frame is evidence"
+    );
+}
+
 /// One reply per command, in the order they were sent, each saying what changed.
 ///
 /// The `seq` assertion is the one that pins the rule a human debugging a log

@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (11 shapes, 10 animations, 10 properties, 45 rates);
+//!    the build actually has (11 shapes, 11 animations, 10 properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
 //!    against the parser rather than trusted;
@@ -148,7 +148,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     // animation added without joining `ALL` fails here before it can ship an
     // incomplete capability list.
     assert_eq!(caps.shapes.len(), 11, "{:?}", caps.shapes);
-    assert_eq!(caps.animations.len(), 10, "{:?}", caps.animations);
+    assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
     assert_eq!(caps.profiles, ["primitive".to_owned()]);
@@ -197,9 +197,9 @@ fn every_advertised_word_is_accepted_by_the_binary() {
         // The capability list says the *kind* is accepted; each kind's required
         // fields are its own, and a probe that omitted one would be testing the
         // refusal path, not the vocabulary. `group`/`succession` name members
-        // rather than a target (a target on a group is a refusal), and the four
-        // parameterised kinds each have one field without which they are
-        // deliberately refused.
+        // rather than a target (a target on a group is a refusal), and each
+        // parameterised kind has one field without which it is deliberately
+        // refused.
         let animation = match name.as_str() {
             "group" | "succession" => {
                 format!(r#"{{"type":"{name}","animations":[{{"target":{a},"type":"fade_in"}}]}}"#)
@@ -208,6 +208,9 @@ fn every_advertised_word_is_accepted_by_the_binary() {
             "rotate" => format!(r#"{{"target":{a},"type":"rotate","angle":0.5}}"#),
             "scale" => format!(r#"{{"target":{a},"type":"scale","factor":1.5}}"#),
             "transform" => format!(r#"{{"target":{a},"type":"transform","into":{b}}}"#),
+            "animate" => format!(
+                r#"{{"target":{a},"type":"animate","property":{{"name":"opacity","value":0.5}}}}"#
+            ),
             _ => format!(r#"{{"target":{a},"type":"{name}"}}"#),
         };
         let line = format!(r#"{{"action":"play","animation":{animation}}}"#);

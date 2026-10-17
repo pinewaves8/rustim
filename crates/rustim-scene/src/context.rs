@@ -906,7 +906,7 @@ mod tests {
         {
             CommandOutcome::Greeted(caps) => {
                 assert_eq!(caps.protocol, command::PROTOCOL_VERSION);
-                assert_eq!(caps.animations.len(), 10);
+                assert_eq!(caps.animations.len(), 11);
                 // Nine of the eleven kinds: this context has no typesetter, so
                 // it must not advertise the two that need one. Advertising them
                 // and refusing the first `add` would teach a client to distrust
@@ -1625,6 +1625,7 @@ mod tests {
                 to: None,
                 angle: None,
                 factor: None,
+                property: None,
                 about_point: None,
                 into: None,
                 path_arc: None,
@@ -1751,6 +1752,7 @@ mod tests {
                 to: None,
                 angle: None,
                 factor: None,
+                property: None,
                 about_point: None,
                 into: None,
                 path_arc: None,
@@ -1793,6 +1795,7 @@ mod tests {
                 to: None,
                 angle: None,
                 factor: None,
+                property: None,
                 about_point: None,
                 into: None,
                 path_arc: None,

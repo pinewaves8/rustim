@@ -9,9 +9,8 @@ license.workspace = true
 [dependencies]
 rustim-math.workspace = true
 rustim-mobject.workspace = true
-
-[dev-dependencies]
-# The palette, for the tests that check a morph's colours move. Only the tests
-# need distinct colours: `Transform` itself reaches `Srgb` through `Style` and
-# names no colour type, so this stays out of `[dependencies]`.
+# `Animate`'s colour channel is a colour, not a component array: `StyleProperty`
+# hands `Srgb` straight to `Style::stroke`, and `Transform`'s tests already need
+# the palette. It is a kernel crate with no dependencies of its own, so this
+# adds nothing to the wasm surface.
 rustim-color.workspace = true

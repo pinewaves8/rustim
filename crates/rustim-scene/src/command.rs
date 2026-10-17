@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::a11y::SemanticTree;
 use rustim_anim::{
-    Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, Succession,
-    TransformGroup, Uncreate, WithRate,
+    Animate, Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale,
+    StyleProperty, Succession, TransformGroup, Uncreate, WithRate,
 };
 use rustim_math::rate::Rate;
 use rustim_math::{Affine2, Camera, Point, Viewport};
@@ -439,6 +439,16 @@ pub struct AnimationSpec {
     /// What a `scale` multiplies the size by. Must be positive and finite.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub factor: Option<f64>,
+    /// The style property an `animate` moves to, in `set`'s own spelling —
+    /// `{"name":"opacity","value":0.35}`.
+    ///
+    /// Read only by `animate`, and deliberately the *same* struct `set` takes:
+    /// a host learns one property vocabulary, and the animation layer refuses the
+    /// geometry half (`position`, `scale`, `rotation`) with a message naming the
+    /// dedicated animation instead of re-implementing it badly. `label` and
+    /// `kind` are refused because they are not continuous.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub property: Option<Property>,
     /// A `rotate`'s pivot, in **world** units. Absent means the object's own
     /// centre, which is what Manim's `Rotate` defaults to as well.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -522,6 +532,8 @@ pub enum AnimationKind {
     Group,
     /// Play the `animations` list one after another, as one animation.
     Succession,
+    /// Drive one style property to a new value over time.
+    Animate,
 }
 
 impl AnimationKind {
@@ -533,8 +545,8 @@ impl AnimationKind {
     /// list. A variant added to the enum but not to this array would be
     /// invisible to a client, and no compiler can count an array literal —
     /// which is why the conformance suite asserts every name here is accepted
-    /// and the count is 10.
-    pub const ALL: [AnimationKind; 10] = [
+    /// and the count is 11.
+    pub const ALL: [AnimationKind; 11] = [
         Self::FadeIn,
         Self::FadeOut,
         Self::MoveTo,
@@ -545,6 +557,7 @@ impl AnimationKind {
         Self::Transform,
         Self::Group,
         Self::Succession,
+        Self::Animate,
     ];
 }
 
@@ -1349,6 +1362,21 @@ fn simple_for(tree: &SceneTree, spec: &AnimationSpec) -> Result<Box<dyn Animatio
             }
             Box::new(Scale::new(target, factor).with_duration(duration))
         }
+        AnimationKind::Animate => {
+            let Some(property) = spec.property.as_ref() else {
+                return Err(CommandError::OutOfRange {
+                    property: "property".into(),
+                    detail: "an animate needs the property to move, e.g. \
+                             {\"name\":\"opacity\",\"value\":0.35}"
+                        .into(),
+                });
+            };
+            // `animatable` validates the value *and* refuses the channels this
+            // animation does not cover, each refusal naming the animation that
+            // does — see its doc.
+            let to = property.animatable()?;
+            Box::new(Animate::new(target, to).with_duration(duration))
+        }
         AnimationKind::Create => Box::new(Create::new(target).with_duration(duration)),
         AnimationKind::Uncreate => Box::new(Uncreate::new(target).with_duration(duration)),
         AnimationKind::Transform => {
@@ -1487,39 +1515,93 @@ fn composed_for(
     })
 }
 
+/// Reject an opacity-like value outside `0.0..=1.0`, naming the field it came
+/// from.
+///
+/// Shared between `set` ([`Property::write`]) and `animate`
+/// ([`Property::animatable`]) so the two spellings of "opacity" cannot admit
+/// different ranges — the most likely way a command layer drifts.
+fn unit_range(name: &str, v: f64) -> Result<f64, CommandError> {
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(CommandError::OutOfRange {
+            property: name.to_string(),
+            detail: format!("{v} is not in 0.0..=1.0"),
+        })
+    }
+}
+
+/// Reject a stroke width that is negative or not finite.
+fn width_range(v: f64) -> Result<f64, CommandError> {
+    if v < 0.0 || !v.is_finite() {
+        return Err(CommandError::OutOfRange {
+            property: "stroke_width".into(),
+            detail: format!("{v} is not a non-negative, finite width"),
+        });
+    }
+    Ok(v)
+}
+
 impl Property {
-    fn write(&self, m: &mut Mobject) -> Result<(), CommandError> {
-        let range = |name: &str, v: f64| -> Result<f64, CommandError> {
-            if (0.0..=1.0).contains(&v) {
-                Ok(v)
-            } else {
-                Err(CommandError::OutOfRange {
-                    property: name.to_string(),
-                    detail: format!("{v} is not in 0.0..=1.0"),
-                })
+    /// The style channel this property names, with its value checked — or the
+    /// refusal an `animate` should answer with.
+    ///
+    /// The three geometry properties are refused rather than approximately
+    /// animated, and each refusal names the animation that *does* mean what the
+    /// caller asked for: a `position` lerp is [`MoveTo`] minus its `begin`-time
+    /// resolution, a `scale` lerp is [`Scale`] without its centre, and a
+    /// `rotation` lerp interpolates a matrix entry rather than an angle. `label`
+    /// and `kind` are semantic, and there is no frame at which an object is half
+    /// a circle.
+    pub fn animatable(&self) -> Result<StyleProperty, CommandError> {
+        Ok(match self {
+            Self::Opacity(v) => StyleProperty::Opacity(unit_range("opacity", *v)?),
+            Self::FillOpacity(v) => StyleProperty::FillOpacity(unit_range("fill_opacity", *v)?),
+            Self::StrokeOpacity(v) => {
+                StyleProperty::StrokeOpacity(unit_range("stroke_opacity", *v)?)
             }
-        };
+            Self::StrokeWidth(v) => StyleProperty::StrokeWidth(width_range(*v)?),
+            // Same construction `set` uses, so an `animate` to a colour leaves
+            // the object exactly where a `set` to the same colour would.
+            Self::StrokeColor([r, g, b]) => {
+                StyleProperty::StrokeColor(rustim_color::Srgb::from_rgba8(*r, *g, *b, 255))
+            }
+            Self::Position(_)
+            | Self::Scale(_)
+            | Self::Rotation(_)
+            | Self::Label(_)
+            | Self::Kind(_) => {
+                let hint = match self {
+                    Self::Position(_) => "a `move_to` animation moves an object",
+                    Self::Scale(_) => "a `scale` animation resizes an object",
+                    Self::Rotation(_) => "a `rotate` animation turns an object",
+                    _ => "label and kind are set instantly with `set`",
+                };
+                return Err(CommandError::OutOfRange {
+                    property: "property".into(),
+                    detail: format!("`animate` interpolates style channels only; {hint}"),
+                });
+            }
+        })
+    }
+
+    fn write(&self, m: &mut Mobject) -> Result<(), CommandError> {
         match self {
             Self::Opacity(v) => {
-                m.opacity = range("opacity", *v)?;
+                m.opacity = unit_range("opacity", *v)?;
                 m.dirty.style = true;
             }
             Self::FillOpacity(v) => {
-                m.style.fill_opacity = range("fill_opacity", *v)?;
+                m.style.fill_opacity = unit_range("fill_opacity", *v)?;
                 m.dirty.style = true;
             }
             Self::StrokeWidth(v) => {
-                if *v < 0.0 || !v.is_finite() {
-                    return Err(CommandError::OutOfRange {
-                        property: "stroke_width".into(),
-                        detail: format!("{v} is not a non-negative, finite width"),
-                    });
-                }
-                m.style.stroke_width = *v;
+                m.style.stroke_width = width_range(*v)?;
                 m.dirty.style = true;
             }
             Self::StrokeOpacity(v) => {
-                m.style.stroke_opacity = range("stroke_opacity", *v)?;
+                m.style.stroke_opacity = unit_range("stroke_opacity", *v)?;
                 m.dirty.style = true;
             }
             Self::StrokeColor([r, g, b]) => {
@@ -1662,6 +1744,15 @@ mod tests {
             ),
             format!(
                 r#"{{"action":"play","animation":{{"target":{id},"type":"scale","factor":2.5}}}}"#
+            ),
+            // The property animation carries `set`'s own payload inside a
+            // `play` — one property vocabulary for both, and the absent-field
+            // rule applies to `property` as to every other optional field.
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"animate","duration":0.8,"property":{{"name":"opacity","value":0.35}}}}}}"#
+            ),
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"animate","property":{{"name":"stroke_color","value":[100,181,246]}}}}}}"#
             ),
             // The two kinds that carry no parameter beyond the target: a `create`
             // and an `uncreate` are spelled with the target and nothing else.
@@ -2413,6 +2504,7 @@ mod tests {
                     to: None,
                     angle: None,
                     factor: None,
+                    property: None,
                     about_point: None,
                     into: None,
                     path_arc: None,
@@ -2447,6 +2539,7 @@ mod tests {
             to: None,
             angle: None,
             factor: None,
+            property: None,
             about_point: None,
             into: None,
             path_arc: None,
@@ -2600,6 +2693,7 @@ mod tests {
             AnimationKind::Create,
             AnimationKind::Uncreate,
             AnimationKind::Transform,
+            AnimationKind::Animate,
         ] {
             let mut what = spec(id, kind);
             match kind {
@@ -2607,6 +2701,7 @@ mod tests {
                 AnimationKind::Rotate => what.angle = Some(1.0),
                 AnimationKind::Scale => what.factor = Some(1.5),
                 AnimationKind::Transform => what.into = Some(donor.into()),
+                AnimationKind::Animate => what.property = Some(Property::Opacity(0.5)),
                 _ => {}
             }
             assert_eq!(
@@ -2758,6 +2853,88 @@ mod tests {
         );
     }
 
+    // ---- the `animate` kind -----------------------------------------------
+
+    /// The command's only real job is the mapping, so this drives the built
+    /// animation through its cardinal points: it must start from the opacity the
+    /// object has, move linearly, and land exactly on the target.
+    #[test]
+    fn an_animate_command_drives_a_style_channel() {
+        let (mut tree, id) = scene_with_a_blank();
+        tree.get_mut(id).unwrap().opacity = 0.8;
+        let mut what = spec(id, AnimationKind::Animate);
+        what.property = Some(Property::Opacity(0.2));
+        what.duration = Some(0.4);
+
+        let mut anim = animation_for(&tree, &what).unwrap();
+        assert_eq!(anim.duration(), 0.4);
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+        assert!((tree.get(id).unwrap().opacity - 0.5).abs() < 1e-12);
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().opacity, 0.2);
+    }
+
+    #[test]
+    fn an_animate_command_needs_a_property() {
+        let (tree, id) = scene_with_a_blank();
+        assert!(matches!(
+            animation_for(&tree, &spec(id, AnimationKind::Animate)),
+            Err(CommandError::OutOfRange { property, .. }) if property == "property"
+        ));
+    }
+
+    /// Every property that already has a dedicated animation is refused with an
+    /// actionable message rather than duplicated worse: a componentwise
+    /// `rotation` lerp is not a rotation, and a `position` lerp is `MoveTo` minus
+    /// its `begin`-time resolution.
+    #[test]
+    fn an_animate_refuses_the_properties_that_have_their_own_animation() {
+        let (tree, id) = scene_with_a_blank();
+        for property in [
+            Property::Position([1.0, 0.0]),
+            Property::Scale(2.0),
+            Property::Rotation(1.0),
+            Property::Label("名字".into()),
+            Property::Kind(NodeKind::Circle),
+        ] {
+            let mut what = spec(id, AnimationKind::Animate);
+            what.property = Some(property.clone());
+            let Err(CommandError::OutOfRange {
+                property: field,
+                detail,
+            }) = animation_for(&tree, &what)
+            else {
+                panic!("{property:?} must not be animatable");
+            };
+            assert_eq!(field, "property");
+            assert!(detail.contains("`animate`"), "{detail}");
+        }
+    }
+
+    /// The value is checked by the same range `set` uses, so an `animate` cannot
+    /// reach a state a `set` would have refused.
+    #[test]
+    fn an_animate_validates_its_value_like_a_set() {
+        let (tree, id) = scene_with_a_blank();
+        for (property, expected) in [
+            (Property::Opacity(7.0), "opacity"),
+            (Property::FillOpacity(-0.1), "fill_opacity"),
+            (Property::StrokeOpacity(f64::NAN), "stroke_opacity"),
+            (Property::StrokeWidth(-1.0), "stroke_width"),
+        ] {
+            let mut what = spec(id, AnimationKind::Animate);
+            what.property = Some(property);
+            assert!(
+                matches!(
+                    animation_for(&tree, &what),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == expected
+                ),
+                "expected a refusal under {expected}"
+            );
+        }
+    }
+
     // ---- the P3 create/uncreate kinds --------------------------------------
 
     /// A `create` draws the object's own path on, and at the end it is the whole
@@ -2810,6 +2987,7 @@ mod tests {
             to: None,
             angle: None,
             factor: None,
+            property: None,
             about_point: None,
             into: None,
             path_arc: None,

@@ -3,7 +3,8 @@
 //! The shapes the design has to support, one animation each: a scalar
 //! ([`FadeIn`], [`FadeOut`]), an interpolated transform ([`MoveTo`]) — where the
 //! deferred transform pays off directly — a parameterised *rigid* transform whose
-//! parameter is not a matrix entry ([`Rotate`], [`Scale`]), point arrays
+//! parameter is not a matrix entry ([`Rotate`], [`Scale`]), a single style
+//! channel driven to any value ([`Animate`]), point arrays
 //! ([`Transform`], the morph), which is what puts Manim's `align_points`
 //! machinery to work, and a *prefix* of a point array ([`Create`],
 //! [`Uncreate`]), which is `pointwise_become_partial`.
@@ -17,6 +18,7 @@
 //! occupies the clock, which is exactly what makes a pause an animation like any
 //! other.
 
+use rustim_color::Srgb;
 use rustim_math::{Affine2, Camera, Point, bezier};
 use rustim_mobject::{Mobject, NodeId, SceneTree, Style};
 
@@ -420,6 +422,166 @@ impl Animation for Scale {
         let factor = lerp_scalar(1.0, self.factor, alpha);
         m.set_transform(Affine2::scale_about(factor, centre) * start);
     }
+}
+
+/// One style channel [`Animate`] can interpolate, carrying the value it moves to.
+///
+/// The vocabulary is deliberately the **paint** half of what `set` accepts. The
+/// geometry half already has an animation whose semantics are better than "lerp
+/// the field": [`MoveTo`] resolves its destination in `begin`, [`Scale`] composes
+/// about the object's centre, and [`Rotate`] interpolates an angle rather than a
+/// matrix. A label or a kind is not a continuous quantity at all — it is what the
+/// object *means*, and there is no frame at which it is halfway a circle. So
+/// this covers exactly the channels where "in between" is both defined and
+/// visible.
+///
+/// `Srgb` is named rather than reached through [`Style`] because the colour
+/// channel *is* a colour, and a second representation for it would drift from
+/// the one `Style::lerp` already blends.
+#[derive(Debug, Clone, Copy)]
+pub enum StyleProperty {
+    /// The object's own opacity, the channel [`FadeIn`] drives.
+    Opacity(f64),
+    FillOpacity(f64),
+    StrokeOpacity(f64),
+    StrokeWidth(f64),
+    StrokeColor(Srgb),
+}
+
+impl StyleProperty {
+    /// The value this channel currently has on `m`.
+    ///
+    /// Matching on `self` is what keeps the read complete: a variant added to the
+    /// enum is a compile error here rather than a silently unread channel.
+    fn read(self, m: &Mobject) -> Self {
+        match self {
+            Self::Opacity(_) => Self::Opacity(m.opacity),
+            Self::FillOpacity(_) => Self::FillOpacity(m.style.fill_opacity),
+            Self::StrokeOpacity(_) => Self::StrokeOpacity(m.style.stroke_opacity),
+            Self::StrokeWidth(_) => Self::StrokeWidth(m.style.stroke_width),
+            Self::StrokeColor(_) => Self::StrokeColor(m.style.stroke),
+        }
+    }
+
+    /// Blend from `self` towards `to`.
+    ///
+    /// A pair of different channels cannot be produced through [`Animate`] —
+    /// `begin` reads `to`'s own channel — so a mismatch is answered with `self`
+    /// rather than a panic, the same posture a command naming a deleted node has.
+    fn blend(self, to: Self, t: f64) -> Self {
+        if t == 1.0 {
+            return to;
+        }
+        match (self, to) {
+            (Self::Opacity(a), Self::Opacity(b)) => Self::Opacity(lerp_scalar(a, b, t)),
+            (Self::FillOpacity(a), Self::FillOpacity(b)) => Self::FillOpacity(lerp_scalar(a, b, t)),
+            (Self::StrokeOpacity(a), Self::StrokeOpacity(b)) => {
+                Self::StrokeOpacity(lerp_scalar(a, b, t))
+            }
+            (Self::StrokeWidth(a), Self::StrokeWidth(b)) => Self::StrokeWidth(lerp_scalar(a, b, t)),
+            (Self::StrokeColor(a), Self::StrokeColor(b)) => {
+                Self::StrokeColor(blend_srgb(a, b, t as f32))
+            }
+            _ => self,
+        }
+    }
+
+    /// Write this value into the object, marking what a repaint must rebuild.
+    fn write(self, m: &mut Mobject) {
+        match self {
+            Self::Opacity(v) => m.opacity = v,
+            Self::FillOpacity(v) => m.style.fill_opacity = v,
+            Self::StrokeOpacity(v) => m.style.stroke_opacity = v,
+            Self::StrokeWidth(v) => m.style.stroke_width = v,
+            Self::StrokeColor(c) => m.style.stroke = c,
+        }
+        m.dirty.style = true;
+    }
+}
+
+/// Moves one style channel from wherever it is to a new value over time.
+///
+/// The wire's `animate`, and the piece that was missing between `set` (change a
+/// property instantly) and the endpoint-only [`FadeIn`] / [`FadeOut`] pair: "take
+/// the opacity to 0.35", "thicken the outline", "recolour the stroke" were all
+/// expressible only as a jump.
+///
+/// Three properties are the design:
+///
+/// * **`begin` captures the current value**, not a value fixed at construction —
+///   the same reason [`FadeIn`] does it: a beat may be constructed long before
+///   its turn (`Succession` builds every member up front), and an animation
+///   interrupted by another must not snap back. The consequence is that two
+///   `animate`s in a succession compose: the second starts from where the first
+///   ended.
+/// * **The end is written, not computed.** `interpolate(1.0)` writes the target
+///   verbatim (`Style::lerp`'s own short-circuit), so reduced motion — which
+///   drives `ease(1.0)` once — settles on a frame that is bitwise identical to
+///   the one full motion reaches, and a replayed run is identical too.
+/// * **Opacity does not inherit in the draw walk**, so animating a group's
+///   opacity changes the group's own invisible field and not its children.
+///   Target the nodes the viewer can see.
+///
+/// A target that is gone by the time the animation runs is a no-op, as it is for
+/// every other animation here: `interpolate` has no error channel.
+#[derive(Debug, Clone)]
+pub struct Animate {
+    target: NodeId,
+    to: StyleProperty,
+    from: Option<StyleProperty>,
+    duration: f64,
+}
+
+impl Animate {
+    /// Move `target`'s style channel to `to` over `duration` seconds.
+    pub fn new(target: NodeId, to: StyleProperty) -> Self {
+        Self {
+            target,
+            to,
+            from: None,
+            duration: 1.0,
+        }
+    }
+
+    pub fn with_duration(mut self, seconds: f64) -> Self {
+        self.duration = seconds;
+        self
+    }
+}
+
+impl Animation for Animate {
+    fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    fn begin(&mut self, tree: &SceneTree) {
+        if let Some(m) = tree.get(self.target) {
+            self.from = Some(self.to.read(m));
+        }
+    }
+
+    fn interpolate(&mut self, alpha: f64, tree: &mut SceneTree) {
+        let Some(from) = self.from else {
+            return;
+        };
+        let Some(m) = tree.get_mut(self.target) else {
+            return;
+        };
+        from.blend(self.to, alpha).write(m);
+    }
+}
+
+/// Interpolate two sRGB colours per channel, the way `Style::lerp` does.
+///
+/// No colour-space conversion: both ends are already sRGB, and Manim blends its
+/// raw arrays too.
+fn blend_srgb(a: Srgb, b: Srgb, t: f32) -> Srgb {
+    let (a, b) = (a.components, b.components);
+    let mut out = [0.0f32; 4];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (1.0 - t) * a[i] + t * b[i];
+    }
+    Srgb::new(out)
 }
 
 /// Morphs an object into another shape.
@@ -1861,6 +2023,120 @@ mod tests {
         scale.begin(&tree);
         scale.interpolate(0.5, &mut tree);
 
+        assert!(tree.is_empty());
+    }
+
+    /// `Animate` starts from the value it *finds*, not from the value at
+    /// construction — and it lands exactly on the target, which is what reduced
+    /// motion (`ease(1.0)`) and a replayed run sit on.
+    #[test]
+    fn an_animate_starts_from_the_value_it_finds_and_lands_exactly() {
+        let (mut tree, id) = scene(square());
+        tree.get_mut(id).unwrap().opacity = 0.25;
+
+        let mut anim = Animate::new(id, StyleProperty::Opacity(0.75));
+        // Constructed before the object was at 0.25; `begin` is what matters.
+        anim.begin(&tree);
+        anim.interpolate(0.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().opacity, 0.25);
+
+        anim.interpolate(0.5, &mut tree);
+        assert!((tree.get(id).unwrap().opacity - 0.5).abs() < 1e-12);
+
+        anim.interpolate(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().opacity, 0.75);
+    }
+
+    /// Two `animate`s in one succession compose: the second's `begin` sees the
+    /// first's end state, so 1 → 0.5 then 0.5 → 0.2 is a monotone fade rather
+    /// than a snap back to 1.
+    #[test]
+    fn a_second_animate_starts_where_the_first_ended() {
+        let (mut tree, id) = scene(square());
+
+        let mut first = Animate::new(id, StyleProperty::Opacity(0.5));
+        first.begin(&tree);
+        first.interpolate(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().opacity, 0.5);
+
+        let mut second = Animate::new(id, StyleProperty::Opacity(0.2));
+        second.begin(&tree);
+        second.interpolate(0.5, &mut tree);
+        assert!((tree.get(id).unwrap().opacity - 0.35).abs() < 1e-12);
+    }
+
+    /// A channel animation touches its own field and nothing else. `opacity` and
+    /// `fill_opacity` compose multiplicatively at draw time, so a bug that wrote
+    /// both would show as a squared fade — this is the unit half of that claim.
+    #[test]
+    fn an_animate_moves_only_its_own_channel() {
+        let (mut tree, id) = scene(square());
+        {
+            let m = tree.get_mut(id).unwrap();
+            m.opacity = 0.5;
+            m.style.fill_opacity = 0.8;
+            m.style.stroke_opacity = 0.4;
+            m.style.stroke_width = 0.1;
+        }
+
+        let mut anim = Animate::new(id, StyleProperty::FillOpacity(0.2));
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+
+        let m = tree.get(id).unwrap();
+        assert!((m.style.fill_opacity - 0.5).abs() < 1e-12);
+        assert_eq!(m.opacity, 0.5);
+        assert_eq!(m.style.stroke_opacity, 0.4);
+        assert_eq!(m.style.stroke_width, 0.1);
+    }
+
+    /// The colour channel blends per sRGB component, the same arithmetic
+    /// `Style::lerp` uses — not a hue rotation, and not a linear-light
+    /// conversion wrapped around a lerp the source does not do.
+    #[test]
+    fn a_stroke_colour_animate_blends_each_channel() {
+        let (mut tree, id) = scene(square());
+        tree.get_mut(id).unwrap().style.stroke = Srgb::from_rgba8(255, 0, 0, 255);
+
+        let mut anim = Animate::new(
+            id,
+            StyleProperty::StrokeColor(Srgb::from_rgba8(0, 0, 255, 255)),
+        );
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
+
+        let [r, g, b, a] = tree.get(id).unwrap().style.stroke.components;
+        // Red -> blue: the shared channel (green) stays at zero, the two that
+        // move meet in the middle, and alpha (255 on both ends) is untouched.
+        for (name, v, want) in [("r", r, 0.5), ("g", g, 0.0), ("b", b, 0.5), ("a", a, 1.0)] {
+            assert!((v - want).abs() < 1e-6, "{name} = {v}, expected {want}");
+        }
+    }
+
+    /// The boxed route is how every beat actually plays, so the new animation
+    /// has to survive `Box<dyn Animation>` like the others.
+    #[test]
+    fn a_boxed_animate_still_drives_the_tree() {
+        use crate::AnimationScheduler;
+
+        let (mut tree, id) = scene(square());
+        let mut sched = AnimationScheduler::new();
+        sched.add_boxed(Box::new(
+            Animate::new(id, StyleProperty::Opacity(0.2)).with_duration(0.5),
+        ));
+        sched.update(1.0, &mut tree);
+        assert_eq!(tree.get(id).unwrap().opacity, 0.2);
+    }
+
+    /// The shared posture: a deleted target is a no-op, not a panic.
+    #[test]
+    fn an_animate_is_a_no_op_on_a_missing_node() {
+        let (mut tree, id) = scene(square());
+        tree.clear();
+
+        let mut anim = Animate::new(id, StyleProperty::Opacity(0.2));
+        anim.begin(&tree);
+        anim.interpolate(0.5, &mut tree);
         assert!(tree.is_empty());
     }
 }
