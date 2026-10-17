@@ -386,7 +386,15 @@ impl Formula {
     /// which is what the AI layer wants to name and what keeps a move from
     /// costing O(glyphs).
     pub fn insert(self, tree: &mut SceneTree) -> FormulaNodes {
-        let root = tree.insert(self.root);
+        // Computed before anything is moved out of `self`: the union is over the
+        // glyphs and rules, and after the first insertion they belong to the
+        // tree. The container itself has no points, so this box is the only
+        // extent it will ever have — it is what gives the formula a `bounds` in
+        // the accessibility tree and a centre for `camera focus` / `MoveTo`.
+        let bounds = self.local_bounds();
+        let mut root = self.root;
+        root.local_bounds = bounds;
+        let root = tree.insert(root);
         let adopt = |tree: &mut SceneTree, mobject| {
             let id = tree.insert(mobject);
             // **`reparent` must be called unconditionally, with its result

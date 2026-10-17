@@ -397,9 +397,11 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
 ///   a model that an empty camera request is fine;
 /// * a `focus` naming a missing node — [`CommandError::NoSuchNode`], the same
 ///   refusal every other command that names a node gives;
-/// * a `focus` naming a node with no geometry (a text mobject has no points; see
-///   `Mobject::has_picture`) or with zero extent —
-///   [`CommandError::OutOfRange`] rather than a silent no-op;
+/// * a `focus` naming a node with neither points nor a declared
+///   [`Mobject::local_bounds`] — an empty placeholder, or text whose owner never
+///   told the tree how big it is — or with zero extent:
+///   [`CommandError::OutOfRange`] rather than a silent no-op. A text object that
+///   *does* carry its layout box is framed like any other node;
 /// * a `zoom` that is not positive and finite — [`CommandError::OutOfRange`],
 ///   the same posture as `Scale`: a zero zoom divides by zero, a negative one
 ///   mirrors the world, and neither is what "zoom in" means.
@@ -906,6 +908,7 @@ impl Property {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustim_math::Rect;
 
     #[test]
     fn commands_round_trip_through_json() {
@@ -2238,18 +2241,38 @@ mod tests {
         ));
     }
 
-    /// A text mobject has no points (`Mobject::has_picture` is the test for "can
-    /// be seen", not a point count), so there is no box to frame. Refusing is
-    /// honest: a silent success would leave the camera where it was and the host
-    /// believing it had framed the text.
+    /// A node with neither points nor a declared box has nothing to frame.
+    /// Refusing is honest: a silent success would leave the camera where it was
+    /// and the host believing it had framed something.
     #[test]
     fn a_focus_on_a_node_without_geometry_is_refused() {
         let mut tree = SceneTree::new();
-        let text = tree.insert(Mobject::new(vec![]));
+        let empty = tree.insert(Mobject::new(vec![]));
         assert!(matches!(
-            camera_for(&tree, &Viewport::default(), None, None, Some(text)),
+            camera_for(&tree, &Viewport::default(), None, None, Some(empty)),
             Err(CommandError::OutOfRange { ref property, .. }) if property == "focus"
         ));
+    }
+
+    /// A text node is point-less but not geometry-less: its owner declares the
+    /// layout box, and `focus` frames that box like any other object.
+    #[test]
+    fn a_focus_can_frame_a_text_nodes_declared_box() {
+        let mut tree = SceneTree::new();
+        let text = tree.insert(
+            Mobject::new(vec![])
+                .with_kind(NodeKind::Text)
+                .with_local_bounds(Rect::new(-2.0, -0.5, 2.0, 0.5)),
+        );
+
+        let camera = camera_for(&tree, &Viewport::default(), None, None, Some(text)).unwrap();
+        assert_eq!(camera.center, (0.0, 0.0));
+        // 4 wide and 1 tall: the width is the tighter axis at 1280x720
+        // (visible width is ~14.22, so a 4-unit box fills it at ~2.96x), while
+        // the height alone would allow 8 / (1.2 * 1) = 6.67x.
+        let aspect = 1280.0 / 720.0;
+        let want = Camera::WORLD_HEIGHT * aspect / (1.2 * 4.0);
+        assert!((camera.zoom - want).abs() < 1e-12, "zoom {}", camera.zoom);
     }
 
     /// The fit leaves a 1.2 margin and is decided by the tighter axis. A 2×2 box

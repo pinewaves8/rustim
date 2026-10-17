@@ -840,6 +840,9 @@ impl TextScene {
                 .with_style(filled(line.color, 1.0))
                 .with_kind(NodeKind::Text)
                 .with_label(line.text);
+            if let Some(bounds) = rustim_app::text::local_bounds(&shaped) {
+                m = m.with_local_bounds(bounds);
+            }
             m.opacity = line.opacity;
             m.transform = Affine2::rotate(line.rotate) * Affine2::translate(line.at);
             self.nodes.push(ctx.add(m));
@@ -1163,6 +1166,9 @@ impl AxesScene {
                 .with_style(filled(rustim_color::FG, 1.0))
                 .with_kind(NodeKind::Text)
                 .with_label(text);
+            if let Some(bounds) = rustim_app::text::local_bounds(&shaped) {
+                m = m.with_local_bounds(bounds);
+            }
             m.transform = Affine2::translate(at);
             this.nodes.push(ctx.add(m));
             this.blocks.push(shaped);

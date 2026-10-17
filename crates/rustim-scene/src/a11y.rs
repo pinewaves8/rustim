@@ -234,6 +234,14 @@ pub fn build(tree: &SceneTree, viewport: &Viewport, live: Option<String>) -> Sem
         let Some(m) = tree.get(id) else { continue };
         let anchors = tree.world_anchors(id);
         let shape = anchors.as_deref().and_then(Shape::of);
+        // `bounds` and `describe` read two different things on purpose. The
+        // box comes from `world_bounds`, which also knows about an object's
+        // declared local extent — text has no anchors but does have a layout
+        // box. The *shape* stays anchor-only: its corner and edge-length rules
+        // are what make a rotated square report its side rather than its
+        // bounding box, and a rectangle invented for text would put it through
+        // those rules as if it were a polyline.
+        let bounds = tree.world_bounds(id);
         let name = m
             .label
             .clone()
@@ -244,9 +252,7 @@ pub fn build(tree: &SceneTree, viewport: &Viewport, live: Option<String>) -> Sem
             name,
             description: describe(m.kind, m.label.as_deref(), shape.as_ref()),
             children: tree.child_ids(id).to_vec(),
-            bounds: shape
-                .as_ref()
-                .map(|s| to_screen.transform_rect_bbox(s.bounds)),
+            bounds: bounds.map(|b| to_screen.transform_rect_bbox(b)),
             // "Cannot be seen", not "was faded out": an object with no picture is
             // no more on screen than a transparent one is. Both are reported
             // rather than omitted — a reader who is told a faded-out square exists
@@ -1107,5 +1113,34 @@ mod tests {
         assert_eq!(s.camera, CameraView::default());
         assert_eq!(s.camera.zoom, 1.0);
         assert_eq!(s.camera.visible, [8.0 * (1280.0 / 720.0), 8.0]);
+    }
+
+    /// Text and a formula container have no points but do have a declared local
+    /// extent, so they get screen bounds — while keeping the description they
+    /// had before the bounds existed.
+    ///
+    /// The description half is the load-bearing one: routing bounds through
+    /// `world_bounds` is fine, but someone extending `world_anchors` instead
+    /// would hand the Describe path a rectangle and change 「文本」 into a
+    /// measured sentence that no listener asked for. The text should still be
+    /// spoken as its own label.
+    #[test]
+    fn a_text_box_gets_bounds_without_changing_its_description() {
+        let mut tree = SceneTree::new();
+        let mut m = rustim_mobject::Mobject::new(Vec::new())
+            .with_kind(rustim_mobject::kind::NodeKind::Text)
+            .with_label("斜边");
+        m.local_bounds = Some(rustim_math::Rect::new(-2.0, -0.5, 2.0, 0.5));
+        let id = tree.insert(m);
+
+        let s = build(&tree, &Viewport::default(), None);
+        let node = s.get(id).unwrap();
+        let bounds = node.bounds.expect("a declared box is a bounds");
+        // The default viewport is 90 px per world unit. The box is 4 x 1 world
+        // units and is centred, so it spans 360 x 90 pixels about the origin.
+        assert!((bounds.width() - 4.0 * 90.0).abs() < 1e-9);
+        assert!((bounds.height() - 1.0 * 90.0).abs() < 1e-9);
+        assert_eq!(node.description, "斜边", "the text speaks as itself");
+        assert_eq!(node.name, "斜边");
     }
 }

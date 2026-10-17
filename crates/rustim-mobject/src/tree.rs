@@ -128,6 +128,22 @@ pub struct Mobject {
     /// becomes visible to a host only through the `add` command's `type` and the
     /// `set` command's `kind` property, which share this enum's names.
     pub kind: NodeKind,
+    /// The object's extent in *local* space, for objects whose picture is not a
+    /// point array.
+    ///
+    /// Text is the case this exists for: its geometry is a glyph run the owning
+    /// scene pushes itself, so `points` is empty and there is nothing for
+    /// [`Mobject::materialize`], [`Mobject::critical_point`] or
+    /// [`SceneTree::world_bounds`] to measure. The shaper knew the layout box
+    /// all along; this is where it is handed over.
+    ///
+    /// It is a **fallback, never an override**: a node with points answers from
+    /// its points, so every shape that existed before this field returns exactly
+    /// the bounds it always did. `None` for a point-bearing object is the normal
+    /// case and means nothing.
+    ///
+    /// `Mobject` is not `Serialize`, so this field changes no wire JSON.
+    pub local_bounds: Option<Rect>,
     pub children: Vec<NodeId>,
     pub parent: Option<NodeId>,
     /// Draw order within a parent. Manim has no explicit z; order of addition
@@ -146,6 +162,7 @@ impl Mobject {
             opacity: 1.0,
             label: None,
             kind: NodeKind::Unknown,
+            local_bounds: None,
             children: Vec::new(),
             parent: None,
             z: 0,
@@ -168,6 +185,16 @@ impl Mobject {
 
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
+        self.dirty.semantic = true;
+        self
+    }
+
+    /// Declare the extent of an object that has no point array.
+    ///
+    /// See [`Mobject::local_bounds`] for what this is for and why it never
+    /// overrides a node whose points can answer.
+    pub fn with_local_bounds(mut self, bounds: Rect) -> Self {
+        self.local_bounds = Some(bounds);
         self.dirty.semantic = true;
         self
     }
@@ -248,15 +275,34 @@ impl Mobject {
     ///   control points and not the sampled curve. A cusped cubic whose control
     ///   points reach far outside its endpoints has its critical point between
     ///   those endpoints. See [`rustim_math::bezier::anchors`].
-    /// - It sees **world** coordinates. Manim's mobjects store world points, so the
-    ///   question does not arise there; here the transform is deferred, and the
-    ///   point of this method existing on the mobject rather than on the point array
-    ///   is that it materialises first. Callers must not pre-transform and pass the
-    ///   result in as well.
+    /// - It answers in the **parent's** space, not world space. The transform is
+    ///   deferred, and the point of this method existing on the mobject rather
+    ///   than on the point array is that it materialises through
+    ///   [`Mobject::transform`] first; it stops there. A caller that needs a
+    ///   world point folds in [`SceneTree::parent_transform`] itself (that is
+    ///   what `ops::Rotate` does), and a caller must not pre-transform and pass
+    ///   the result in as well.
+    ///
+    /// An object with no points but with [`Mobject::local_bounds`] — text, a
+    /// formula's container — answers from the transformed box instead. The four
+    /// corners go through the same per-axis min/midpoint/max rule, so `(0, 1)`
+    /// is the top edge's horizontal midpoint rather than a corner.
     ///
     /// `None` when the point array is not a whole number of curves — a mobject
     /// mid-construction. Manim raises there; this reports it.
     pub fn critical_point(&self, direction: (f64, f64)) -> Option<Point> {
+        if self.points.is_empty()
+            && let Some(bounds) = self.local_bounds
+        {
+            let b = self.transform.transform_rect_bbox(bounds);
+            let corners = [
+                Point::new(b.x0, b.y0),
+                Point::new(b.x1, b.y0),
+                Point::new(b.x1, b.y1),
+                Point::new(b.x0, b.y1),
+            ];
+            return Some(bezier::critical_point(&corners, direction));
+        }
         let world = self.materialize();
         bezier::anchors(&world).map(|anchors| bezier::critical_point(&anchors, direction))
     }
@@ -440,12 +486,24 @@ impl SceneTree {
     /// reason: they are what the point array is *about*, and sampling the curves
     /// would make the answer depend on a flattening tolerance.
     ///
-    /// `None` when the id is unknown or the point array is empty. This is the
-    /// primitive `rustim-app`'s `fit_and_centre` used to hand-roll, and what the
-    /// accessibility layer measures a node's on-screen rectangle from — sizes are
-    /// read off materialised geometry, never off the shape parameters, which are
-    /// not stored on the mobject in the first place.
+    /// `None` when the id is unknown or the point array is empty — unless the
+    /// mobject declared [`Mobject::local_bounds`], in which case that box is
+    /// projected like any shape. The fallback applies only to point-less nodes:
+    /// a node with points answers from them, and a malformed array still returns
+    /// `None` rather than being papered over with a rectangle.
+    ///
+    /// This is the primitive `rustim-app`'s `fit_and_centre` used to hand-roll,
+    /// and what the accessibility layer measures a node's on-screen rectangle
+    /// from — sizes are read off materialised geometry, never off the shape
+    /// parameters, which are not stored on the mobject in the first place.
     pub fn world_bounds(&self, id: NodeId) -> Option<Rect> {
+        let m = self.nodes.get(id)?;
+        if m.points.is_empty()
+            && let Some(bounds) = m.local_bounds
+        {
+            let t = self.parent_transform(id) * m.transform;
+            return Some(t.transform_rect_bbox(bounds));
+        }
         bezier::bounds_of(&self.world_anchors(id)?)
     }
 
@@ -1136,5 +1194,87 @@ mod tests {
             pts.last(),
             "a closed corner path returns to where it started"
         );
+    }
+
+    /// `local_bounds` is a fallback, not an override: a node with points answers
+    /// from its points even when a rectangle is also present.
+    ///
+    /// Without this rule the field would be a way to silently change the bounds
+    /// of every existing shape, and the "bounds run on materialised geometry"
+    /// contract would have an exception nobody could see.
+    #[test]
+    fn local_bounds_never_overrides_a_point_array() {
+        let mut tree = SceneTree::new();
+        let plain = tree.insert(Mobject::new(crate::shapes::square(2.0, 2.0)));
+        let with_bounds = tree.insert(
+            Mobject::new(crate::shapes::square(2.0, 2.0))
+                .with_local_bounds(Rect::new(-100.0, -100.0, 100.0, 100.0)),
+        );
+
+        assert_eq!(tree.world_bounds(plain), tree.world_bounds(with_bounds));
+        assert_eq!(
+            tree.get(plain).unwrap().critical_point((1.0, 1.0)),
+            tree.get(with_bounds).unwrap().critical_point((1.0, 1.0)),
+            "the box must not be consulted while there are points"
+        );
+    }
+
+    /// A malformed array is still `None`; the rectangle does not paper over it.
+    #[test]
+    fn local_bounds_does_not_rescue_a_ragged_point_array() {
+        let mut tree = SceneTree::new();
+        let id = tree.insert(
+            Mobject::new(vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)])
+                .with_local_bounds(Rect::new(0.0, 0.0, 1.0, 1.0)),
+        );
+        assert_eq!(tree.world_bounds(id), None);
+    }
+
+    /// A point-less object — text, a formula container — answers from its box,
+    /// through its own transform, in the same parent space as a point array.
+    #[test]
+    fn a_pointless_mobject_answers_from_its_local_bounds() {
+        let mut m = Mobject::new(Vec::new()).with_local_bounds(Rect::new(-1.0, -0.5, 1.0, 0.5));
+        m.transform = Affine2::translate((3.0, 4.0)) * Affine2::rotate(90.0_f64.to_radians());
+
+        // The box is 2 wide and 1 tall in local space; a quarter turn swaps that,
+        // so the world extent is 1 wide and 2 tall around (3, 4).
+        let eps = 1e-12;
+        let top = m.critical_point((0.0, 1.0)).unwrap();
+        assert!(
+            (top.x - 3.0).abs() < eps,
+            "top edge is horizontally centred"
+        );
+        assert!((top.y - 5.0).abs() < eps);
+        let right = m.critical_point((1.0, 0.0)).unwrap();
+        assert!((right.x - 3.5).abs() < eps);
+        assert!(
+            (right.y - 4.0).abs() < eps,
+            "right edge is vertically centred"
+        );
+        let centre = m.critical_point((0.0, 0.0)).unwrap();
+        assert!((centre.x - 3.0).abs() < eps);
+        assert!((centre.y - 4.0).abs() < eps);
+    }
+
+    /// `world_bounds` folds the ancestors in for a box exactly as it does for
+    /// points. A nested text object must move with its group.
+    #[test]
+    fn nested_local_bounds_pick_up_the_ancestor_transform() {
+        let mut tree = SceneTree::new();
+        let parent = tree.insert({
+            let mut m = Mobject::new(Vec::new()).with_kind(NodeKind::Group);
+            m.transform = Affine2::translate((2.0, 0.0));
+            m
+        });
+        let text = tree.insert(
+            Mobject::new(Vec::new())
+                .with_kind(NodeKind::Text)
+                .with_local_bounds(Rect::new(0.0, 0.0, 2.0, 1.0)),
+        );
+        assert!(tree.reparent(text, parent));
+
+        let b = tree.world_bounds(text).unwrap();
+        assert_eq!((b.x0, b.y0, b.x1, b.y1), (2.0, 0.0, 4.0, 1.0));
     }
 }

@@ -55,7 +55,7 @@
 //! absorbed.
 
 use rustim_color::Srgb;
-use rustim_math::Affine2;
+use rustim_math::{Affine2, Rect};
 use rustim_render::{DrawList, DrawOp};
 use rustim_text::ShapedText;
 
@@ -72,6 +72,25 @@ use rustim_text::ShapedText;
 pub fn layout_to_local(width: f32, height: f32) -> Affine2 {
     Affine2::translate((-f64::from(width) / 2.0, f64::from(height) / 2.0))
         * Affine2::scale_non_uniform(1.0, -1.0)
+}
+
+/// A shaped block's extent in its own local space.
+///
+/// This is the box [`layout_to_local`] centres on the origin, in world units —
+/// **not** the glyphs' ink box. A descender, an italic overhang or a combining
+/// mark can reach outside it, exactly as they can reach outside a font's line
+/// box; that is what a layout box means, and it is the box a glyph run is placed
+/// by. Measuring ink instead would need a per-run outline walk and would make
+/// the accessibility bounds disagree with where the run was actually drawn.
+///
+/// `None` for a block with no extent: an empty string has nothing to frame, and
+/// a zero-area bounds would be a focus target with no size.
+pub fn local_bounds(shaped: &ShapedText) -> Option<Rect> {
+    let (w, h) = (f64::from(shaped.width), f64::from(shaped.height));
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    Some(Rect::new(-w / 2.0, -h / 2.0, w / 2.0, h / 2.0))
 }
 
 /// The ops that draw one shaped block, centred on the origin of its own frame.
