@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-A Cargo workspace at the repository root, plus three documents and one directory of throwaway probes.
+A Cargo workspace at the repository root, plus four documents and one directory of throwaway probes.
 
-**Read the documents in this order:**
+**Read the design documents in this order:**
 
 1. `方案建议.md` — **the primary document.** The commissioned research and proposal: measured Manim
    internals (with `file:line` evidence), Rust crate/version selections, the recommended
@@ -18,6 +18,13 @@ A Cargo workspace at the repository root, plus three documents and one directory
    sketches for a deliberately minimal ~800-line version.
 3. `需求探讨.txt` — the original design rationale: why Rust, why this is an architecture change
    rather than a translation, and three candidate technical routes with cost/benefit.
+
+`使用说明.md` is the fourth: the **user-facing manual**, for someone driving the binary rather than
+changing it — the scene list, the mouse and keyboard map, the headless flags, the JSON command
+vocabulary with examples, export, the browser demo, and troubleshooting. It is not required reading
+for engine work, and this file is the development reference. The two must be edited together when a
+flag, a wire field or a key binding changes: a stale manual is a user-facing wrong answer, and nothing
+in CI reads it.
 
 The tutorial's code blocks are **illustrative sketches, not compilable code**; the workspace does not
 follow its flat `src/` module layout. See "Where the workspace diverges from the tutorial" below.
