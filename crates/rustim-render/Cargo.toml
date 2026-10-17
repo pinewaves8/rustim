@@ -6,6 +6,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# §10.6's second day-one Web guard, as a cargo feature rather than a promise.
+# The parallel rasteriser is the right default for a desktop host and the wrong
+# thing inside a browser: `vello_cpu/multithreading` pulls rayon and
+# `thread_local`, which on `wasm32-unknown-unknown` has no threads to spread
+# work over. A host that wants single-threaded rasterisation depends on this
+# crate with `default-features = false`.
+default = ["multithreading"]
+multithreading = ["vello_cpu/multithreading"]
+
 [dependencies]
 rustim-math.workspace = true
 rustim-color.workspace = true
@@ -17,6 +27,6 @@ vello_common.workspace = true
 # face index — with no rasteriser and no platform code, so naming it here does
 # not widen this crate's surface.
 peniko.workspace = true
-vello_cpu = { workspace = true, features = ["multithreading"] }
+vello_cpu.workspace = true
 bytemuck = "1"
 thiserror = "2"

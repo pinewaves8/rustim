@@ -9,7 +9,11 @@ license.workspace = true
 [dependencies]
 rustim-math.workspace = true
 rustim-color.workspace = true
-rustim-render.workspace = true
+# The minimum: this crate only needs the `DrawList`/`Damage` types. A host that
+# wants the parallel rasteriser (the desktop app does) enables `rustim-render`'s
+# default features on its own edge; a browser host does not, which is how the
+# wasm build keeps rayon out.
+rustim-render = { workspace = true, default-features = false }
 rustim-mobject.workspace = true
 rustim-anim.workspace = true
 serde = { version = "1", features = ["derive"] }

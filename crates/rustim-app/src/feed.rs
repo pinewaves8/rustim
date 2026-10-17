@@ -48,7 +48,7 @@
 use std::io::{self, BufRead, Write};
 
 use rustim_anim::Rate;
-use rustim_scene::command::{AnimationKind, Command, CommandError, CommandReply, StateDiff};
+use rustim_scene::command::AnimationKind;
 use rustim_scene::{Scene, SceneContext};
 
 use crate::AppEvent;
@@ -82,36 +82,11 @@ impl Counts {
     }
 }
 
-/// One line of the feed, as the parser sees it.
-///
-/// `None` means the line carried nothing — blank or whitespace — which is a
-/// *skip*, not a refusal: a session log with paragraph breaks in it is still a
-/// well-formed session log. Everything else is either a command or the reason
-/// there is not one, and the reason is a [`CommandError`] rather than a panic,
-/// because the text comes from a language model.
-pub fn parse_command(line: &str) -> Option<Result<Command, CommandError>> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-    Some(
-        serde_json::from_str(line).map_err(|e| CommandError::Unparseable {
-            detail: e.to_string(),
-        }),
-    )
-}
-
-/// One reply line, without its newline.
-pub fn reply_line(seq: u64, outcome: Result<StateDiff, CommandError>) -> String {
-    let reply = match outcome {
-        Ok(diff) => CommandReply::applied(seq, diff),
-        Err(error) => CommandReply::refused(seq, error),
-    };
-    // A reply is built from types that already round-trip, so this cannot fail
-    // for a reason the caller could act on; a `Result` here would only push the
-    // same `unwrap` up a level.
-    serde_json::to_string(&reply).expect("a reply is serialisable by construction")
-}
+// The parser and the reply writer are protocol, not transport — the browser
+// host applies the same lines through `rustim-web` — so they moved down into
+// `rustim_scene::command`. Re-exported here because the app's own call sites
+// and tests read them through the feed module.
+pub use rustim_scene::command::{parse_command, reply_line};
 
 /// Apply every line of the feed, in order, and answer each one.
 ///
@@ -290,6 +265,9 @@ pub fn rate_names() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests name the protocol values directly; the transport itself
+    // passes them through `SceneContext::handle`.
+    use rustim_scene::command::{Command, CommandError, CommandReply, StateDiff};
 
     /// A scene that remembers what it was told, so the hook can be tested
     /// without a window and without a renderer.

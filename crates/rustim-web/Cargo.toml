@@ -1,0 +1,56 @@
+[package]
+name = "rustim-web"
+description = "The browser host: a scene rendered into a canvas, its semantics projected into DOM/ARIA."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# `cdylib` for the wasm artifact, `rlib` so the session core — which is target
+# independent — is unit-tested natively like every other crate in the workspace.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# A second artifact, not a runtime switch: this is what makes Typst's wasm cost
+# measurable rather than a guess, and it keeps the formula page's download off
+# the plain demo's critical path.
+formula = ["dep:rustim-text"]
+
+[dependencies]
+rustim-math.workspace = true
+rustim-anim.workspace = true
+rustim-scene.workspace = true
+# Single-threaded on purpose — see `rustim-render`'s feature list. A browser has
+# no threads here to spread rasterisation over, and `multithreading` would pull
+# rayon and `thread_local` into the artifact for nothing.
+rustim-render = { workspace = true, default-features = false }
+# The scene both hosts run. Sharing the construction is what lets the canvas be
+# compared to the desktop golden at all.
+rustim-scenes.workspace = true
+rustim-text = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Pinned to the installed CLI (`wasm-bindgen --version` == 0.2.100): the glue
+# the CLI generates and the crate that describes the ABI must be the same
+# release, or the generated JS refuses the module at load time. `web-sys 0.3.77`
+# is the release whose own manifest pins exactly this pair.
+wasm-bindgen = "=0.2.100"
+js-sys = "=0.3.77"
+web-sys = { version = "=0.3.77", features = [
+    "CanvasRenderingContext2d",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "ImageData",
+    "Performance",
+    "Window",
+] }
+
+[dev-dependencies]
+# The golden comparison: a session's pixels are checked against the same
+# baseline the desktop binary renders, with the same comparator.
+rustim-export.workspace = true
+serde_json.workspace = true

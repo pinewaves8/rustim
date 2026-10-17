@@ -285,15 +285,14 @@ pub enum CommandError {
         detail: String,
     },
     /// The request was not a command at all — whoever read the wire could not
-    /// turn it into one, and the transport's parser says why.
+    /// turn it into one, and [`parse_command`] says why.
     ///
-    /// **Nothing here constructs it.** `apply` never sees text, and this crate
-    /// has no JSON parser on purpose (it compiles to wasm and the browser build
-    /// reaches the engine through the same commands, from a host that does own
-    /// one). It is part of *this* vocabulary anyway, because a host reading a
-    /// reply stream has to tell "the engine refused what I asked for" from "the
-    /// engine could not read what I sent" — and one error type on the wire is
-    /// simpler for that host than two.
+    /// `apply` never sees text: it receives values. The parser that produces
+    /// this variant sits beside it in *this* crate rather than in each host's
+    /// transport, because "a blank line is a skip and bad JSON is a refusal" is
+    /// protocol, and the desktop feed and the browser build must not answer it
+    /// differently. `serde_json` is a pure parser with no I/O, so it costs the
+    /// wasm build nothing a `Command` was not already using.
     Unparseable {
         detail: String,
     },
@@ -378,6 +377,42 @@ impl CommandReply {
             error: Some(error),
         }
     }
+}
+
+/// One line of a command feed, as the parser sees it.
+///
+/// `None` means the line carried nothing — blank or whitespace — which is a
+/// *skip*, not a refusal: a session log with paragraph breaks in it is still a
+/// well-formed session log. Everything else is either a command or the reason
+/// there is not one, and the reason is a [`CommandError`] rather than a panic,
+/// because the text comes from a language model.
+///
+/// This lives here rather than with the feed's transport because it is protocol,
+/// not I/O: the browser host applies the same lines from `rustim-web`, and a
+/// second copy of the "blank is a skip, bad JSON is a refusal" rule would be a
+/// second answer to what a line means.
+pub fn parse_command(line: &str) -> Option<Result<Command, CommandError>> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(
+        serde_json::from_str(line).map_err(|e| CommandError::Unparseable {
+            detail: e.to_string(),
+        }),
+    )
+}
+
+/// One reply line, without its newline.
+pub fn reply_line(seq: u64, outcome: Result<StateDiff, CommandError>) -> String {
+    let reply = match outcome {
+        Ok(diff) => CommandReply::applied(seq, diff),
+        Err(error) => CommandReply::refused(seq, error),
+    };
+    // A reply is built from types that already round-trip, so this cannot fail
+    // for a reason the caller could act on; a `Result` here would only push the
+    // same `unwrap` up a level.
+    serde_json::to_string(&reply).expect("a reply is serialisable by construction")
 }
 
 /// Apply a command to the tree.
@@ -2459,5 +2494,53 @@ mod tests {
                 "{bad} must be refused"
             );
         }
+    }
+
+    /// A line that carries nothing is skipped; a line that is not a command is a
+    /// refusal, not an error and definitely not a panic. Both hosts — the desktop
+    /// feed and the browser — read this answer from here.
+    #[test]
+    fn a_blank_line_is_a_skip_and_bad_json_is_a_refusal() {
+        for blank in ["", "   ", "\t", " \r\n "] {
+            assert!(parse_command(blank).is_none(), "{blank:?} must be a skip");
+        }
+
+        let parsed = parse_command(r#"{"action":"add","type":"circle","params":{"radius":1}}"#)
+            .expect("a non-blank line is something");
+        assert!(matches!(parsed, Ok(Command::Add { .. })));
+
+        let refused = parse_command("{").expect("a broken line is something");
+        assert!(matches!(refused, Err(CommandError::Unparseable { .. })));
+        // Surrounding whitespace is the transport's, not the protocol's: a line
+        // pasted from a log with a trailing newline still parses.
+        assert!(
+            parse_command("  {\"action\":\"remove\",\"target\":1}  \n")
+                .unwrap()
+                .is_ok(),
+            "whitespace around a command must not change what it is"
+        );
+    }
+
+    /// The presence of `diff` or `error` is the discriminant; the other field is
+    /// omitted, never written as null.
+    #[test]
+    fn a_reply_carries_exactly_one_of_diff_and_error() {
+        let applied: serde_json::Value =
+            serde_json::from_str(&reply_line(3, Ok(StateDiff::default()))).unwrap();
+        assert_eq!(applied["seq"], 3);
+        assert!(applied.get("diff").is_some());
+        assert!(applied.get("error").is_none());
+
+        let refused: serde_json::Value = serde_json::from_str(&reply_line(
+            4,
+            Err(CommandError::Unparseable {
+                detail: "expected value".to_owned(),
+            }),
+        ))
+        .unwrap();
+        assert_eq!(refused["seq"], 4);
+        assert!(refused.get("error").is_some());
+        assert!(refused.get("diff").is_none());
+        assert_eq!(refused["error"]["error"], "unparseable");
     }
 }

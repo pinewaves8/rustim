@@ -46,22 +46,10 @@ pub fn write_png<R: Renderer + ?Sized>(r: &R, path: impl AsRef<Path>) -> std::io
 
 /// Un-premultiply an RGBA8 frame.
 ///
-/// `a == 0` is left as it is (there is no colour to recover), and `a == 255` is
-/// copied without arithmetic, which is the whole frame in practice.
-pub fn straight_rgba(premultiplied: &[u8]) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(premultiplied.len());
-    for px in premultiplied.as_chunks::<4>().0 {
-        let a = px[3];
-        if a == 0 || a == 255 {
-            rgba.extend_from_slice(px);
-        } else {
-            let un =
-                |c: u8| ((u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8;
-            rgba.extend_from_slice(&[un(px[0]), un(px[1]), un(px[2]), a]);
-        }
-    }
-    rgba
-}
+/// Re-exported from `rustim-render`, where the rule lives beside
+/// [`Renderer::pixels`](rustim_render::Renderer::pixels): the browser canvas and
+/// the PNG encoder need the same conversion, and neither should own it.
+pub use rustim_render::straight_rgba;
 
 /// Encode one already-straight RGBA8 frame as a PNG.
 ///

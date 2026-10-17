@@ -106,9 +106,62 @@ pub trait Renderer {
     fn pixels(&self) -> &[u8];
 }
 
+/// Un-premultiply an RGBA8 frame into a new buffer.
+///
+/// The conversion lives beside [`Renderer::pixels`] because it is a property of
+/// *that* format, not of any particular consumer — the PNG encoder and the
+/// browser canvas both need straight alpha and neither should own the rule.
+/// `a == 0` is left as it is (there is no colour to recover), and `a == 255` is
+/// copied without arithmetic, which is the whole frame in practice.
+pub fn straight_rgba(premultiplied: &[u8]) -> Vec<u8> {
+    let mut rgba = premultiplied.to_vec();
+    straight_rgba_in_place(&mut rgba);
+    rgba
+}
+
+/// [`straight_rgba`] without the allocation, for a buffer a host reuses.
+///
+/// The browser needs this shape: a 1280x720 frame is 3.7 MB, and allocating one
+/// per presented frame at 60 fps is pure churn when the destination buffer is
+/// the same size every time.
+pub fn straight_rgba_in_place(rgba: &mut [u8]) {
+    for px in rgba.as_chunks_mut::<4>().0 {
+        let a = px[3];
+        if a == 0 || a == 255 {
+            continue;
+        }
+        let un = |c: u8| ((u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8;
+        px[0] = un(px[0]);
+        px[1] = un(px[1]);
+        px[2] = un(px[2]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The canvas and the PNG encoder both depend on this conversion, so it is
+    /// pinned here rather than only where it is consumed: a half-covered pixel
+    /// recovers its colour, a fully transparent one is left alone (there is
+    /// nothing to recover), and an opaque one is untouched by definition.
+    #[test]
+    fn straight_alpha_recovers_the_colour() {
+        let mut px = vec![
+            64, 32, 0, 128, // premultiplied half-coverage -> straight (128, 64, 0)
+            10, 20, 30, 0, // transparent: unchanged
+            1, 2, 3, 255, // opaque: unchanged
+        ];
+        straight_rgba_in_place(&mut px);
+        assert_eq!(px, vec![128, 64, 0, 128, 10, 20, 30, 0, 1, 2, 3, 255]);
+        // And the allocating wrapper is the same function: applying it twice is
+        // *not* idempotent (the output is straight, not premultiplied), which is
+        // exactly why the two entry points are named for their input.
+        assert_eq!(
+            straight_rgba(&[64, 32, 0, 128, 1, 2, 3, 255]),
+            vec![128, 64, 0, 128, 1, 2, 3, 255]
+        );
+    }
 
     #[test]
     fn cpu_backend_renders_a_background() {

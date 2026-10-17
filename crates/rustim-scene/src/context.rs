@@ -435,12 +435,12 @@ impl SceneContext {
     /// layer does — see `rustim-app::a11y` for the volume at which that stops
     /// being true.
     ///
-    /// There is deliberately no `..._json` sibling here. `serde_json` is a test
-    /// dependency everywhere in this workspace so that it cannot reach the
-    /// `wasm32-unknown-unknown` kernel build, and this is a kernel crate; a host
-    /// that wants JSON calls `serde_json::to_string(&ctx.semantic_tree(None))` on
-    /// its own side of the boundary. That works because [`a11y::SemanticTree`] is
-    /// derived data with no platform types in it.
+    /// There is deliberately no `..._json` sibling here: a host calls
+    /// `serde_json::to_string(&ctx.semantic_tree(None))` on its own side, which
+    /// works because [`a11y::SemanticTree`] is derived data with no platform
+    /// types in it. (`serde_json` is a real dependency of this crate — the
+    /// protocol's line parser lives in [`crate::command`] — but the projection
+    /// itself does not own a JSON spelling.)
     pub fn semantic_tree(&self, live: Option<String>) -> a11y::SemanticTree {
         a11y::build(&self.tree, &self.viewport, live)
     }
