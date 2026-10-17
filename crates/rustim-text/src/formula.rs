@@ -203,6 +203,37 @@
 //! a fraction bar out of the spoken tree wants a `decorative` flag on `Mobject`
 //! that this step did not add. See the field's doc.
 //!
+//! # Structure: MathML, from the compiler's own IR
+//!
+//! A glyph tree says *where the symbols are*, and the relation between them
+//! lives only in the layout: `x^2 + y^2` and `x2 + y2` draw the same five
+//! symbols in different places, and no geometry heuristic recovers "the 2 is an
+//! exponent" reliably. Typst knows, because its math IR is built *after*
+//! scripts, fractions, fences and radicals are recognised. So the same fragment
+//! is compiled a second time against Typst's **HTML** target, whose exporter
+//! lowers that IR to MathML, and the `<math>` element is carried on the formula's
+//! root mobject ([`Mobject::mathml`]).
+//!
+//! Three properties of the route are worth knowing:
+//!
+//! - **It is a second `Library`, not a second compiler.** `compile::<HtmlDocument>`
+//!   refuses to run unless Typst's in-development `Feature::Html` is enabled, and
+//!   the paged compile has no reason to know the feature exists. Both libraries
+//!   come from [`LibraryExt::builder`], which is the same `ROUTINES` table the
+//!   facade's `Library::default()` uses, so they cannot disagree about the
+//!   language. `typst-html` is already in the graph through the facade; naming it
+//!   directly buys the API without adding a compiler.
+//! - **The MathML is Typst's, verbatim.** In particular `mi` holds the
+//!   *typeset* character, so a math `x` arrives as U+1D465 `𝑥` — the
+//!   mathematical italic — where the per-glyph label keeps the author's `x`. That
+//!   asymmetry is deliberate: the element is what a MathML renderer draws and a
+//!   reader recognises, the label is what the AI layer matches a command against,
+//!   and rewriting the element's text would mean owning a Unicode mapping table.
+//! - **A failed HTML pass is not a failed formula.** The geometry is the primary
+//!   product; a missing structured reading is a gap in what a reader can *hear*,
+//!   so the field is `None` rather than an error that would refuse to draw a
+//!   formula which is on screen.
+//!
 //! # What is still not implemented, and is reported rather than dropped
 //!
 //! Anything else that is neither a glyph outline nor a stroke-to-fill rule is
@@ -426,6 +457,16 @@ impl Formula {
         }
     }
 
+    /// The formula's structure as a `<math>` element, if it could be produced.
+    ///
+    /// Read through the root mobject: the structure travels with the object, so
+    /// a formula that has been inserted into a tree — and therefore copied,
+    /// morphed, re-parented or snapshotted — does not depend on the `Formula`
+    /// value that built it still being alive. See [`Mobject::mathml`].
+    pub fn mathml(&self) -> Option<&str> {
+        self.root.mathml.as_deref()
+    }
+
     /// The union of everything the formula draws, in its local space.
     pub fn local_bounds(&self) -> Option<rustim_math::Rect> {
         let mut bounds: Option<rustim_math::Rect> = None;
@@ -460,6 +501,15 @@ impl Formula {
 /// seen. One per scene, or one per host process.
 pub struct FormulaCompiler {
     library: LazyHash<Library>,
+    /// The same library with Typst's in-development **HTML** feature enabled,
+    /// for the MathML pass.
+    ///
+    /// A second `Library` rather than one with the feature on, because
+    /// `typst::compile::<HtmlDocument>` refuses to run unless `Feature::Html` is
+    /// on and the paged compile has no reason to know the feature exists. Both
+    /// libraries are built from the same private `ROUTINES` table — that is what
+    /// `Library::builder()` is for — so they cannot disagree about the language.
+    html_library: LazyHash<Library>,
     book: LazyHash<FontBook>,
     /// The book's index is this vector's index — `FontBook::from_fonts` pushes
     /// `FontInfo`s in iteration order, so `World::font(index)` and
@@ -525,6 +575,11 @@ impl FormulaCompiler {
 
         Ok(Self {
             library: LazyHash::new(Library::default()),
+            html_library: LazyHash::new(
+                Library::builder()
+                    .with_features(typst::Features::from_iter([typst::Feature::Html]))
+                    .build(),
+            ),
             book: LazyHash::new(FontBook::from_fonts(&fonts)),
             fonts,
             outlines: HashMap::new(),
@@ -724,12 +779,79 @@ impl FormulaCompiler {
             .map(|points| Mobject::new(points.iter().map(|p| place * *p).collect()))
             .collect();
 
+        // The structure, from the same body through a second compile. After the
+        // paged one because a fragment that does not compile has no structure to
+        // report, and the geometry is the primary product.
+        let mathml = self.mathml(body);
+
         Ok(Formula {
-            root: Mobject::new(Vec::new()).with_kind(NodeKind::Formula),
+            root: {
+                let mut root = Mobject::new(Vec::new()).with_kind(NodeKind::Formula);
+                if let Some(mathml) = mathml {
+                    root = root.with_mathml(mathml);
+                }
+                root
+            },
             glyphs,
             rules,
             skipped_shapes: extracted.skipped_shapes,
         })
+    }
+
+    /// The fragment's structure as a `<math>` element, or `None`.
+    ///
+    /// # Why a second compile
+    ///
+    /// The paged route has already gathered every glyph *outline* — but an
+    /// outline is where a symbol is, not what it is doing there. "x, 2, +, y, 2"
+    /// is the same five glyphs for `x^2 + y^2` and for `x2 + y2`, and an
+    /// accessibility tree built from the frame alone can only ever say the
+    /// former. Typst's HTML exporter lowers the resolved math IR — the tree
+    /// *after* scripts, fractions, fences and radicals have been recognized —
+    /// into MathML, so the structure is the compiler's answer rather than a
+    /// geometry heuristic of ours.
+    ///
+    /// `None` rather than an error when the HTML pass fails, because the formula
+    /// still draws: a missing structured reading is a gap in what a reader can
+    /// **hear**, not in what the frame shows, and turning it into a
+    /// [`FormulaError`] would refuse to draw a formula that is on screen. The
+    /// caller can tell the two states apart — [`Formula::mathml`] is `Some` in
+    /// the working case.
+    ///
+    /// # Why the output is sliced rather than serialised directly
+    ///
+    /// `html()` encodes the *document* — `<html><head>` with Typst's MathML
+    /// stylesheet, then `<body><p><math>…</math></p>` — and the element is what
+    /// a caller wants. Typst offers no public "encode one element" entry point
+    /// that does not first require a `LateLinkResolver` handle this crate would
+    /// have to track by hand. Slicing is safe because the encoder escapes `<` in
+    /// text content: no string *inside* the document can spell `<math`, and
+    /// MathML does not nest a `<math>` inside another, so the first `<math` and
+    /// the first `</math>` after it bound exactly one element.
+    fn mathml(&self, body: &str) -> Option<String> {
+        // The same `$…$` body as the paged pass, and nothing else: an HTML
+        // document has no page to set up, and the size does not affect
+        // structure, so a second prologue would only be a second place the two
+        // passes could disagree.
+        let source_text = format!("${body}$");
+        let id = self.file_id();
+        let source = Source::new(id, source_text);
+        let document = {
+            let world = FormulaWorld {
+                library: &self.html_library,
+                book: &self.book,
+                fonts: &self.fonts,
+                source,
+            };
+            typst::compile::<typst_html::HtmlDocument>(&world)
+                .output
+                .ok()?
+        };
+        let encoded =
+            typst_html::html(&document, &typst_html::HtmlOptions { pretty: false }).ok()?;
+        let start = encoded.find("<math")?;
+        let end = encoded[start..].find("</math>")? + start + "</math>".len();
+        Some(encoded[start..end].to_owned())
     }
 
     /// The font-space outline of one glyph, from the cache or from the face.
@@ -1396,6 +1518,71 @@ mod tests {
         // the rule count is about geometry, not about how the source is written.
         let accented = compiler.compile("hat(x)").expect("compiles");
         assert!(accented.rules.is_empty());
+    }
+
+    /// The structure survives the trip: a script is an `msup`, a fraction is an
+    /// `mfrac`, and both are *elements*, not a rendering hint.
+    ///
+    /// This is the assertion the whole item exists for. A glyph tree can say
+    /// "x, 2, +, y, 2" for `x^2 + y^2`; only the MathML says the 2 is an
+    /// exponent. Measured rather than assumed — the tags below are Typst's own
+    /// output, not a shape this crate constructs.
+    #[test]
+    fn a_formula_carries_its_structure_as_mathml() {
+        let mut compiler = compiler();
+        let formula = compiler.compile("x^2 + frac(1, 2)").expect("compiles");
+        let mathml = formula.mathml().expect("a compiled formula has structure");
+
+        assert!(mathml.starts_with("<math>"), "{mathml}");
+        assert!(mathml.ends_with("</math>"), "{mathml}");
+        assert!(
+            mathml.contains("<msup>"),
+            "the exponent is not a script: {mathml}"
+        );
+        assert!(
+            mathml.contains("<mfrac>"),
+            "the fraction is not a fraction: {mathml}"
+        );
+        // And nothing outside the element leaked in: the document's stylesheet
+        // and its `<body>` wrapper are the slicing's job to drop.
+        assert!(!mathml.contains("<style"), "{mathml}");
+        assert!(!mathml.contains("<body"), "{mathml}");
+    }
+
+    /// The structure travels with the object, so a formula that has been
+    /// inserted — the only form the a11y tree can see — still has it.
+    #[test]
+    fn the_structure_travels_with_the_inserted_root() {
+        let mut compiler = compiler();
+        let formula = compiler.compile("sqrt(2)").expect("compiles");
+        let expected = formula.mathml().expect("has structure").to_owned();
+        assert!(expected.contains("<msqrt>"), "{expected}");
+
+        let mut tree = SceneTree::new();
+        let nodes = formula.insert(&mut tree);
+        assert_eq!(
+            tree.get(nodes.root).and_then(|m| m.mathml.as_deref()),
+            Some(expected.as_str()),
+            "the root lost its structure on the way into the tree",
+        );
+    }
+
+    /// A glyph's own name and the formula's structure are different facts, and
+    /// the engine keeps both: the label is what `--inspect` names a symbol with,
+    /// the MathML is what the expression means.
+    #[test]
+    fn the_mathml_is_not_the_labels_and_not_a_substitute_for_them() {
+        let mut compiler = compiler();
+        let formula = compiler.compile("x^2 + y").expect("compiles");
+        let mathml = formula.mathml().expect("has structure");
+        // The typeset character is the mathematical italic, which is what Typst
+        // emits into `mi`; the labels keep the author's spelling. That asymmetry
+        // is deliberate and this test says so.
+        assert!(mathml.contains('\u{1d465}'), "{mathml}");
+        assert!(
+            formula.glyphs.iter().any(|g| g.text == "x"),
+            "no glyph keeps the author's spelling",
+        );
     }
 
     fn bounds_of(points: &[Point]) -> (f64, f64, f64, f64) {

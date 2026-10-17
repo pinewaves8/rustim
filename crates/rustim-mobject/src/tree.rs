@@ -119,6 +119,27 @@ pub struct Mobject {
     /// Human-readable name. The accessibility layer reads this; the AI layer
     /// may address the node by it as an alternative to the opaque id.
     pub label: Option<String>,
+    /// The object's structure as MathML, for an object whose picture is a
+    /// *formula* rather than a shape.
+    ///
+    /// A formula is a glyph tree: the symbols are objects, but the relation
+    /// between them — what is an exponent, what is a numerator — lives only in
+    /// how they are laid out. A reader walking the glyphs is told "x, 2, +, y, 2"
+    /// and has not been told "x squared plus y squared", and no amount of
+    /// measuring the geometry recovers the difference. So the compiler hands the
+    /// structure over as a `<math>` element, and this field carries it from
+    /// `rustim-text` to the two consumers that can use it: the accessibility
+    /// tree (`SemanticNode::mathml`, where a DOM/ARIA target emits it and an
+    /// agent sees it in `--inspect`) and any host that wants to know what a
+    /// formula means without re-parsing its source.
+    ///
+    /// It is **not** drawn, not derived from points, and not a label: the label
+    /// is one symbol's name, this is the whole expression's structure. `None` for
+    /// every object that is not a formula, and for a formula whose MathML could
+    /// not be produced — see `rustim_text::formula::Formula::mathml`.
+    ///
+    /// `Mobject` is not `Serialize`, so this field changes no wire JSON.
+    pub mathml: Option<String>,
     /// What this object *is*. See [`crate::kind::NodeKind`].
     ///
     /// Stored rather than derived from the point array, because the geometry is
@@ -161,6 +182,7 @@ impl Mobject {
             transform: Affine2::IDENTITY,
             opacity: 1.0,
             label: None,
+            mathml: None,
             kind: NodeKind::Unknown,
             local_bounds: None,
             children: Vec::new(),
@@ -185,6 +207,13 @@ impl Mobject {
 
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
+        self.dirty.semantic = true;
+        self
+    }
+
+    /// Carry an object's structure as MathML. See [`Mobject::mathml`].
+    pub fn with_mathml(mut self, mathml: impl Into<String>) -> Self {
+        self.mathml = Some(mathml.into());
         self.dirty.semantic = true;
         self
     }

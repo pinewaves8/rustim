@@ -74,6 +74,11 @@ accesskit_winit = "0.34.1"
 typst = "0.15.1"
 typst-layout = "0.15.1"
 typst-assets = { version = "0.15.1", features = ["fonts"] }
+# MathML (P3 step 20). `typst-html` lowers the resolved math IR to MathML; its
+# document entry point and encoder are the only public route to it. It is
+# already in the graph through the facade, so naming it directly buys the API
+# without a second compiler.
+typst-html = "0.15.1"
 
 # Test-only in the six kernel crates: used there to read the Manim fixtures
 # (`crates/rustim-math/tests/fixtures/`) and to round-trip the command layer

@@ -3224,6 +3224,7 @@ dependencies = [
  "skrifa 0.44.0",
  "typst",
  "typst-assets",
+ "typst-html",
  "typst-layout",
 ]
 

@@ -33,7 +33,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-17: **575 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-17: **581 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -96,6 +96,7 @@ cargo run -p rustim-app -- --frames 300    # run 300 frames then exit
 cargo run -p rustim-app -- --scene primitives  # ...a named scene; `--help` lists them
 cargo run -p rustim-app -- --scene text --png out.png   # CJK + Latin glyph runs
 cargo run -p rustim-app -- --scene formula --png out.png  # Typst → per-glyph outlines
+cargo run -p rustim-app -- --scene formula --inspect  # ...and each formula's MathML, in the tree
 cargo run -p rustim-app -- --scene rotate --inspect  # rotate + scale, then a FadeOut removal
 cargo run -p rustim-app -- --scene axes --png out.png  # axes, ticks, a plot and a camera beat
 cargo run -p rustim-app -- --motion reduced  # ignore the platform "reduce motion" preference
@@ -116,6 +117,7 @@ cargo test -p rustim-app --test script          # the command feed, end to end, 
 cargo test -p rustim-app --test captions        # the band is in the bottom of the still, and replays
 cargo test -p rustim-app --test speech          # --speak refuses the headless flags (no backend needed)
 cargo test -p rustim-app --test export          # the export loop, the sinks and the .srt timings
+cargo test -p rustim-app --test formula         # formula structure reaches --inspect, via the binary
 cargo test -p rustim-export --test compare_cli  # the visual-regression CLI's exit codes
 cargo test -p rustim-text --test manim_text_scale  # check the font size constant (needs no Python)
 cargo clippy --workspace --all-targets -- -D warnings
@@ -291,7 +293,7 @@ last property.
 | `rustim-color` | The 3b1b palette as `const`s | Real |
 | `rustim-mobject` | `Mobject` (points / declared `local_bounds` / style / deferred transform / `label` / `NodeKind`), `SceneTree` (with `camera`, `snapshot` / `insert_subtree` / `reorder_children`), stable `NodeId`, `Subtree`, shape builders (`square` / `circle` / `right_triangle` / `line` / `arrow` / `number_line` / `axes` / `plot`) and `AxesScale`, `critical_point`, `world_anchors` | Real |
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
-| `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler | Real |
+| `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `a11y` (the platform-neutral semantic tree) | Real |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
@@ -796,7 +798,7 @@ Three layers, and the split is the design:
 | Layer | Where | What it knows |
 |---|---|---|
 | `NodeKind` | `rustim-mobject` | What a mobject *is* (square / circle / text / …), a serde field beside `label` |
-| `SemanticTree` | `rustim-scene::a11y` | Roles, names, descriptions, screen-pixel bounds (measured, or declared for a point-less glyph tree). **No accesskit, no platform** — it compiles to wasm |
+| `SemanticTree` | `rustim-scene::a11y` | Roles, names, descriptions, screen-pixel bounds (measured, or declared for a point-less glyph tree), and a formula's `mathml`. **No accesskit, no platform** — it compiles to wasm |
 | `accesskit` | `rustim-app::a11y` | The adapter, the announcement node, action requests. The only module in the workspace that names `accesskit`; CI asserts this with `cargo tree` |
 
 The two projections share *semantic data*, not an AccessKit tree: there is no `accesskit_web`, so a
@@ -1538,9 +1540,9 @@ weeks later.
 | 4 | Text: `parley` end to end (string → glyphs → screen), bundled CJK, measured font size | done — see "Text" |
 | 5 | Formulas: Typst → per-glyph outlines via `skrifa::OutlinePen`, never `typst-render` | done — see "P1 step 5", `rustim-text::formula`, the `formula` scene |
 
-P1's deferred edges, deliberately: MathML flattening (a formula is now a glyph tree with per-symbol
-spans, so this is unblocked but unwritten) and self-voicing TTS for P5. Reduced motion was the third,
-and **P2 step 4 landed it** — one form of it, still: the platform preference is read on Linux only,
+P1's deferred edges were MathML flattening and self-voicing TTS for P5, and **both have landed** —
+TTS as P3 step 16 (see "Narration, captions and self-voicing") and the formula structure as P3 step
+20 (see "Formula structure: MathML"). Reduced motion was the third, and **P2 step 4 landed it** — one form of it, still: the platform preference is read on Linux only,
 so macOS and Windows honour `--motion reduced` and not the system setting (see "Reduced motion" in
 the timeline section for what is read and why the rest is not). The CPU cost is
 **fill-area bound, not
@@ -1637,6 +1639,44 @@ named on purpose**: a bare `cargo tree -i skrifa` reports *two* versions, becaus
 second, older `skrifa` inside Typst's own image subtree (`hayro-interpret`), which is harmless but
 reads like a mistake. Both, plus "no Typst crate reaches the kernel" and "`rustim-render` never
 depends on `rustim-text`", run as the `typst-subtree` CI job.
+
+### Formula structure: MathML
+
+The geometry is only half of a formula. A glyph tree says what is on the screen and nothing about what
+the symbols *are to each other*: `x² + 1` and `x + 1²` are the same marks in the same boxes to a point
+array, and the relation lives only in the vertical layout. A screen reader, a Web target and a host
+inspecting the scene all need the tree, so `FormulaCompiler::compile` carries Typst's own MathML beside
+the outlines: `Mobject.mathml` → `SemanticNode.mathml` → `--inspect`'s JSON.
+
+The route is a second *compile*, not a second parser. `typst-html` is the only public entry point to
+the resolved math IR — its lowering function is crate-private and the IR resolver needs compiler
+internals — and it is already in the dependency graph through the `typst` facade, so naming it
+directly buys the API and no new crate. `FormulaCompiler` therefore holds a second `Library` built
+from the same `ROUTINES` with `Feature::Html` enabled (the flag is what `compile::<HtmlDocument>`
+checks), and the same `World` answers both compiles. The document is encoded with `pretty: false` and
+the `<math>…</math>` element is sliced out of it: the encoder escapes `<` in text content and
+`<math>` never nests, so the first `<math` and the next `</math>` are the element.
+
+Four properties are load-bearing:
+
+- **`None` is not an error.** The geometry is the primary product, so a failed HTML pass drops the
+  structure and keeps the picture. A formula compiles or it does not; a structureless formula is still
+  a formula, and the field's absence is reported rather than hidden behind an empty string.
+- **The MathML is Typst's verbatim.** `mi` carries the typeset character (`x` is U+1D465 `𝑥`), while
+  the per-glyph labels keep the author's spelling — a deliberate asymmetry: a label is for reading one
+  symbol aloud, the MathML is for rendering the expression. Do not "fix" either into the other.
+- **The field is absent from the JSON, never `null`** (`#[serde(default, skip_serializing_if)]`) —
+  the same rule every absent command parameter follows, because `--inspect`'s output is a thing a
+  model reads back.
+- **It does not replace the children.** The glyph mobjects stay addressable nodes; the structure says
+  what the formula means, it does not flatten the tree.
+
+Two things have to be true of the MathML for it to be worth carrying, and the tests assert both: a
+fraction and a radical survive as `<mfrac>`/`<msqrt>` — a flat list could not spell them — and the
+string is the element alone, with no `<style>` or `<body>` from the surrounding document.
+`crates/rustim-app/tests/formula.rs` runs the real binary's `--scene formula --inspect` and checks the
+pairing end to end, because each unit hop can stay green while the scene stops setting the field, or
+`--inspect` stops printing it.
 
 - **P2** — more mobjects (lines, arrows, axes, function plots) and animations (`Transform`, `Rotate`,
   `Scale`, `FadeOut`); morph via `align_points`. The animations are all in (steps 2 and 5); of the
@@ -1939,7 +1979,18 @@ depends on `rustim-text`", run as the `typst-subtree` CI job.
   not a second picture. Deliberately deferred: audio muxing (the engine has no audio), a damage-based
   export renderer (every frame is a new artifact, so a region render would save nothing), resumable
   or streaming exports, and subtitle styling/RTL.
-- **P3+** — MathML flattening; the AI command surface at full width; Web (WASM).
+- **P3's MathML flattening is done** — the structure half of P1 step 5. `FormulaCompiler` compiles
+  each formula a second time through `typst-html` and slices the `<math>` element out of the encoded
+  document; it rides on `Mobject.mathml`, reaches `SemanticNode.mathml`, and `--inspect` prints it
+  beside every `role: "math"` node while omitting it everywhere else. Evidence: three `formula.rs`
+  tests (`msup`/`mfrac` survive, `sqrt(2)` gives `<msqrt>` and the root keeps the field after
+  `insert`, and the MathML is not the labels — `mi` holds U+1D465 where a glyph label holds `x`), two
+  `a11y.rs` tests (the field reaches the node and round-trips; a scene without formulas omits it from
+  the JSON), and `crates/rustim-app/tests/formula.rs` end to end over the real binary. **No golden
+  moved** — the field is metadata and the draw walk never reads it. The compiler's own deferrals
+  (per-run colour, link annotations, `GroupItem::clip`) are unchanged: this step carries structure,
+  not style.
+- **P3+** — the AI command surface at full width; Web (WASM).
 
 ## AI integration
 
@@ -2024,6 +2075,11 @@ of I/O and of a JSON parser (it compiles to wasm).
   is applied at t = 0 — that is the determinism property, not a quirk — so two `narrate` lines
   without `at` are both due in the frame the file is read. Its reply is a present-but-empty diff,
   like `play`'s.
+- **`--inspect` carries a formula's structure.** A `role: "math"` node holds its MathML in a
+  `mathml` field — absent, not null, on every other node — so a host reads the expression as a tree
+  rather than reconstructing it from the glyph children's names. It is one more thing a host can read
+  and nothing a host can write: there is no command that sets structure on a formula (see "Formula
+  structure: MathML").
 
 `Scene::on_command(&StateDiff, &mut SceneContext)` — declared since the trait was written, never called
 until this step — now fires for every command that reached the tree, from the feed *and* from the

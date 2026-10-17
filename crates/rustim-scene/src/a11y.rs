@@ -59,9 +59,10 @@ pub enum SemanticRole {
     Label,
     /// A heading, which a reader's navigation keys jump between.
     Heading,
-    /// A formula. The kind exists from this step so that flattening the formula
-    /// into a structured math subtree (P1 step 5, once Typst lands) adds fields
-    /// to [`SemanticNode`] rather than changing this mapping.
+    /// A formula. The kind existed from this step so that flattening a formula
+    /// into structure (P1's deferred MathML edge, landed in P3 step 20) would add
+    /// a field to [`SemanticNode`] rather than change this mapping — it did, and
+    /// this is still the role either way.
     Math,
     /// A live region: a node whose text changes are announcements, not content.
     /// Only ever used for the announcement node, which is not a mobject.
@@ -143,6 +144,17 @@ pub struct SemanticNode {
     /// misnumbering them.
     pub hidden: bool,
     pub value: Option<SemanticValue>,
+    /// The object's structure, for a formula. See [`Mobject::mathml`].
+    ///
+    /// A `<math>` element in MathML, carried beside the name and description
+    /// rather than inside them: the description is one sentence read aloud, this
+    /// is a tree a MathML-aware target renders (Web) or a host inspects
+    /// (`--inspect`). The glyph children stay addressable — this says what the
+    /// formula *means*, it does not replace the symbols.
+    ///
+    /// [`Mobject::mathml`]: rustim_mobject::Mobject::mathml
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mathml: Option<String>,
 }
 
 /// The camera the bounds in this snapshot were projected with.
@@ -228,6 +240,7 @@ pub fn build(tree: &SceneTree, viewport: &Viewport, live: Option<String>) -> Sem
         bounds: None,
         hidden: false,
         value: None,
+        mathml: None,
     });
 
     for id in tree.draw_order() {
@@ -266,6 +279,7 @@ pub fn build(tree: &SceneTree, viewport: &Viewport, live: Option<String>) -> Sem
                 step: 0.05,
                 text: format!("不透明度 {:.0}%", m.opacity * 100.0),
             }),
+            mathml: m.mathml.clone(),
         });
     }
 
@@ -1142,5 +1156,43 @@ mod tests {
         assert!((bounds.height() - 1.0 * 90.0).abs() < 1e-9);
         assert_eq!(node.description, "斜边", "the text speaks as itself");
         assert_eq!(node.name, "斜边");
+    }
+
+    /// A formula's structure reaches the semantic tree — that is the only route
+    /// by which a MathML-aware target (Web) or an agent (`--inspect`) can see
+    /// it, since the geometry says where the symbols are and not what they do.
+    #[test]
+    fn a_formulas_structure_reaches_the_semantic_tree() {
+        let mut tree = SceneTree::new();
+        let mathml = "<math><msup><mi>x</mi><mn>2</mn></msup></math>";
+        let id = tree.insert(
+            rustim_mobject::Mobject::new(Vec::new())
+                .with_kind(rustim_mobject::kind::NodeKind::Formula)
+                .with_mathml(mathml),
+        );
+        let s = build(&tree, &Viewport::default(), None);
+        let node = s.get(id).unwrap();
+        assert_eq!(node.role, SemanticRole::Math);
+        assert_eq!(node.mathml.as_deref(), Some(mathml));
+        // Beside the name and description, not inside them: the description is
+        // one sentence read aloud and must not become an XML dump.
+        assert_eq!(node.name, "公式");
+        assert!(!node.description.contains("<math"));
+        // And it survives the `--inspect` JSON round trip.
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<SemanticTree>(&json).unwrap(), s);
+    }
+
+    /// The field is absent from the JSON for every object that is not a formula.
+    /// This is the wire's rule everywhere — a parameter nobody supplied is
+    /// omitted, never written as `null` — and `--inspect` is a wire a host reads.
+    #[test]
+    fn a_node_without_structure_omits_the_field() {
+        let s = build(&scene(), &Viewport::default(), None);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("mathml"), "{json}");
+        for node in &s.nodes {
+            assert_eq!(node.mathml, None);
+        }
     }
 }

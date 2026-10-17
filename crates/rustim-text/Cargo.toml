@@ -32,6 +32,7 @@ icu_segmenter = { version = "2.1.2", default-features = false, features = ["lstm
 typst.workspace = true
 typst-layout.workspace = true
 typst-assets.workspace = true
+typst-html.workspace = true
 
 # Glyph outlines. No longer dev-only: `formula` reads each glyph's outline out of
 # the face's own bytes, which is the whole reason this route was chosen over
