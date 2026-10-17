@@ -328,6 +328,58 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// Draw a function: labelled axes, a polynomial curve and a caption.
+    ///
+    /// The second `explain.*` template. `coefficients` is the polynomial
+    /// `c0 + c1·x + c2·x² + …`, lowest degree first — the protocol has no
+    /// expression language (a decision, not a gap), so a caller hands over
+    /// numbers and the template evaluates them itself by Horner's rule. Degrees
+    /// above 16 are refused rather than truncated.
+    ///
+    /// `x_range` (default `[-4, 4]`) and `y_range` (default `[-3, 3]`) are the
+    /// data windows; `width`/`height` are the axes' *geometric* size in world
+    /// units (defaults 7 and 4, the compiled `axes` scene's proportions) and are
+    /// deliberately separate numbers, so a small range can fill a large frame.
+    /// `step` (default 1) is the data distance between ticks and their labels;
+    /// `samples` (default 160) is the curve's resolution. `color` paints the
+    /// curve — the axes and the labels stay foreground.
+    ///
+    /// The reply's `created` is `[group, axes, plot…, label…, caption?]`. A
+    /// curve that leaves `y_range` and comes back yields **several** plot
+    /// pieces, one per contiguous run, because a flat point array cannot express
+    /// a break; each run is cut at the interpolated boundary crossing so the
+    /// curve reaches the edge of its range. A curve that never enters `y_range`
+    /// is refused under `y_range` rather than leaving axes with no graph.
+    ///
+    /// Tick labels are typeset, so the whole template needs a text typesetter;
+    /// without one it refuses with [`CommandError::Unsupported`] under `text`
+    /// before anything is inserted. Answered by [`crate::SceneContext::handle`].
+    #[serde(rename = "explain.plot")]
+    ExplainPlot {
+        coefficients: Vec<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x_range: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y_range: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        samples: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<[u8; 3]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<[f64; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption_size: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Dim everything but an object for a moment, then bring it back.
     ///
     /// The attention helper a spoken explanation needs and `point_at` does not
@@ -669,6 +721,7 @@ pub const ACTIONS: &[&str] = &[
     "checkpoint",
     "events",
     "explain.equation",
+    "explain.plot",
     "fit",
     "hello",
     "highlight",
@@ -709,6 +762,7 @@ impl Command {
             Self::PointAt { .. } => "point_at",
             Self::Annotate { .. } => "annotate",
             Self::ExplainEquation { .. } => "explain.equation",
+            Self::ExplainPlot { .. } => "explain.plot",
             Self::Highlight { .. } => "highlight",
             Self::Play { .. } => "play",
             Self::Stop => "stop",
@@ -1858,6 +1912,10 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // Answered by `SceneContext::handle`: a template compiles a formula
             // and typesets a caption, and `apply` may not read fonts.
         }
+        Command::ExplainPlot { .. } => {
+            // Answered by `SceneContext::handle` for the same reason: the tick
+            // labels are typeset, and `apply` may not read fonts.
+        }
         Command::Narrate { .. } => {
             // Answered by `SceneContext::handle`, because scheduling narration
             // needs the virtual clock and the narration track — neither of which
@@ -2710,6 +2768,11 @@ mod tests {
             // with a sixth field to branch on.
             r#"{"action":"explain.equation","formula":"a^2 + b^2 = c^2","position":[0.0,0.5],"scale":1.2,"color":[100,181,246],"caption":"勾股定理","caption_size":0.5,"label":"定理"}"#.to_owned(),
             r#"{"action":"explain.equation","formula":"x^2"}"#.to_owned(),
+            // The second template: a full plot, then the minimal spelling —
+            // one coefficient per degree, lowest first. Declaration order is
+            // the serialised order, so the fields here follow the enum.
+            r#"{"action":"explain.plot","coefficients":[0.0,-1.75,0.25],"x_range":[-4.0,4.0],"y_range":[-3.0,3.0],"width":7.0,"height":4.0,"samples":160,"step":1.0,"color":[255,213,79],"position":[0.0,0.5],"caption":"y = 0.25x² - 1.75","caption_size":0.5,"label":"抛物线"}"#.to_owned(),
+            r#"{"action":"explain.plot","coefficients":[1.0,0.0,-1.0]}"#.to_owned(),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for json in cases {
@@ -2796,6 +2859,20 @@ mod tests {
                 position: None,
                 scale: None,
                 color: None,
+                caption: None,
+                caption_size: None,
+                label: None,
+            },
+            Command::ExplainPlot {
+                coefficients: vec![1.0, 0.0, -1.0],
+                x_range: None,
+                y_range: None,
+                width: None,
+                height: None,
+                samples: None,
+                step: None,
+                color: None,
+                position: None,
                 caption: None,
                 caption_size: None,
                 label: None,

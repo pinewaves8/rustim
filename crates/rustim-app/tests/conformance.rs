@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (26 actions, 11 shapes, 11 animations, 10
+//!    the build actually has (27 actions, 11 shapes, 11 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -155,7 +155,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
-    assert_eq!(caps.actions.len(), 26, "{:?}", caps.actions);
+    assert_eq!(caps.actions.len(), 27, "{:?}", caps.actions);
     assert_eq!(
         caps.profiles,
         ["primitive".to_owned(), "teaching".to_owned()],
@@ -500,6 +500,94 @@ fn the_equation_template_builds_one_addressable_group() {
         .error
         .expect("a blank caption is refused");
     assert!(format!("{error}").contains("caption"), "{error}");
+    let tree = client
+        .send_raw(r#"{"action":"query"}"#)
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert!(
+        !tree.nodes.iter().any(|node| node.name == "空的"),
+        "a refused template left its group behind"
+    );
+
+    finish(client, &png);
+}
+
+/// The second `explain.*` template has the same shape on the wire, and two
+/// properties of its own that only the real binary can prove: the tick labels
+/// are typeset by the host's typesetter (they are nodes, not pixels), and a
+/// curve that leaves the frame is several addressable pieces rather than one
+/// broken polyline.
+#[test]
+fn the_plot_template_groups_axes_a_curve_and_ticks() {
+    let (mut client, png) = client("plot");
+
+    let created = expect_diff(
+        &mut client,
+        r#"{"action":"explain.plot","coefficients":[0.0,0.0,1.0],"position":[0.5,0.5],"caption":"y = x²","label":"图像"}"#,
+    )
+    .created;
+    // The group, the axes, one curve piece, eight x labels (-4..4 without 0),
+    // six y labels (-3..3 without 0), and the caption.
+    assert_eq!(created.len(), 18, "{:?}", created);
+
+    let group = created[0];
+    let tree = client
+        .send_raw(&format!(r#"{{"action":"query","target":{}}}"#, group.raw()))
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert_eq!(tree.root, group);
+    assert_eq!(tree.nodes[0].name, "图像", "the label names the group");
+    assert!(
+        tree.nodes[0].bounds.is_some(),
+        "the group declares the union of its pieces"
+    );
+    // The caption is the last piece and carries no label of its own, so it is
+    // addressable by the id the diff reported and announces as a text node.
+    let caption = *created.last().unwrap();
+    let tree = client
+        .send_raw(&format!(
+            r#"{{"action":"query","target":{}}}"#,
+            caption.raw()
+        ))
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert_eq!(tree.root, caption);
+    assert_eq!(tree.nodes[0].name, "文本");
+    assert!(tree.nodes[0].bounds.is_some(), "the caption has a box");
+
+    let tree = client
+        .send_raw(&format!(r#"{{"action":"query","target":{}}}"#, group.raw()))
+        .expect("a query is a reply")
+        .tree
+        .expect("a tree");
+    assert!(
+        tree.nodes.iter().any(|node| node.name == "4"),
+        "the tick labels were typeset: {:?}",
+        tree.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+    );
+
+    // A curve that leaves the band and comes back is two plot pieces, not one
+    // polyline with a chord across the gap: x² ∈ [0.5, 3] on two disjoint
+    // intervals, so the group holds the group, the axes, two curves, eight x
+    // labels and three y labels (1, 2, 3).
+    let created = expect_diff(
+        &mut client,
+        r#"{"action":"explain.plot","coefficients":[0.0,0.0,1.0],"y_range":[0.5,3.0],"label":"双段"}"#,
+    )
+    .created;
+    assert_eq!(created.len(), 15, "{:?}", created);
+
+    // An empty coefficient list is refused by field, and the group does not
+    // survive the refusal.
+    let error = client
+        .send_raw(r#"{"action":"explain.plot","coefficients":[],"label":"空的"}"#)
+        .expect("a refusal is a reply")
+        .error
+        .expect("an empty polynomial is refused");
+    assert!(format!("{error}").contains("coefficients"), "{error}");
     let tree = client
         .send_raw(r#"{"action":"query"}"#)
         .expect("a query is a reply")

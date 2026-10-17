@@ -54,7 +54,7 @@ side with
 from the workspace and are scratch work, not the engine — but they are the evidence for every number
 quoted in this file and in `方案建议.md`, so keep them.
 
-The workspace itself is **verified green** as of 2026-10-18: **846 tests** (unit, integration and
+The workspace itself is **verified green** as of 2026-10-18: **856 tests** (unit, integration and
 doctest) pass, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 are clean, the
 six-crate semantic kernel builds for `wasm32-unknown-unknown` (with `accesskit` reachable from
@@ -373,7 +373,7 @@ last property.
 | `rustim-anim` | `Animation` trait (`begin` / `interpolate` / `finish`), `AnimationScheduler`, `Sequence` (the beat queue), `AnimationGroup` / `Succession` (lagged composition), `FadeIn`, `FadeOut`, `Create`, `Uncreate`, `MoveTo`, `Rotate`, `Scale`, `Transform` (with `path_arc`), `TransformGroup` (family morph, also arced), `CameraMove`, `WithRate` (a rate override wrapper), `Wait` | Real |
 | `rustim-text` | Text shaping: an injectable `FontProvider` over `parley`/`fontique`, CJK from `assets/fonts`, `MissingGlyph` / `FontSubstitution` reports; `formula`, the Typst → per-glyph outline compiler, which also carries each formula's structure as MathML | Real |
 | `rustim-scene` | `Scene`/`SceneContext`, the serde command layer, `event` (the wire vocabulary for out-of-band notifications), `a11y` (the platform-neutral semantic tree), `typeset` (the `Typesetter` seam — a trait, no fonts in it), `text` (`TextBlock` → `DrawOp::GlyphRun`, shared by the draw walk and both hosts) and `templates` (the `explain.*` thick tools: one group, addressable pieces, a declared box and an atomic rollback) | Real |
-| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the remaining five templates, the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; the first template lives one crate up) |
+| `rustim-director` | The teaching tier above the protocol: `layout` (`next_to`, `arrange`, `fit` — world-space placement measured from `world_bounds` and written as a composed translation or scale on the deferred transform) and `attention` (`pointing_arrow` builds a filled arrow whose tip sits a `buff` outside the subject's box; `callout` places a label just past that arrow's tail from one measurement of the subject, plus the arrow itself when asked; `spotlight` lists the picture-bearing nodes outside the subject's subtree, in draw order). All pure geometry; animations are *not* composed here — the director does not depend on `rustim-anim`, and typesetting is the host's, so `annotate`'s wire arm lives in `rustim-scene`. The `explain.*` templates' wire arms live in `rustim-scene::templates` because they typeset; the remaining four templates, the linter and `ScenePlan` are deferred. Nothing here does I/O and nothing names a model | Real (layout, attention, annotation; the first two templates live one crate up) |
 | `rustim-render` | `Renderer` trait (`render`, `render_damaged`), `DrawList` and its `Damage` diff, `RenderStats`, the `vello_cpu` backend | Real (CPU only) |
 | `rustim-export` | PNG encoding, the `compare` module that scores two frames, the `VideoSink` seam (`FfmpegSink`, `PngSequenceSink`), the `srt` writer, and the `rustim-compare` binary | Real |
 | `rustim-scenes` | Scenes shared by more than one host — currently `Pythagorean`, which the desktop binary's `--scene pythagorean` and the browser demo both run | Real |
@@ -2063,8 +2063,47 @@ conformance case that drives the real binary's typesetter through the template a
 declared bounds back; `ACTIONS` 25 → 26. **All eight goldens are unchanged**, and the count moved
 842 → 846.
 
+**The fifth slice is `explain.plot`, and it is where the template layer first has to say what a
+function *is* without an expression language.** The wire has no evaluator by decision, so the caller
+hands over `coefficients` (`c0 + c1·x + …`, lowest degree first) and the template evaluates them by
+Horner's rule, bounded at `MAX_DEGREE = 16`. Everything else is the engine's: a `ShapeKind::Axes`
+shaft with ticks, an `AxesScale` shared by the samples and the tick positions so a curve and its
+labels cannot drift apart, host-typeset tick labels, and a caption measured off the lowest piece.
+Four properties are worth carrying forward:
+
+- **A curve that leaves the window comes back as several `Plot` pieces.** A flat point array cannot
+  express a subpath break (`bezier_path_from_points` emits one `move_to`), so one polyline over
+  `x² ∈ [0.5, 3]` would draw the chord between the two branches — a line the function never had.
+  `sample_runs` splits the samples into contiguous in-range runs and `boundary` interpolates the
+  crossing, so each piece ends *on* the range's edge rather than one sample short of it. A curve that
+  never enters `y_range` is refused under `"y_range"`, through the rollback path (the axes are
+  already in the tree by then).
+- **Tick labels are mandatory, so the whole template needs `supports_text()`** — caption or not. An
+  unlabelled graph is a picture, not an explanation, and the refusal is `Unsupported { feature:
+  "text" }`. The labels' `label` is the number itself, which makes two axes' shared values
+  (`"3"`, `"-2"`) `AmbiguousLabel` when addressed by label; the ids the diff reports are the
+  precise spelling. Zero is skipped on both axes because the two would overlap at the origin.
+- **The caption is measured off the lowest piece, not off the axes.** The test that first asserted
+  `axes_bottom - gap` was wrong: with a 4-unit-tall axes the `"-3"` y label's line box reaches half a
+  line below the shaft, so the lowest piece is a *label*. `Build::created`'s world boxes — not the
+  requested `height` — are the honest input, which is the same rule `explain.equation` follows from
+  the formula's ink.
+- **The template reuses `Build` verbatim** — group first, pieces inserted then reparented into the
+  group's frame, `finish` declaring the union, `rollback` removing the group. There is no second
+  rollback implementation, and `handle` is the entry point for the same reason as `annotate`'s: tick
+  labels need the host's typesetter.
+
+Evidence: six `templates.rs` unit tests over the pure half (Horner order, a run cut at the edge, a
+two-run curve, a curve outside the band, tick text without float noise, the label cap), three
+`context.rs` tests (the full group/axes/curve/labels/caption geometry including the declared box, a
+band the curve leaves twice yielding two `Plot` nodes with disjoint boxes, and every refusal leaving
+the tree unchanged — including the late `y_range` one), two round-trip fixtures, and a conformance
+case through the real binary that reads the group, the caption and a tick label back and asserts the
+two-piece count. `ACTIONS` 26 → 27. **All eight goldens are unchanged**, and the count moved
+846 → 856.
+
 Deferred, and named so they are not rediscovered as gaps: labels that *follow* their subject, the
-remaining five `explain.*` templates (`plot`, `geometry`, `matrix`, `chart`, `algorithm`), the linter
+remaining four `explain.*` templates (`geometry`, `matrix`, `chart`, `algorithm`), the linter
 (out of frame, overlap, size, contrast, pacing) and `ScenePlan`. Deliberately not ported with attention: an arrow that *tracks* a moving subject (the
 arrow is a static node placed once; re-placing it is a `point_at` again, and following would need a
 per-frame constraint the tree does not have), and spotlight-beyond-opacity (a true mask over the
@@ -2921,6 +2960,20 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   so a replayed log passes through. `ACTIONS` 25 → 26. Evidence: two context tests, a rollback test
   over a typesetter that fails only on the caption, two round-trip fixtures and a conformance case;
   **all eight goldens unchanged**, count 842 → 846.
+- **Phase 2's sixth slice — the second template, `explain.plot` — is done.** It is the template layer
+  applied to a function instead of a formula, and it settled two things the first template did not
+  have to: how a function is spelled without an expression language (coefficients, Horner, degree cap
+  16), and how a curve that leaves the window is drawn (several `Plot` pieces, split at interpolated
+  range crossings, because a flat point array cannot express a subpath break). The axes, the samples
+  and the tick labels go through one `AxesScale`; the labels are host-typeset and mandatory, so the
+  command needs `supports_text()` even without a caption; zero is skipped on both axes and every
+  label is named by its number, which makes a shared value ambiguous to address by label. The caption
+  is measured off the lowest *piece* — often a y label's line box rather than the axes' edge, a
+  distinction the first test got wrong. `created = [group, axes, plot…, x labels, y labels,
+  caption?]`. `ACTIONS` 26 → 27. Evidence: six unit tests over the pure half, three context tests
+  (geometry and declared box, a two-run curve, atomic refusals including the late `y_range` one), two
+  round-trip fixtures and a conformance case through the real binary; **all eight goldens unchanged**,
+  count 846 → 856.
 
 ## AI integration
 
@@ -2946,7 +2999,7 @@ the AI surface" below.
 session. It does not touch the tree; it answers with a `capabilities` document — the protocol version,
 the engine's version string, and the exact action / shape / animation / property / rate names this
 build accepts, plus its limits and two advisory profiles. The lists are **derived from serde over the
-same enums the parser uses** — `actions` from `Command::action_name` (26 verbs), `PROPERTY_NAMES`,
+same enums the parser uses** — `actions` from `Command::action_name` (27 verbs), `PROPERTY_NAMES`,
 `AnimationKind::ALL`, `Rate::ALL` and `ShapeKind::ALL` for the nouns — so an advertised name is
 accepted by construction, and a conformance test feeds every advertised word back through the binary
 (see `crates/rustim-app/tests/conformance.rs`). A new variant that misses its `ALL`/name table fails a

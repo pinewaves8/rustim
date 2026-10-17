@@ -1284,6 +1284,52 @@ impl SceneContext {
             return crate::templates::equation(&mut self.tree, typesetter.as_mut(), args)
                 .map(CommandOutcome::Applied);
         }
+        if let Command::ExplainPlot {
+            coefficients,
+            x_range,
+            y_range,
+            width,
+            height,
+            samples,
+            step,
+            color,
+            position,
+            caption,
+            caption_size,
+            label,
+        } = cmd
+        {
+            // The tick labels are mandatory, so the whole template needs text
+            // rather than only its optional caption. `templates::plot` makes
+            // the same check as its first act; this one keeps the refusal
+            // beside the capability query a host reads from `hello`.
+            if !self.supports_text() {
+                return Err(CommandError::Unsupported {
+                    feature: "text".to_owned(),
+                });
+            }
+            let Some(typesetter) = self.typesetter.as_mut() else {
+                return Err(CommandError::Unsupported {
+                    feature: "text".to_owned(),
+                });
+            };
+            let args = crate::templates::Plot {
+                coefficients,
+                x_range: *x_range,
+                y_range: *y_range,
+                width: *width,
+                height: *height,
+                samples: *samples,
+                step: *step,
+                color: *color,
+                position: *position,
+                caption: caption.as_deref(),
+                caption_size: *caption_size,
+                label: label.as_deref(),
+            };
+            return crate::templates::plot(&mut self.tree, typesetter.as_mut(), args)
+                .map(CommandOutcome::Applied);
+        }
         if let Command::Highlight {
             target,
             dim,
@@ -3331,6 +3377,287 @@ mod tests {
             before,
             "the group and the compiled formula went with the refusal"
         );
+    }
+
+    // ---- explain.plot -----------------------------------------------------
+
+    /// A plot command with only the caller's own choices filled: every other
+    /// slot is the template's default.
+    fn explain_plot(
+        coefficients: &[f64],
+        position: Option<[f64; 2]>,
+        caption: Option<&str>,
+        label: Option<&str>,
+    ) -> Command {
+        Command::ExplainPlot {
+            coefficients: coefficients.to_vec(),
+            x_range: None,
+            y_range: None,
+            width: None,
+            height: None,
+            samples: None,
+            step: None,
+            color: Some([255, 213, 79]),
+            position,
+            caption: caption.map(str::to_owned),
+            caption_size: None,
+            label: label.map(str::to_owned),
+        }
+    }
+
+    /// The centres of the created text pieces carrying `label`, in draw order.
+    fn centres(ctx: &SceneContext, diff: &StateDiff, label: &str) -> Vec<rustim_math::Point> {
+        diff.created
+            .iter()
+            .filter_map(|id| {
+                let m = ctx.tree.get(*id)?;
+                (m.kind == NodeKind::Text && m.label.as_deref() == Some(label))
+                    .then(|| ctx.tree.world_bounds(*id).map(|rect| rect.center()))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// The whole teaching picture in one command: axes, a stroked curve cut at
+    /// the frame's edge, a label under every tick and a caption below it all.
+    ///
+    /// Every number below is exact, because the data window and the geometric
+    /// size are deliberately different numbers: `x_range [-4, 4]` across `width
+    /// 7` puts the x tick labelled `4` at world `3.5`, and `y_range [-3, 3]`
+    /// across `height 4` puts the y tick labelled `3` at world `2.0`. A template
+    /// that confused data units with world units would land both somewhere else.
+    #[test]
+    fn a_plot_groups_axes_a_curve_and_labelled_ticks() {
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(
+            &mut ctx,
+            &explain_plot(
+                &[0.0, 0.0, 1.0],
+                Some([0.5, 1.0]),
+                Some("抛物线"),
+                Some("图像"),
+            ),
+        );
+
+        // Group, axes, one curve, eight x labels (-4..4 without 0), six y
+        // labels (-3..3 without 0), and the caption.
+        assert_eq!(diff.created.len(), 18, "{:?}", diff.created);
+        let group = diff.created[0];
+        assert_eq!(ctx.tree.get(group).unwrap().kind, NodeKind::Group);
+        assert_eq!(ctx.tree.get(group).unwrap().label.as_deref(), Some("图像"));
+        assert_eq!(ctx.tree.get(diff.created[1]).unwrap().kind, NodeKind::Axes);
+        let curve = diff.created[2];
+        assert_eq!(ctx.tree.get(curve).unwrap().kind, NodeKind::Plot);
+
+        // x² lives inside y ∈ [-3, 3] only where |x| ≤ √3, so the one run is
+        // cut on the top edge: its world y is 2 there, plus the group's 1.
+        let bounds = ctx.tree.world_bounds(curve).unwrap();
+        assert!((bounds.y0 - 1.0).abs() < 1e-12, "{bounds:?}");
+        assert!((bounds.y1 - 3.0).abs() < 1e-12, "{bounds:?}");
+        assert!((bounds.x1 - 2.0154).abs() < 1e-3, "{bounds:?}");
+        assert!(
+            (bounds.x0 + 1.0154).abs() < 1e-3,
+            "the run starts left of the group"
+        );
+
+        // The curve is a stroke, not a fill: a filled polyline would paint the
+        // area between the parabola and its chord.
+        let style = &ctx.tree.get(curve).unwrap().style;
+        assert_eq!(
+            style.fill,
+            rustim_color::Srgb::from_rgba8(255, 213, 79, 255)
+        );
+        assert_eq!(style.fill_opacity, 0.0);
+        assert_eq!(style.stroke_opacity, 1.0);
+
+        // A tick's label sits under the coordinate it names, not under the
+        // number's own value: data 4 is 3.5 world units right of the centre.
+        let four = centres(&ctx, &diff, "4");
+        assert_eq!(four.len(), 1, "4 is an x tick only");
+        assert!((four[0].x - 4.0).abs() < 1e-12, "{:?}", four[0]);
+        assert!((four[0].y - 0.62).abs() < 1e-12, "{:?}", four[0]);
+        let threes = centres(&ctx, &diff, "3");
+        assert_eq!(threes.len(), 2, "3 labels both axes");
+        assert!(
+            threes
+                .iter()
+                .any(|p| (p.x - 3.125).abs() < 1e-12 && (p.y - 0.62).abs() < 1e-12),
+            "{threes:?}"
+        );
+        assert!(
+            threes
+                .iter()
+                .any(|p| (p.x - 0.08).abs() < 1e-12 && (p.y - 3.0).abs() < 1e-12),
+            "{threes:?}"
+        );
+
+        // The caption is measured off the lowest piece — here the "-3" y label,
+        // whose line box reaches local -2.5, below the axes' own bottom edge at
+        // -2 — one gap and half a line further down.
+        let caption = *diff.created.last().unwrap();
+        assert_eq!(ctx.tree.get(caption).unwrap().kind, NodeKind::Text);
+        let text = ctx.tree.world_bounds(caption).unwrap();
+        assert!((text.center().x - 0.5).abs() < 1e-12, "{text:?}");
+        assert!((text.center().y + 2.35).abs() < 1e-12, "{text:?}");
+
+        // The declared box is the union of the pieces in the group's frame —
+        // axes, curve, every label (the "-4" is 2 units wide, so it reaches
+        // x = -4.5) and the caption's bottom.
+        let declared = ctx.tree.get(group).unwrap().local_bounds.unwrap();
+        assert!((declared.x0 + 4.5).abs() < 1e-12, "{declared:?}");
+        assert!((declared.x1 - 4.0).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y0 + 3.85).abs() < 1e-12, "{declared:?}");
+        assert!((declared.y1 - 2.5).abs() < 1e-12, "{declared:?}");
+    }
+
+    /// A curve that leaves `y_range` and comes back is **two** pieces: a flat
+    /// point array cannot express a break, and one polyline would draw a chord
+    /// the function never had.
+    #[test]
+    fn a_curve_that_leaves_the_band_becomes_two_plot_pieces() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"action":"explain.plot","coefficients":[0.0,0.0,1.0],"y_range":[0.5,3.0],"label":"双段"}"#,
+        )
+        .expect("a wire plot");
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        let diff = applied(&mut ctx, &cmd);
+
+        let plots: Vec<NodeId> = diff
+            .created
+            .iter()
+            .copied()
+            .filter(|id| ctx.tree.get(*id).is_some_and(|m| m.kind == NodeKind::Plot))
+            .collect();
+        assert_eq!(plots.len(), 2, "the well under 0.5 is a gap, not a chord");
+        let left = ctx.tree.world_bounds(plots[0]).unwrap();
+        let right = ctx.tree.world_bounds(plots[1]).unwrap();
+        assert!(left.x1 < 0.0, "{left:?}");
+        assert!(right.x0 > 0.0, "{right:?}");
+        // Both runs reach the bottom edge of the band (data 0.5 maps to -2.0)
+        // and the top edge (data 3 maps to 2.0).
+        for run in [left, right] {
+            assert!((run.y0 + 2.0).abs() < 1e-12, "{run:?}");
+            assert!((run.y1 - 2.0).abs() < 1e-12, "{run:?}");
+        }
+    }
+
+    /// Every refusal names its own field and leaves the tree exactly as it
+    /// found it — including the late one, where the axes were already in the
+    /// group when the (empty) set of curve runs was discovered.
+    #[test]
+    fn a_plot_refuses_before_creating_anything() {
+        let mut bare = scene();
+        let before = bare.tree.len();
+        assert!(
+            matches!(
+                bare.handle(&explain_plot(&[1.0], None, None, None)),
+                Err(CommandError::Unsupported { ref feature }) if feature == "text"
+            ),
+            "the tick labels are mandatory, so a build without a shaper cannot plot"
+        );
+        assert_eq!(bare.tree.len(), before);
+
+        let mut ctx = with_typesetter(FakeTypesetter {
+            text: false,
+            ..FakeTypesetter::both()
+        });
+        assert!(matches!(
+            ctx.handle(&explain_plot(&[1.0], None, None, None)),
+            Err(CommandError::Unsupported { ref feature }) if feature == "text"
+        ));
+
+        for (json, field) in [
+            (
+                r#"{"action":"explain.plot","coefficients":[]}"#,
+                "coefficients",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
+                "coefficients",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"x_range":[4.0,-4.0]}"#,
+                "x_range",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"y_range":[1.0,1.0]}"#,
+                "y_range",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"width":0.0}"#,
+                "width",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"height":-1.0}"#,
+                "height",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"samples":1}"#,
+                "samples",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"samples":4096}"#,
+                "samples",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"step":0.0}"#,
+                "step",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"step":0.01}"#,
+                "step",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"caption":"   "}"#,
+                "caption",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[1.0],"caption_size":0.0}"#,
+                "caption_size",
+            ),
+            (
+                r#"{"action":"explain.plot","coefficients":[100.0]}"#,
+                "y_range",
+            ),
+        ] {
+            let cmd: Command = serde_json::from_str(json).expect("a wire plot");
+            let mut ctx = with_typesetter(FakeTypesetter::both());
+            let before = ctx.tree.len();
+            assert!(
+                matches!(
+                    ctx.handle(&cmd),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == field
+                ),
+                "{json} refused as the wrong field"
+            );
+            assert_eq!(ctx.tree.len(), before, "{json} left nodes behind");
+        }
+
+        // Non-finite values have no JSON spelling, so these are built directly.
+        let nan = Command::ExplainPlot {
+            coefficients: vec![f64::NAN],
+            x_range: None,
+            y_range: None,
+            width: None,
+            height: None,
+            samples: None,
+            step: None,
+            color: None,
+            position: None,
+            caption: None,
+            caption_size: None,
+            label: None,
+        };
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        assert!(matches!(
+            ctx.handle(&nan),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "coefficients"
+        ));
+        let mut ctx = with_typesetter(FakeTypesetter::both());
+        assert!(matches!(
+            ctx.handle(&explain_plot(&[1.0], Some([f64::INFINITY, 0.0]), None, None)),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "position"
+        ));
     }
 
     // ---- the camera -------------------------------------------------------
