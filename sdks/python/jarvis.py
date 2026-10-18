@@ -30,18 +30,27 @@ from the plan's beat durations.  That is deliberate: a file feed applies every
 command at virtual time zero, so a `say` left inside the plan would be due
 immediately and the whole lecture would speak at once.  The plan itself remains
 the model's product; only the timing is the driver's job.
+
+Captions and sound are on by default.  The engine draws the live region into
+the bottom of every frame (`--captions`) and writes a `.srt`; it does not speak
+during an export, so this host synthesises the same lines with espeak-ng and
+muxes them into the mp4.  `--no-captions` and `--no-speak` turn each half off.
 """
 
 import argparse
+import array
 import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+import wave
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rustim_client import Client, ProtocolError  # noqa: E402
@@ -52,6 +61,11 @@ MAX_STEPS = 12
 MAX_REPAIRS = 2
 TAIL_SECONDS = 2.0
 MAX_FRAMES = 7200
+
+#: The voice espeak-ng reads Chinese prose with.  The backend's default is the
+#: distribution's, and an English voice does not mis-pronounce Han characters —
+#: it spells them out as "Chinese letter", once per character.
+DEFAULT_VOICE = "cmn"
 
 SYSTEM_PROMPT = """你是 rustim 的讲解导演。rustim 是一个数学动画引擎。你只输出一个 JSON
 讲解计划，由外部程序交给引擎执行。
@@ -110,21 +124,80 @@ SYSTEM_PROMPT = """你是 rustim 的讲解导演。rustim 是一个数学动画�
 group 表示同时播放，succession 表示依次播放。只使用这些 type，不要用 query、
 check、plan.*、batch、validate 之类的命令。
 
-内容要求：先用 ops 把对象创建好（可以放在第一步），再用 beats 让它们出现或移动；
-讲解用简短中文（每句不超过 30 字）；图形不要超出 x ∈ [-6.5, 6.5]、y ∈ [-3.8, 3.8]。
+关于动画的两条硬规则：
+1. 新建对象的 opacity 默认是 1，而 fade_in 是从对象当前的不透明度升到 1，所以对
+   刚建好的对象直接 fade_in 没有任何视觉效果。要让对象淡入，先
+   {"action":"set","target":"标签","property":{"name":"opacity","value":0}}；
+   或者用 create，让带点的图形沿路径画出来。group 的淡入要求每个成员都是 0。
+2. params.color 会同时设置描边色和填充色。画“带边框的浅色方块”时，先 set
+   fill_opacity（如 0.35），再 set stroke_opacity（如 0.9）。
 
-示例（三步讲勾股定理）：
+内容要求：先用 ops 把对象创建好（可以放在第一步），再用 beats 让它们出现或移动；
+讲解用简短中文（每句不超过 30 字）；图形不要超出 x ∈ [-6.5, 6.5]、
+y ∈ [-3.8, 3.8]；画面底部 0.9 个世界单位留给字幕条，图形下沿不要低于 y = -3.0。
+
+讲勾股定理时必须画出三条边上的正方形（a²、b²、c²），只画一个三角形是不够的：
+直角边 a、b 各是一个正方形，斜边 c 上的正方形由斜边向量旋转 90° 得到；三个正方形、
+三角形、直角标记和标签最后放进一个 add group，整体淡入。
+
+示例（五步讲勾股定理；直角边 1.4 和 1.05，斜边 1.75）：
 {"label":"勾股定理","steps":[
  {"say":"先写下勾股定理。","ops":[
    {"action":"explain.equation","formula":"a^2 + b^2 = c^2","caption":"勾股定理",
-    "position":[0,2.0],"label":"方程"}],
-  "beats":[{"type":"fade_in","target":"方程","duration":1.0}]},
- {"say":"两条直角边围出一个直角三角形。","ops":[
-   {"action":"explain.geometry","vertices":[[0,0],[3,0],[0,2.4]],
-    "side_labels":["a","c","b"],"right_angle":true,"position":[0,-1.0],
-    "label":"三角形"}],
-  "beats":[{"type":"fade_in","target":"三角形","duration":0.8}]},
- {"say":"两条直角边的平方和等于斜边的平方。"}
+    "caption_size":0.5,"position":[0,3.4],"label":"方程"},
+   {"action":"set","target":"方程","property":{"name":"scale","value":0.6}}],
+  "beats":[{"type":"scale","target":"方程","factor":1.6666666666666667,"duration":1.2}]},
+ {"say":"三条边各画一个正方形。","ops":[
+   {"action":"add","type":"polygon","params":{"label":"a方","color":[100,181,246],
+    "points":[[-0.7,-1.55],[0.7,-1.55],[0.7,-2.95],[-0.7,-2.95]]}},
+   {"action":"set","target":"a方","property":{"name":"fill_opacity","value":0.35}},
+   {"action":"set","target":"a方","property":{"name":"stroke_opacity","value":0.9}},
+   {"action":"set","target":"a方","property":{"name":"opacity","value":0}},
+   {"action":"add","type":"polygon","params":{"label":"b方","color":[255,213,79],
+    "points":[[-0.7,-1.55],[-0.7,-0.5],[-1.75,-0.5],[-1.75,-1.55]]}},
+   {"action":"set","target":"b方","property":{"name":"fill_opacity","value":0.35}},
+   {"action":"set","target":"b方","property":{"name":"stroke_opacity","value":0.9}},
+   {"action":"set","target":"b方","property":{"name":"opacity","value":0}},
+   {"action":"add","type":"polygon","params":{"label":"c方","color":[239,83,80],
+    "points":[[0.7,-1.55],[-0.7,-0.5],[0.35,0.9],[1.75,-0.15]]}},
+   {"action":"set","target":"c方","property":{"name":"fill_opacity","value":0.35}},
+   {"action":"set","target":"c方","property":{"name":"stroke_opacity","value":0.9}},
+   {"action":"set","target":"c方","property":{"name":"opacity","value":0}},
+   {"action":"add","type":"polygon","params":{"label":"三角形","color":[255,255,255],
+    "points":[[-0.7,-1.55],[0.7,-1.55],[-0.7,-0.5]]}},
+   {"action":"set","target":"三角形","property":{"name":"fill_opacity","value":0.15}},
+   {"action":"set","target":"三角形","property":{"name":"stroke_opacity","value":0.9}},
+   {"action":"set","target":"三角形","property":{"name":"opacity","value":0}},
+   {"action":"add","type":"polygon","params":{"label":"直角标记","color":[255,255,255],
+    "points":[[-0.7,-1.55],[-0.55,-1.55],[-0.55,-1.4],[-0.7,-1.4]]}},
+   {"action":"set","target":"直角标记","property":{"name":"opacity","value":0}},
+   {"action":"add","type":"text","params":{"label":"a²","text":"a²","size":0.5,
+    "position":[0,-2.25],"color":[255,255,255]}},
+   {"action":"set","target":"a²","property":{"name":"opacity","value":0}},
+   {"action":"add","type":"text","params":{"label":"b²","text":"b²","size":0.5,
+    "position":[-1.225,-1.025],"color":[255,255,255]}},
+   {"action":"set","target":"b²","property":{"name":"opacity","value":0}},
+   {"action":"add","type":"text","params":{"label":"c²","text":"c²","size":0.5,
+    "position":[0.525,-0.325],"color":[255,255,255]}},
+   {"action":"set","target":"c²","property":{"name":"opacity","value":0}},
+   {"action":"add","type":"group","params":{"label":"图形"},
+    "children":["a方","b方","c方","三角形","直角标记","a²","b²","c²"]}],
+  "beats":[{"type":"group","lag_ratio":0.08,"animations":[
+    {"type":"fade_in","target":"a方","duration":0.9},
+    {"type":"fade_in","target":"b方","duration":0.9},
+    {"type":"fade_in","target":"c方","duration":0.9},
+    {"type":"fade_in","target":"三角形","duration":0.9},
+    {"type":"fade_in","target":"直角标记","duration":0.9},
+    {"type":"fade_in","target":"a²","duration":0.9},
+    {"type":"fade_in","target":"b²","duration":0.9},
+    {"type":"fade_in","target":"c²","duration":0.9}]}]},
+ {"say":"看斜边上的红色正方形。","beats":[
+   {"type":"animate","target":"c方","property":{"name":"fill_opacity","value":0.75},
+    "duration":1.4}]},
+ {"say":"直角边的平方和等于它。","beats":[
+   {"type":"animate","target":"c方","property":{"name":"fill_opacity","value":0.35},
+    "duration":1.6}]},
+ {"say":"这就是勾股定理。"}
 ]}
 """
 
@@ -291,6 +364,36 @@ def local_problem(plan):
     return None
 
 
+def content_problem(plan, request):
+    """The one content rule the engine cannot state: a theorem's picture.
+
+    `validate` and `check` can say a scene is well formed and even legible;
+    neither can say that an explanation of Pythagoras has to *show* the squares
+    the theorem is about.  A plan that draws only the triangle is valid JSON,
+    passes the linter, and teaches nothing, which is exactly the failure this
+    check exists for.  It is deliberately narrow: it fires only when the
+    request names the theorem, and asks for the three polygons that carry the
+    picture rather than prescribing the whole scene.
+    """
+    asked = request.lower()
+    if "勾股" not in request and "pythagor" not in asked:
+        return None
+    polygons = 0
+    for step in plan.get("steps") or []:
+        for op in step.get("ops") or []:
+            # `type` is a field of the `add` command itself, beside `params` —
+            # not one of the shape's parameters.
+            if op.get("action") == "add" and op.get("type") == "polygon":
+                polygons += 1
+    if polygons >= 3:
+        return None
+    return (
+        "勾股定理必须画出三条边上的正方形，只画三角形不够：用 add polygon 画 a²、b²、c² "
+        "三个正方形（斜边上的正方形由斜边向量旋转 90° 得到），再把三角形、正方形、直角"
+        "标记和标签放进一个 add group，整体淡入。"
+    )
+
+
 def beat_duration(spec):
     """The nominal length of one animation spec, mirroring the engine.
 
@@ -366,6 +469,115 @@ def flatten(plan):
     return commands, now
 
 
+def _figure_piece(label, points, color, fill_opacity, stroke_opacity):
+    """One outlined, translucent polygon that starts invisible.
+
+    `params.color` paints the fill *and* the stroke, so the two alphas are set
+    explicitly; the zero opacity is what gives `fade_in` something to raise
+    (a freshly created node is already opaque, so fading it in does nothing).
+    """
+    return [
+        {
+            "action": "add",
+            "type": "polygon",
+            "params": {"label": label, "color": color, "points": points},
+        },
+        {
+            "action": "set",
+            "target": label,
+            "property": {"name": "fill_opacity", "value": fill_opacity},
+        },
+        {
+            "action": "set",
+            "target": label,
+            "property": {"name": "stroke_opacity", "value": stroke_opacity},
+        },
+        {"action": "set", "target": label, "property": {"name": "opacity", "value": 0}},
+    ]
+
+
+def _figure_text(label, position):
+    """A text label centred in its square, invisible until the group fades in."""
+    return [
+        {
+            "action": "add",
+            "type": "text",
+            "params": {
+                "label": label,
+                "text": label,
+                "size": 0.5,
+                "position": position,
+                "color": [255, 255, 255],
+            },
+        },
+        {"action": "set", "target": label, "property": {"name": "opacity", "value": 0}},
+    ]
+
+
+# The classic picture: a right triangle with a square on each side.  The legs
+# are 1.4 and 1.05 and the hypotenuse is exactly 1.75 (3-4-5 scaled by 0.35),
+# so `a² + b² = c²` is true of the drawn figure and not only of the equation.
+# The hypotenuse square is the hypotenuse vector turned a quarter turn outward.
+_FIGURE_OPS = (
+    _figure_piece(
+        "a方",
+        [[-0.7, -1.55], [0.7, -1.55], [0.7, -2.95], [-0.7, -2.95]],
+        [100, 181, 246],
+        0.35,
+        0.9,
+    )
+    + _figure_piece(
+        "b方",
+        [[-0.7, -1.55], [-0.7, -0.5], [-1.75, -0.5], [-1.75, -1.55]],
+        [255, 213, 79],
+        0.35,
+        0.9,
+    )
+    + _figure_piece(
+        "c方",
+        [[0.7, -1.55], [-0.7, -0.5], [0.35, 0.9], [1.75, -0.15]],
+        [239, 83, 80],
+        0.35,
+        0.9,
+    )
+    + _figure_piece(
+        "三角形",
+        [[-0.7, -1.55], [0.7, -1.55], [-0.7, -0.5]],
+        [255, 255, 255],
+        0.15,
+        0.9,
+    )
+    + _figure_piece(
+        "直角标记",
+        [[-0.7, -1.55], [-0.55, -1.55], [-0.55, -1.4], [-0.7, -1.4]],
+        [255, 255, 255],
+        0.9,
+        0.0,
+    )
+    + _figure_text("a²", [0, -2.25])
+    + _figure_text("b²", [-1.225, -1.025])
+    + _figure_text("c²", [0.525, -0.325])
+    + [
+        {
+            "action": "add",
+            "type": "group",
+            "params": {"label": "图形"},
+            "children": ["a方", "b方", "c方", "三角形", "直角标记", "a²", "b²", "c²"],
+        }
+    ]
+)
+
+_FIGURE_BEATS = [
+    {
+        "type": "group",
+        "lag_ratio": 0.08,
+        "animations": [
+            {"type": "fade_in", "target": label, "duration": 0.9}
+            for label in ["a方", "b方", "c方", "三角形", "直角标记", "a²", "b²", "c²"]
+        ],
+    }
+]
+
 OFFLINE_PLAN = {
     "label": "勾股定理（离线示例）",
     "steps": [
@@ -376,37 +588,63 @@ OFFLINE_PLAN = {
                     "action": "explain.equation",
                     "formula": "a^2 + b^2 = c^2",
                     "caption": "勾股定理",
-                    "position": [0, 2.0],
+                    "caption_size": 0.5,
+                    "position": [0, 3.4],
                     "label": "方程",
+                },
+                {
+                    "action": "set",
+                    "target": "方程",
+                    "property": {"name": "scale", "value": 0.6},
+                },
+            ],
+            "beats": [
+                {
+                    "type": "scale",
+                    "target": "方程",
+                    "factor": 1.6666666666666667,
+                    "duration": 1.2,
                 }
             ],
-            "beats": [{"type": "fade_in", "target": "方程", "duration": 1.0}],
         },
         {
-            "say": "两条直角边围出一个直角三角形。",
-            "ops": [
+            "say": "三条边各画一个正方形。",
+            "ops": _FIGURE_OPS,
+            "beats": _FIGURE_BEATS,
+        },
+        {
+            "say": "看斜边上的红色正方形。",
+            "beats": [
                 {
-                    "action": "explain.geometry",
-                    "vertices": [[0, 0], [3, 0], [0, 2.4]],
-                    "side_labels": ["a", "c", "b"],
-                    "right_angle": True,
-                    "position": [0, -1.0],
-                    "label": "三角形",
+                    "type": "animate",
+                    "target": "c方",
+                    "property": {"name": "fill_opacity", "value": 0.75},
+                    "duration": 1.4,
                 }
             ],
-            "beats": [{"type": "fade_in", "target": "三角形", "duration": 0.9}],
         },
-        {"say": "两条直角边的平方和等于斜边的平方。"},
+        {
+            "say": "直角边的平方和等于它。",
+            "beats": [
+                {
+                    "type": "animate",
+                    "target": "c方",
+                    "property": {"name": "fill_opacity", "value": 0.35},
+                    "duration": 1.6,
+                }
+            ],
+        },
+        {"say": "这就是勾股定理。"},
     ],
 }
 
 
 def accepted_plan(args):
     if args.offline:
-        return OFFLINE_PLAN, "offline"
+        return OFFLINE_PLAN, "offline", ""
     if args.plan:
         with open(args.plan, "r", encoding="utf-8") as handle:
-            return normalize_plan(json.load(handle)), "file"
+            return normalize_plan(json.load(handle)), "file", ""
     request = " ".join(args.request).strip()
     if not request:
         raise JarvisError("给一句讲解要求，例如：\"用三步动画解释勾股定理\"")
@@ -414,7 +652,7 @@ def accepted_plan(args):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": request},
     ]
-    return messages, "model"
+    return messages, "model", request
 
 
 def inspect_plan(probe, commands):
@@ -459,7 +697,7 @@ def inspect_plan(probe, commands):
     return "\n".join(lines)
 
 
-def plan_via_engine(spawn_probe, messages_or_plan, origin):
+def plan_via_engine(spawn_probe, messages_or_plan, origin, request_text=""):
     """Ask (or read) a plan and pre-flight it through the real engine.
 
     `spawn_probe` returns a fresh `Client` on a throwaway session; a repair
@@ -493,6 +731,8 @@ def plan_via_engine(spawn_probe, messages_or_plan, origin):
                 continue
             problem = local_problem(plan)
             commands, seconds = None, 0.0
+            if problem is None:
+                problem = content_problem(plan, request_text)
             if problem is None:
                 commands, seconds = flatten(plan)
                 with spawn_probe() as probe:
@@ -529,6 +769,170 @@ def plan_via_engine(spawn_probe, messages_or_plan, origin):
     return plan, commands, seconds
 
 
+def narration_cues(commands):
+    """Every spoken line in the flattened log, in time order."""
+    cues = []
+    for command in commands:
+        if command.get("action") != "narrate":
+            continue
+        text = command.get("text")
+        at = command.get("at", 0.0)
+        if isinstance(text, str) and text.strip():
+            try:
+                at = float(at)
+            except (TypeError, ValueError):
+                at = 0.0
+            cues.append((at, text.strip()))
+    cues.sort(key=lambda cue: cue[0])
+    return cues
+
+
+def _speak_clip(espeak, voice, text, path):
+    """One line to one WAV file, the sentence on stdin.
+
+    Args would need per-platform quoting and would put the prose in every
+    process listing; `--stdin` is what `rustim-app --speak` uses for the same
+    reason.
+    """
+    result = subprocess.run(
+        [espeak, "-v", voice, "-w", path, "--stdin"],
+        input=text.encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0 or not os.path.exists(path) or os.path.getsize(path) == 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise JarvisError(
+            "%s 朗读失败：%s" % (os.path.basename(espeak), detail or "没有输出")
+        )
+
+
+def build_narration_wav(cues, seconds, voice):
+    """Place every line on a silent bed as long as the video.
+
+    Returns the WAV path, or None when nothing could be spoken.  Clips are laid
+    end to end rather than mixed: two sentences due at the same instant are a
+    plan talking over itself, and a mix makes both unintelligible.  A line is
+    therefore never cut off; it may start later than its cue, which the
+    captions and the .srt (both timed by the engine) will not do.
+    """
+    espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+    if espeak is None:
+        print(
+            "jarvis: 没找到 espeak-ng/espeak，跳过配音（画面和字幕仍然完整）。",
+            file=sys.stderr,
+        )
+        return None
+    handle, wav_path = tempfile.mkstemp(prefix="rustim-voice-", suffix=".wav")
+    os.close(handle)
+    clips = []
+    try:
+        for index, (at, text) in enumerate(cues):
+            clip = "%s.%d.wav" % (wav_path, index)
+            try:
+                _speak_clip(espeak, voice, text, clip)
+                with wave.open(clip, "rb") as wav:
+                    channels = wav.getnchannels()
+                    width = wav.getsampwidth()
+                    rate = wav.getframerate()
+                    data = wav.readframes(wav.getnframes())
+            except JarvisError as error:
+                print("jarvis: %s（这一句跳过）" % error, file=sys.stderr)
+                continue
+            finally:
+                if os.path.exists(clip):
+                    os.remove(clip)
+            if channels != 1 or width != 2:
+                print(
+                    "jarvis: espeak 输出不是 16 位单声道，跳过这一句。", file=sys.stderr
+                )
+                continue
+            samples = array.array("h")
+            samples.frombytes(data)
+            if sys.byteorder != "little":
+                samples.byteswap()
+            clips.append((at, rate, samples))
+        if not clips:
+            os.remove(wav_path)
+            return None
+
+        rate = clips[0][1]
+        usable = [clip for clip in clips if clip[1] == rate]
+        if len(usable) != len(clips):
+            print("jarvis: 各句采样率不一致，只混入多数的那一档。", file=sys.stderr)
+        total = max(int(round(seconds * rate)), 1)
+        bed = array.array("h", bytes(2 * total))
+        cursor = 0
+        for at, _, samples in usable:
+            start = max(int(round(at * rate)), cursor)
+            if start >= total:
+                break
+            end = min(start + len(samples), total)
+            for offset in range(start, end):
+                value = bed[offset] + samples[offset - start]
+                bed[offset] = 32767 if value > 32767 else (-32768 if value < -32768 else value)
+            cursor = end
+        if sys.byteorder != "little":
+            bed.byteswap()
+        with wave.open(wav_path, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(rate)
+            wav.writeframes(bed.tobytes())
+        return wav_path
+    except Exception:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+        raise
+
+
+def mux_audio(video_path, wav_path):
+    """Replace the silent export with one that carries the narration.
+
+    Returns None on success, or a sentence describing what went wrong (the WAV
+    is then left where it is rather than deleted — the voice track is the part
+    that took the work).
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return "没找到 ffmpeg，配音留在 %s" % wav_path
+    directory = os.path.dirname(os.path.abspath(video_path)) or "."
+    handle, temp = tempfile.mkstemp(prefix=".rustim-mux-", suffix=".mp4", dir=directory)
+    os.close(handle)
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            video_path,
+            "-i",
+            wav_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            temp,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        os.remove(temp)
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        return "ffmpeg 混音失败：%s（配音留在 %s）" % (
+            detail[-1] if detail else "退出码 %d" % result.returncode,
+            wav_path,
+        )
+    os.replace(temp, video_path)
+    os.remove(wav_path)
+    return None
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         description="Ask a model for a rustim lecture plan and render it."
@@ -539,7 +943,22 @@ def main(argv):
     parser.add_argument("--frames", type=int, default=0, help="覆盖导出帧数（默认按计划时长算）")
     parser.add_argument("--srt", default="", help="字幕路径；默认与视频同名 .srt")
     parser.add_argument("--no-srt", action="store_true", help="不写字幕")
-    parser.add_argument("--captions", action="store_true", help="把旁白画进画面")
+    parser.add_argument(
+        "--captions",
+        dest="captions",
+        action="store_true",
+        default=True,
+        help="把旁白画进画面（默认开启）",
+    )
+    parser.add_argument(
+        "--no-captions", dest="captions", action="store_false", help="不把旁白画进画面"
+    )
+    parser.add_argument(
+        "--voice",
+        default=DEFAULT_VOICE,
+        help="espeak-ng 的语音名（默认 cmn；macOS 的 say 用 Tingting）",
+    )
+    parser.add_argument("--no-speak", action="store_true", help="不给视频配音")
     parser.add_argument("--offline", action="store_true", help="不调用模型，用内置计划")
     parser.add_argument("--plan", default="", help="从文件读计划，不调用模型")
     parser.add_argument("--binary", default="", help="rustim-app 的路径")
@@ -573,6 +992,7 @@ def main(argv):
         if os.path.exists(scratch):
             os.remove(scratch)
 
+    frames = 0
     if args.png:
         engine_args = ["--script", "-", "--reply", "--png", args.out]
         if args.captions:
@@ -635,6 +1055,21 @@ def main(argv):
 
     if status != 0:
         raise JarvisError("二进制退出码 %d；输出可能不完整。" % status)
+
+    # The engine renders frames and writes captions; it never speaks.  Sound is
+    # the host's job, and this host's synthesiser is espeak-ng on the same
+    # sentences the caption band drew — the cue list comes from the flattened
+    # log, so the voice and the band cannot disagree about what was said.
+    if not args.png and not args.no_speak:
+        cues = narration_cues(commands)
+        if cues:
+            wav_path = build_narration_wav(cues, frames * STEP, args.voice)
+            if wav_path is not None:
+                problem = mux_audio(args.out, wav_path)
+                if problem is None:
+                    print("配音：%s 的 %d 句旁白已混入视频" % (args.voice, len(cues)))
+                else:
+                    print("jarvis: %s" % problem, file=sys.stderr)
 
     if args.print_plan:
         print(json.dumps(plan, ensure_ascii=False, indent=2))

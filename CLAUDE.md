@@ -3635,7 +3635,7 @@ not an engine.** It asks any OpenAI-compatible chat-completions endpoint (`RUSTI
 `RUSTIM_LLM_MODEL` / `RUSTIM_LLM_KEY`, falling back to `DEEPSEEK_API_KEY` then `OPENAI_API_KEY`) for
 a `plan.load` document, flattens it into one command log, and drives the unmodified binary through
 `rustim_client`. It contains no engine logic and no rendering; swapping assistants is swapping three
-environment variables. Four things in it are the design rather than the implementation:
+environment variables. Five things in it are the design rather than the implementation:
 
 - **The plan is flattened before it is sent.** A file or stdin feed applies every command at virtual
   time zero, so a `say` left inside `plan.load` would all be due in the first frame; the driver
@@ -3652,6 +3652,22 @@ environment variables. Four things in it are the design rather than the implemen
   command line and is not known until the plan is flattened, so probes use a throwaway `--png` path
   and the real run is one `batch` on a fresh process — which also means the pre-flight tree is never
   the rendered one.
+- **One content rule the engine cannot state, checked in the driver.** `validate` and `check` can
+  say a picture is well formed and legible; neither can say that an explanation of Pythagoras has to
+  *show the three squares the theorem is about*. `content_problem` counts the plan's
+  `add`-`polygon` ops (the wire puts `type` beside `params` on the command, not inside it — reading
+  `params["type"]` silently found none) and hands the model a rewrite hint below three. It fires
+  only when the request names the theorem. This is the one place the example is more than a
+  transport: a plan that draws only the triangle passes every engine check and teaches nothing.
+- **Sound is the host's, captions are the engine's, and both are on by default.**
+  `--captions` (the engine's own band, see "Narration, captions and self-voicing") and the audio
+  mux are both defaults; `--no-captions` / `--no-speak` turn each half off. An export never speaks,
+  so the driver synthesises the same `narrate` lines with `espeak-ng -v cmn -w … --stdin` (text on
+  stdin, for the reason `rustim-app --speak` puts it there), lays the clips on a silent bed of the
+  video's length with Python's `wave`/`array` — sequential, not mixed, because two sentences due at
+  once are a plan talking over itself — and muxes with `ffmpeg -c:v copy -c:a aac -shortest`. The
+  cue list comes from the flattened log, so the voice and the band cannot disagree about what was
+  said. Neither tool present is a warning and a complete silent video, not a failure.
 - **Absent from the engine.** Nothing in `crates/` changed to make this work. That is the point of
   `贾维斯集成方案.md`: the assistant is a client, and a second one — a different model, a different
   prompt, a different language — drives the same engine unchanged.
