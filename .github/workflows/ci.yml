@@ -17,7 +17,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # `macos-26` rather than `macos-latest`, and only for the macOS entry:
+        # the golden suite derives its baseline filename from the *runner's*
+        # `std::env::consts::ARCH`, and `macos-latest` is a floating label that
+        # GitHub has already moved across macOS 13/14/15/26. Its Intel and Arm64
+        # images are separate labels (`macos-26-intel` / `macos-26`), so a float
+        # onto an x86_64 image would silently start looking for
+        # `macos-x86_64.png` and fail the macOS leg for a reason that has nothing
+        # to do with the code. Pinning makes that a deliberate, visible update.
+        # Per GitHub's runner-images table, `macos-26` is the macOS 26 Arm64 image
+        # — the one `macos-aarch64.png` is named for. `ubuntu-*`/`windows-*` are
+        # left floating: nothing in the suite keys off their arch today.
+        os: [ubuntu-latest, macos-26, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -159,7 +170,7 @@ jobs:
             echo "::error::the skrifa versions in the tree changed"
             echo "expected:"; echo "$want"
             echo "got:";      echo "$got"
-            echo "if Typst moved off 0.42.1, update the note in rustim-text/Cargo.toml and CLAUDE.md"
+            echo "if Typst moved off 0.42.1, update the note in rustim-text/Cargo.toml and docs/history.md"
             exit 1
           fi
 
@@ -177,7 +188,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # `macos-26` rather than `macos-latest`, and only for the macOS entry:
+        # the golden suite derives its baseline filename from the *runner's*
+        # `std::env::consts::ARCH`, and `macos-latest` is a floating label that
+        # GitHub has already moved across macOS 13/14/15/26. Its Intel and Arm64
+        # images are separate labels (`macos-26-intel` / `macos-26`), so a float
+        # onto an x86_64 image would silently start looking for
+        # `macos-x86_64.png` and fail the macOS leg for a reason that has nothing
+        # to do with the code. Pinning makes that a deliberate, visible update.
+        # Per GitHub's runner-images table, `macos-26` is the macOS 26 Arm64 image
+        # — the one `macos-aarch64.png` is named for. `ubuntu-*`/`windows-*` are
+        # left floating: nothing in the suite keys off their arch today.
+        os: [ubuntu-latest, macos-26, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

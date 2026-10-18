@@ -33,6 +33,25 @@ accesskit_winit.workspace = true
 # file is the only way to see what the accessibility layer would say.
 serde_json.workspace = true
 
+# macOS only, and only for reading the system "reduce motion" preference — see
+# `src/motion.rs`. Target-specific rather than a plain `[dependencies]` line
+# because `objc2-app-kit` does not build on Linux or Windows, and a shared entry
+# here would break both of those legs of the CI matrix. It is the same 0.2.2 that
+# `accesskit_macos` 0.27.1 already pulls in, so this is one build of the crate
+# rather than a second one.
+#
+# **Both features are required, and the second one is not the obvious one.**
+# `sharedWorkspace()` is gated by `NSWorkspace`
+# (`objc2-app-kit-0.2.2/src/generated/NSWorkspace.rs:40-42`), and
+# `accessibilityDisplayShouldReduceMotion` also sits inside a `NSWorkspace`-gated
+# block (`.../generated/NSAccessibility.rs:114-128`) — but the whole *file* that
+# block lives in is gated by `NSAccessibility` (`.../generated/mod.rs:28`).
+# Asking for `NSWorkspace` alone would compile today purely by feature
+# unification, because `accesskit_macos` happens to request `NSAccessibility`;
+# that is a coincidence of the current graph, not a contract, so both are named.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.2.2", features = ["NSAccessibility", "NSWorkspace"] }
+
 [dev-dependencies]
 # It is the *consumer* of an AccessKit update — it validates that an incremental
 # update is well formed against the tree a platform would be holding, which is

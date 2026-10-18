@@ -1662,6 +1662,36 @@ impl App {
             }
         }
     }
+
+    /// Make the surface, the renderer and the viewport agree on one frame size.
+    ///
+    /// `width`/`height` are **physical** pixels — what `Window::inner_size` and
+    /// `WindowEvent::Resized` both report. The logical constants the window is
+    /// *asked* for are not a frame size: on a Retina display they differ by the
+    /// scale factor, so seeding from them leaves the first frame's surface at half
+    /// the backing store and the world-unit scale wrong until `Resized` arrives.
+    /// Both call sites therefore go through here, so there is one answer to "how
+    /// big is the frame" rather than two that can drift.
+    fn apply_frame_size(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        if let Some(w) = self.windowed.as_mut() {
+            w.surface
+                .resize(
+                    NonZeroU32::new(width).unwrap(),
+                    NonZeroU32::new(height).unwrap(),
+                )
+                .expect("resize surface");
+        }
+        // The renderer follows the surface, so the tutorial's hardcoded 1280x720
+        // background stops being wrong the moment the window is resized. The
+        // viewport follows with it, and the accessibility tree's bounds are
+        // derived from the viewport, so they follow too.
+        self.renderer.resize(width as u16, height as u16);
+        self.ctx.viewport.frame_width = width as u16;
+        self.ctx.viewport.frame_height = height as u16;
+    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -1685,10 +1715,16 @@ impl ApplicationHandler<AppEvent> for App {
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let mut surface =
             softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
+        // The window's real **physical** size, not the logical constants asked for
+        // above: on a Retina display those differ by the scale factor. Sized before
+        // `set_visible` so the window is never exposed with a surface that does not
+        // match its backing store, since the OS can send `RedrawRequested` on
+        // exposure without waiting for our `request_redraw`.
+        let size = window.inner_size();
         surface
             .resize(
-                NonZeroU32::new(u32::from(WIDTH)).unwrap(),
-                NonZeroU32::new(u32::from(HEIGHT)).unwrap(),
+                NonZeroU32::new(size.width.max(1)).unwrap(),
+                NonZeroU32::new(size.height.max(1)).unwrap(),
             )
             .expect("resize");
 
@@ -1702,6 +1738,11 @@ impl ApplicationHandler<AppEvent> for App {
             surface,
             a11y,
         });
+        // The surface is right; the renderer and the viewport are still on the
+        // logical constants. Bring them onto the same physical size now rather than
+        // waiting for the `Resized` event, which is not guaranteed to arrive before
+        // the first `RedrawRequested`.
+        self.apply_frame_size(size.width, size.height);
         // Offered once, before the first frame, so the frame loop's own
         // `a11y.update` flushes it into the live region. That exercises the
         // announcement path end to end; the report's push counters are what
@@ -1832,26 +1873,9 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => {
                 self.pointer.release();
             }
-            WindowEvent::Resized(size) => {
-                if size.width > 0 && size.height > 0 {
-                    if let Some(w) = self.windowed.as_mut() {
-                        w.surface
-                            .resize(
-                                NonZeroU32::new(size.width).unwrap(),
-                                NonZeroU32::new(size.height).unwrap(),
-                            )
-                            .expect("resize surface");
-                    }
-                    // The renderer follows the surface, so the tutorial's
-                    // hardcoded 1280x720 background stops being wrong the moment
-                    // the window is resized. The viewport follows with it, and
-                    // the accessibility tree's bounds are derived from the
-                    // viewport, so they follow too.
-                    self.renderer.resize(size.width as u16, size.height as u16);
-                    self.ctx.viewport.frame_width = size.width as u16;
-                    self.ctx.viewport.frame_height = size.height as u16;
-                }
-            }
+            // The same three steps `resumed` seeds from, so a resize and a
+            // startup cannot disagree about what the frame size is.
+            WindowEvent::Resized(size) => self.apply_frame_size(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
                 let wall = (now - self.last).as_secs_f64();

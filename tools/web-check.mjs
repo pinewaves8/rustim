@@ -26,6 +26,13 @@
 // tolerance (§5.2) is met with room to spare; demanding `max == 0` here would
 // be asserting a property the canvas API does not offer.
 //
+// Re-measured on 2026-10-18 (Chrome 155, macos-aarch64, real Retina display):
+// **every number is the same** — content box `(343, 90)..(936, 629)`,
+// 16 pixels at 1 LSB, max channel error 1, and the same 6.28e-16 anchor drift on
+// the wheel. The `--force-device-scale-factor=1` flag below is what keeps a 2×
+// display out of the comparison; without it the canvas would be 2560x1440 and
+// the box would not match a 1280x720 still.
+//
 // `cargo test -p rustim-web` covers the session core natively; only the canvas
 // round-trip needs a browser, and that is what this file adds.
 //
@@ -38,9 +45,10 @@
 // Exit: 0 the frame matches, 1 it does not, 2 the question could not be asked.
 
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { extname, join, normalize, sep } from 'node:path';
+import { delimiter, extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -81,7 +89,50 @@ const origin = `http://127.0.0.1:${server.address().port}`;
 // ---------------------------------------------------------------------------
 // Chrome, headless, with its own profile so it never touches the user's.
 
-const chromePath = process.env.CHROME || 'google-chrome';
+/// Where Chrome lives, tried in a fixed order: `$CHROME` first, then the names it
+/// goes by on `PATH`, then the macOS bundles.
+///
+/// The default used to be the bare `google-chrome`, which is the *Linux* name —
+/// so on macOS this check could never run, and said so with a confusing "chrome
+/// exited before the check ran" rather than "no browser here". `$CHROME` still
+/// wins, so a caller can point at a Chromium or a Chrome Beta.
+function findChrome() {
+  if (process.env.CHROME) return process.env.CHROME;
+
+  const names = [
+    'google-chrome',
+    'google-chrome-stable',
+    'chromium',
+    'chromium-browser',
+  ];
+  for (const dir of (process.env.PATH || '').split(delimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+
+  // The bundle, not the bare name: macOS ships no `google-chrome` executable, and
+  // a `.app` is a directory, so the binary is three levels inside it.
+  const bundles = [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  ];
+  for (const candidate of bundles) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+const chromePath = findChrome();
+if (chromePath === null) {
+  console.error(
+    'no Chrome found: set $CHROME, or install Chrome/Chromium.\n' +
+      '  (exit 2 — the question could not be asked)',
+  );
+  process.exit(2);
+}
 const profile = join(outDir, 'chrome-profile');
 await rm(profile, { recursive: true, force: true });
 const chrome = spawn(

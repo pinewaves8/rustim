@@ -14,6 +14,15 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 target=wasm32-unknown-unknown
 
+# `stat` is not portable between GNU and BSD: coreutils spells it `-c%s`, macOS and
+# the BSDs spell it `-f%z`. This script runs from a checkout on all three desktop
+# platforms, so the spelling is selected rather than assumed — `-c%s` under
+# `set -euo pipefail` does not merely print a wrong number, it aborts the build.
+case "$(uname -s)" in
+  Darwin | *BSD) file_size() { stat -f%z "$1"; } ;;
+  *) file_size() { stat -c%s "$1"; } ;;
+esac
+
 build() {
   local out=$1 profile=$2
   shift 2
@@ -26,9 +35,9 @@ build() {
 
   local wasm=$out/rustim_web_bg.wasm
   local raw packed glue
-  raw=$(stat -c%s "$wasm")
+  raw=$(file_size "$wasm")
   packed=$(gzip -9 -c "$wasm" | wc -c)
-  glue=$(stat -c%s "$out/rustim_web.js")
+  glue=$(file_size "$out/rustim_web.js")
   printf '%-12s wasm %8s bytes raw  %8s bytes gzip -9   js %6s bytes\n' \
     "$out" "$raw" "$packed" "$glue"
 }

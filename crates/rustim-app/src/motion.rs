@@ -14,18 +14,19 @@
 //! same intent in its own configuration and is **not** read here, and the XDG
 //! desktop portal has no such key at all.
 //!
-//! **macOS** would be `NSWorkspace.shared.accessibilityDisplayShouldReduceMotion`.
-//! It is not implemented: `accesskit_macos` declares `objc2-app-kit` without the
-//! `NSWorkspace` feature, so the binding would have to be added, and nothing here
-//! can compile or run a macOS target to check it.
+//! **macOS** reads `NSWorkspace.accessibilityDisplayShouldReduceMotion`, in
+//! process, through `objc2-app-kit` — see the [`macos`] module. No subprocess and
+//! no D-Bus: the framework getter answers with a `bool`, so there is nothing to
+//! parse and nothing that can fail. It must be called on the **main thread**, and
+//! it is: the one caller is `main`, before the event loop exists.
 //!
 //! **Windows** would be `SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, ...)`.
-//! It is not implemented, for the same reason and with the same consequence: on
-//! both platforms this returns [`Motion::Full`].
+//! It is **not** implemented — nothing here can compile or run a Windows target to
+//! check a binding — so that platform returns [`Motion::Full`].
 //!
-//! So the honest summary is that a user on macOS or Windows has the flag and not
-//! the preference, and a user on a non-GNOME Linux desktop has the flag and
-//! *usually* the preference. Everything unread, unparsable or failing returns
+//! So the honest summary is that a user on Windows has the flag and not the
+//! preference, while a user on macOS or on a GNOME-family Linux desktop has both.
+//! Everything unread, unparsable or failing returns
 //! [`Motion::Full`] — a probe that cannot answer must not silently disable a
 //! scene's animation, and "the setting says animate" is the answer that keeps the
 //! picture a user sees identical to the one every golden image was made from.
@@ -39,21 +40,76 @@ use rustim_anim::Motion;
 /// best-effort read at startup, and the caller has already had the chance to
 /// override it with the command-line flag.
 pub fn from_platform() -> Motion {
+    // macOS answers in process, and its answer is definitive — so it is asked
+    // first and, when it answers, nothing else runs.
+    //
+    // Spelled `if let … { return … }` rather than a bare `return` on purpose: the
+    // code below has to stay *reachable to the compiler* on macOS, because
+    // `probe` must keep a caller in every build or `dead_code` under `-D warnings`
+    // fails the macOS build. That is the trap the `command` split below was
+    // written to avoid, approached from the other side.
+    #[cfg(target_os = "macos")]
+    if let Some(motion) = macos::reduce_motion() {
+        return motion;
+    }
+
     #[cfg(target_os = "linux")]
     let command: Option<(&str, &[&str])> = Some((
         "gsettings",
         &["get", "org.gnome.desktop.interface", "enable-animations"],
     ));
-    // macOS (`NSWorkspace.accessibilityDisplayShouldReduceMotion`) and Windows
-    // (`SPI_GETCLIENTAREAANIMATION`) are named in the module doc and deliberately
-    // unread. Not a `#[cfg]` arm returning `Full` — that would look like a
-    // decision that had been *made* about those platforms rather than one that is
-    // outstanding, and it would leave the probe below dead code in every build of
-    // those two platforms, which `-D warnings` turns into a failed build.
+    // Windows (`SPI_GETCLIENTAREAANIMATION`) is named in the module doc and
+    // deliberately unread. Not a `#[cfg]` arm returning `Full` — that would look
+    // like a decision that had been *made* about that platform rather than one
+    // that is outstanding, and it would leave the probe below dead code in every
+    // Windows build, which `-D warnings` turns into a failed build.
     #[cfg(not(target_os = "linux"))]
     let command: Option<(&str, &[&str])> = None;
 
     probe(command).unwrap_or(Motion::Full)
+}
+
+/// The `bool` a platform reports, as the preference it means.
+///
+/// Broken out so the mapping is a pure function with its own test on every
+/// platform — the same reason [`parse_output`] exists rather than the comparison
+/// living inside the `gsettings` arm. macOS is the only caller today.
+fn from_reduce_motion_flag(reduced: bool) -> Motion {
+    if reduced {
+        Motion::Reduced
+    } else {
+        Motion::Full
+    }
+}
+
+/// The macOS read, in its own module so `objc2-app-kit` is named only in a build
+/// that has it: a `use` at the top of this file would need a `#[cfg]` of its own
+/// and would not resolve at all on Linux or Windows.
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::{Motion, from_reduce_motion_flag};
+    use objc2_app_kit::NSWorkspace;
+
+    /// `NSWorkspace.accessibilityDisplayShouldReduceMotion`.
+    ///
+    /// **Call from the main thread.** `sharedWorkspace` is a Cocoa singleton
+    /// accessor and AppKit expects it on the main thread. The one caller is
+    /// `main`, before the event loop is built, so that holds today — it is
+    /// recorded here so a future caller does not move this onto the render thread
+    /// or the stdin reader thread.
+    ///
+    /// Always `Some`: a `bool` getter cannot fail. The `Option` is the shape the
+    /// platform probes share, not an error channel.
+    pub(super) fn reduce_motion() -> Option<Motion> {
+        // SAFETY: a nib-less singleton accessor. It takes no argument, cannot
+        // fail, and the framework owns the object it returns.
+        let workspace = unsafe { NSWorkspace::sharedWorkspace() };
+        // SAFETY: reads a user default off a live `NSWorkspace`. The getter has
+        // no precondition beyond the receiver being valid, which the line above
+        // guarantees; it returns a `bool`, so no pointer leaves this call.
+        let reduced = unsafe { workspace.accessibilityDisplayShouldReduceMotion() };
+        Some(from_reduce_motion_flag(reduced))
+    }
 }
 
 /// Run a command — if there is one — and read the two answers out of its stdout.
@@ -113,6 +169,19 @@ mod tests {
         ] {
             assert_eq!(parse_output(other), None, "{other:?} is not an answer");
         }
+    }
+
+    /// The `bool` → preference mapping: the half of the macOS read that can be
+    /// checked on every platform. The framework call itself is one line with no
+    /// logic, so the double negative is the only place a mistake can hide.
+    #[test]
+    fn the_reduce_motion_flag_maps_to_the_preference_it_means() {
+        assert_eq!(
+            from_reduce_motion_flag(true),
+            Motion::Reduced,
+            "the platform saying yes means the user asked for less motion"
+        );
+        assert_eq!(from_reduce_motion_flag(false), Motion::Full);
     }
 
     /// The plumbing, not the schema: whatever a command prints on stdout is what

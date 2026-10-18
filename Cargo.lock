@@ -3255,6 +3255,7 @@ dependencies = [
  "accesskit",
  "accesskit_consumer",
  "accesskit_winit",
+ "objc2-app-kit",
  "rustim-anim",
  "rustim-client",
  "rustim-color",

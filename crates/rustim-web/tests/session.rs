@@ -56,10 +56,11 @@ fn the_browser_frame_is_the_desktop_golden() {
     let session = settled("pythagorean");
     let baseline = baseline_path("pythagorean");
     if !baseline.exists() {
-        // The macOS and Windows baselines are bootstrapped from a CI artifact
-        // (see `CLAUDE.md`, "Golden images"). Failing here would duplicate the
-        // golden suite's job on the platforms it deliberately does not treat
-        // differently; the determinism test below still runs everywhere.
+        // Only Windows is missing one now — `macos-aarch64.png` was committed on
+        // 2026-10-18. This early return exists so `rustim-web` does not *duplicate*
+        // the desktop suite's job on a platform whose baseline is still owed;
+        // failing here too would turn one missing artifact into two red suites.
+        // The determinism test below runs everywhere regardless.
         eprintln!(
             "no baseline at {}; only the desktop golden suite owes one",
             baseline.display()

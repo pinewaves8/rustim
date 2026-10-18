@@ -468,13 +468,32 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut voice = ProcessVoice::new(program, Platform::Linux, Some("cmn".to_owned()));
+        let mut voice = ProcessVoice::new(program.clone(), Platform::Linux, Some("cmn".to_owned()));
         voice.speak(SAID);
 
         let args = std::fs::read_to_string(&args_out).unwrap();
         assert_eq!(args, "-v\ncmn\n--stdin\n");
         let stdin = std::fs::read_to_string(&stdin_out).unwrap();
         assert_eq!(stdin, format!("{SAID}\n"));
+
+        // The macOS spec through the same fake backend. `say` takes no `--stdin`
+        // flag — it reads standard input when it is given no file — so the whole
+        // difference between the two spellings is that one argv entry. Running it
+        // here rather than on the machine that has `say` is the point: `Platform`
+        // exists so a spec can be *constructed* everywhere, and this is the one
+        // place a spawn is checked against it, so pinning it to `Platform::Linux`
+        // left the `say` argv unwitnessed by any test.
+        let mut voice = ProcessVoice::new(program, Platform::MacOs, Some("Tingting".to_owned()));
+        voice.speak(SAID);
+
+        let args = std::fs::read_to_string(&args_out).unwrap();
+        assert_eq!(args, "-v\nTingting\n");
+        let stdin = std::fs::read_to_string(&stdin_out).unwrap();
+        assert_eq!(
+            stdin,
+            format!("{SAID}\n"),
+            "`say` reads the sentence from stdin on both spellings"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
