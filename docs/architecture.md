@@ -857,8 +857,13 @@ needs longer than that to notice a new application and ask for its tree, so a ma
 "not attached, 0 pushes" with VoiceOver audibly running was measuring the *probe's* brevity, not the
 backend. `--frames 400000` on that machine (≈50 s) gave `assistive technology: attached`,
 `1 full, 399919 incremental` — one full snapshot on attach, exactly the `InitialTreeRequested` reset
-the adapter documents, and a difference per frame after it. **If the report says "not attached" on a
-fast machine, raise `--frames` before believing it.**
+the adapter documents, and a difference per frame after it.
+
+**So the probe now holds for a wall-clock minimum.** `PROBE_MIN_SECONDS` in `main` is 10 seconds, and
+probe mode does not end on the frame count alone: the count is a *floor*, and the run continues until
+it has been open long enough for a reader to act on. That is what makes the report's "not attached"
+mean **no reader** — which is the answer the report exists to give. Before the fix it could equally
+have meant *not enough time*, and on a fast machine it did.
 
 Verifying it by hand, per platform:
 

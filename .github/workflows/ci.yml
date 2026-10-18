@@ -108,6 +108,35 @@ jobs:
             exit 1
           fi
 
+      # The same guard for the AppKit binding `motion.rs` reads the reduce-motion
+      # preference through, and the same reasoning: `objc2-app-kit` has no
+      # `compile_error!` gate for non-Apple targets, and the six kernel crates are
+      # built as *libraries*, so nothing links their externals — a stray
+      # dependency there would compile and only surface on a machine that tried
+      # to use it.
+      #
+      # Only the prohibition can be asserted on this runner: the dependency is
+      # declared for `target_os = "macos"`, so on Linux it is not in
+      # `rustim-app`'s tree either. The non-vacuity half therefore reads the
+      # manifest — if that line is ever dropped, this guard would be checking
+      # nothing while still passing.
+      - name: the AppKit binding stays in the application layer
+        run: |
+          failed=0
+          for p in rustim-math rustim-color rustim-mobject \
+                   rustim-anim rustim-scene rustim-render rustim-director; do
+            if cargo tree -p "$p" -e normal --prefix none | grep -qE '^objc2(-| )'; then
+              echo "::error::$p depends on objc2; the AppKit binding belongs in rustim-app only"
+              cargo tree -p "$p" -e normal --prefix none | grep -E '^objc2(-| )'
+              failed=1
+            fi
+          done
+          if ! grep -q 'objc2-app-kit' crates/rustim-app/Cargo.toml; then
+            echo "::error::rustim-app no longer declares objc2-app-kit; the check above is vacuous"
+            exit 1
+          fi
+          exit $failed
+
   # Typst, for formulas, arrives carrying a whole second shaping stack: a frozen
   # `rustybuzz` / `ttf-parser` pair and its own font book. That is acceptable
   # only because it is confined to `rustim-text`, which is deliberately *not* one

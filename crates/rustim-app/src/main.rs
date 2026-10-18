@@ -30,7 +30,7 @@
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustim_anim::Motion;
 use rustim_app::a11y::{A11y, Request};
@@ -1152,6 +1152,16 @@ fn scene_names() -> String {
 /// long enough that no scene in this binary is still moving.
 const STILL_SECONDS: f64 = 10.0;
 
+/// How long an `--a11y-probe` run is held open at minimum, whatever `--frames`
+/// says.
+///
+/// Ten seconds is the figure the frame-count default was *chosen* to mean — 600
+/// frames at 60 fps — and the number a screen reader has to be given the chance
+/// to act on. Expressing it in seconds rather than frames is the fix for a probe
+/// that reported "not attached" on a machine fast enough to burn 600 idle frames
+/// in 2.4 of them; VoiceOver had simply not been given the time.
+const PROBE_MIN_SECONDS: Duration = Duration::from_secs(10);
+
 /// Present a premultiplied RGBA8 buffer as softbuffer's `0x00RRGGBB` words.
 ///
 /// The scene fills an opaque background first, so every pixel has `a == 255` and
@@ -1470,6 +1480,16 @@ struct App {
     /// and print what the accessibility layer did when the loop ends. Windowed
     /// only, enforced in `main`.
     probe: bool,
+    /// When a probe run started, so it can be held for a **wall-clock** minimum.
+    ///
+    /// `--frames` counts frames, and a frame is not a unit of time: an idle one
+    /// costs 0.12 ms on a fast machine, so the default 600 is 2.4 seconds there
+    /// and ten on a machine rendering at 60 fps. The probe exists to give a
+    /// screen reader time to notice the application and ask for its tree, which
+    /// is a wall-clock property — so probe mode does not end on the frame count
+    /// alone. `None` on every run that is not a probe, where the frame count is
+    /// the whole contract.
+    probe_start: Option<Instant>,
     /// What the feed has done so far, for the closing line.
     feed: feed::Counts,
     /// The window's current modifier state. winit delivers modifiers in their
@@ -1510,6 +1530,17 @@ struct App {
 }
 
 impl App {
+    /// Whether this run has been open long enough to call it finished.
+    ///
+    /// Always true outside probe mode, where `--frames` is the whole contract.
+    /// In probe mode the frame count is a *floor* rather than a deadline: the run
+    /// holds for [`PROBE_MIN_SECONDS`] so a screen reader gets the wall-clock time
+    /// the frame count was always standing in for.
+    fn probe_has_had_long_enough(&self) -> bool {
+        self.probe_start
+            .is_none_or(|start| start.elapsed() >= PROBE_MIN_SECONDS)
+    }
+
     fn request_redraw(&self) {
         if let Some(w) = &self.windowed {
             w.window.request_redraw();
@@ -1751,6 +1782,9 @@ impl ApplicationHandler<AppEvent> for App {
             && let Some(w) = self.windowed.as_mut()
         {
             w.a11y.core().offer(rustim_app::a11y::PROBE_ANNOUNCEMENT);
+        }
+        if self.probe {
+            self.probe_start = Some(Instant::now());
         }
         self.request_redraw();
     }
@@ -2121,6 +2155,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 if let Some(max) = self.max_frames
                     && self.frame >= max
+                    && self.probe_has_had_long_enough()
                 {
                     event_loop.exit();
                     return;
@@ -2776,6 +2811,7 @@ fn main() {
         pending: Vec::new(),
         reply,
         probe,
+        probe_start: None,
         caption,
         speaker,
         scene_name: scene_name.clone(),

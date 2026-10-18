@@ -121,9 +121,9 @@ has it as `/opt/homebrew/bin/cargo`. Check with `cargo --version` before assumin
 cargo run -p rustim-app              # launch the reference window
 cargo run -p rustim-app -- --png out.png   # headless: the scene after 10 s to a PNG
 cargo run -p rustim-app -- --inspect       # headless: the accessibility tree as JSON
-cargo run -p rustim-app -- --a11y-probe    # windowed: did a screen reader attach? (600 frames)
-#   600 frames is 10 s at 60 fps but ~2 s where idle frames cost 0.12 ms, and a reader needs
-#   longer than that to ask for the tree — raise --frames before believing a "not attached"
+cargo run -p rustim-app -- --a11y-probe    # windowed: did a screen reader attach? (~10 s minimum)
+#   the frame count is a floor, not a deadline: probe mode holds for PROBE_MIN_SECONDS of wall
+#   clock, because 600 frames is 10 s at 60 fps but 2.4 s where an idle frame costs 0.12 ms
 cargo run -p rustim-app -- --frames 300    # run 300 frames then exit
 cargo run -p rustim-app -- --scene primitives  # ...a named scene; `--help` lists them
 cargo run -p rustim-app -- --scene text --png out.png   # CJK + Latin glyph runs
