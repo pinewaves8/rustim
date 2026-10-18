@@ -314,6 +314,16 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   is an x86_64 baseline, or a rustc whose float codegen moves. Do not read the byte-identity as
   evidence that the split is unnecessary; read it as "the effect it guards against has not been seen
   yet".
+- **The CI runners are not the machine the baselines were made on, and for Linux that has always
+  meant a red leg.** `platform()` derives the name from the *runner's* arch, and GitHub's
+  `ubuntu-latest` is **x64** — `Ubuntu 24.04 | x64 | ubuntu-latest`, with the arm64 image under a
+  separate label, `ubuntu-24.04-arm` — while `macos-26` is arm64. So the three legs ask for
+  `linux-x86_64.png`, `macos-aarch64.png` and `windows-x86_64.png`. The committed pair is
+  `linux-aarch64` + `macos-aarch64`, so **CI's Linux leg has never been able to pass either**, on
+  any run, and the "Verified green … on linux-aarch64" above is a **development machine**, not a
+  runner: to this suite they are different platforms. That is precisely what the CI-artifact route
+  is for — both failing legs upload `target/golden-artifacts/`, so one push yields the
+  `linux-x86_64` and `windows-x86_64` baselines that close the matrix, with no extra hardware.
 - **The macOS route is now local, and it beats the CI-artifact route.** The baseline is produced by
   `BLESS=1 cargo test -p rustim-app --test goldens` on the machine itself (see "Commands"), in the
   **debug** profile, because both CI jobs that run goldens use a plain `cargo test`. `platform()`
