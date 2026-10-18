@@ -309,8 +309,10 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   today.** The macOS and Windows baselines have *not* been made: this machine cannot reach
   `github.com`, so the artifacts the CI job would have uploaded are unreachable from here, and the
   suite therefore fails on those two platforms by design rather than skipping them. That is
-  development-list item 1, blocked on how the artifacts are to be obtained (see the memory note and
-  the roadmap); do not invent baselines or weaken the missing-baseline rule to make the job green.
+  development-list item 1, and **on 2026-10-18 the user chose to defer it** until a Mac/Windows
+  machine or a reachable CI artifact store exists — the failing suite on those platforms is the
+  expected state, not a regression. Do not invent baselines or weaken the missing-baseline rule to
+  make the job green.
 - **The thresholds are §5.2's measured ones and are not to be relaxed**: identical content bounding
   boxes, zero pixels differing by more than 8, maximum channel error 3. The comparison lives in
   `rustim_export::compare` (not in the test), and the `rustim-compare` CLI is a thin shell over the
