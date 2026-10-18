@@ -194,16 +194,30 @@ mod tests {
         assert_eq!(from_reduce_motion_flag(false), Motion::Full);
     }
 
+    /// `probe`, pointed at a program that prints `text` on stdout and exits 0.
+    ///
+    /// The printer is spelled per platform, and that is not fussiness: `/bin/echo`
+    /// is Unix-only, so on Windows `probe` was being handed a program that does
+    /// not exist rather than one that prints — which is exactly how the Windows
+    /// leg of CI failed the first time it ever ran. "Whatever a command prints is
+    /// what gets parsed" needs a printer that exists.
+    fn probe_echo(text: &str) -> Option<Motion> {
+        #[cfg(unix)]
+        let (program, args) = ("/bin/echo", vec![text]);
+        #[cfg(windows)]
+        // `cmd /C echo …` prints the text followed by a CRLF, which `parse_output`
+        // trims like any other trailing whitespace.
+        let (program, args) = ("cmd", vec!["/C", "echo", text]);
+        probe(Some((program, args.as_slice())))
+    }
+
     /// The plumbing, not the schema: whatever a command prints on stdout is what
     /// gets parsed.
     #[test]
     fn the_probe_reads_the_command_s_stdout() {
-        assert_eq!(
-            probe(Some(("/bin/echo", &["false"]))),
-            Some(Motion::Reduced)
-        );
-        assert_eq!(probe(Some(("/bin/echo", &["true"]))), Some(Motion::Full));
-        assert_eq!(probe(Some(("/bin/echo", &["maybe"]))), None);
+        assert_eq!(probe_echo("false"), Some(Motion::Reduced));
+        assert_eq!(probe_echo("true"), Some(Motion::Full));
+        assert_eq!(probe_echo("maybe"), None);
     }
 
     /// A probe that cannot run has no answer, and no answer is not "reduced": the
@@ -215,8 +229,19 @@ mod tests {
             None,
             "a missing program is not an answer"
         );
+        // A program that runs and exits nonzero, spelled per platform. This was
+        // `/bin/false` on every platform, which does not exist on Windows — so
+        // there the assertion passed for the *wrong* reason (a missing program,
+        // which the case above already covers) on the one leg that never ran.
+        #[cfg(unix)]
         assert_eq!(
             probe(Some(("/bin/false", &[]))),
+            None,
+            "neither is a nonzero exit"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            probe(Some(("cmd", &["/C", "exit", "1"]))),
             None,
             "neither is a nonzero exit"
         );
