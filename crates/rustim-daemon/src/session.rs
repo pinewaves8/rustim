@@ -70,7 +70,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -219,6 +219,16 @@ pub struct SessionHandle {
     requests: mpsc::Sender<Request>,
     events: broadcast::Sender<Event>,
     now: watch::Receiver<f64>,
+    /// Set the moment a close is requested.
+    ///
+    /// Without it [`SessionHandle::alive`] would have to infer death from the
+    /// request channel closing, which only happens when the session thread has
+    /// been scheduled, read its queue and returned — so a client that closed a
+    /// session and a second client that pinged it a moment later were racing
+    /// the scheduler, and the integration suite failed roughly one run in five.
+    /// "Closed" is a fact the hub knows before the thread does, and it is the
+    /// answer a liveness check is asking for.
+    closed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -271,9 +281,15 @@ impl SessionHandle {
         *self.now.borrow()
     }
 
-    /// Whether the session thread is still accepting work.
+    /// Whether the session is still accepting work.
+    ///
+    /// False once the hub has closed it — deterministically, from the instant
+    /// `close` is issued — or once the session thread has ended on its own
+    /// (a closed request channel). A handle kept by another connection stays
+    /// answerable through [`SessionHandle::id`]; it just reports itself dead,
+    /// and a command sent through it is answered `Closed`.
     pub fn alive(&self) -> bool {
-        !self.requests.is_closed()
+        !self.closed.load(Ordering::Acquire) && !self.requests.is_closed()
     }
 
     /// A new subscriber to this session's event stream.
@@ -323,8 +339,16 @@ impl SessionHandle {
         answer.await.map_err(|_| AdvanceError::Closed)
     }
 
-    fn shutdown(&self) {
-        let _ = self.requests.try_send(Request::Shutdown);
+    /// Ask the session thread to stop.
+    ///
+    /// `send().await` rather than `try_send`: a full queue would otherwise drop
+    /// the shutdown on the floor, leaving a session the hub has already
+    /// forgotten running behind a handle nobody can address. Waiting for
+    /// capacity is bounded by the queue draining, and a dead thread closes the
+    /// channel and fails the send immediately.
+    async fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
+        let _ = self.requests.send(Request::Shutdown).await;
     }
 }
 
@@ -450,7 +474,7 @@ impl Hub {
         let handle = self.sessions.lock().await.remove(id);
         match handle {
             Some(handle) => {
-                handle.shutdown();
+                handle.shutdown().await;
                 true
             }
             None => false,
@@ -598,6 +622,7 @@ async fn spawn_session(
         requests: request_tx,
         events: event_tx,
         now: now_rx,
+        closed: Arc::new(AtomicBool::new(false)),
     }))
 }
 

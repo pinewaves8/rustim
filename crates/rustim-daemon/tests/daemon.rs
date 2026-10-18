@@ -386,7 +386,10 @@ async fn close_ends_the_session_for_every_attached_client() {
 
     // The second connection still holds the handle it attached to; `ping` is
     // how it learns the handle is dead (`alive: false`) rather than being told
-    // by a push it never asked for.
+    // by a push it never asked for. The answer is deterministic from the
+    // instant `close` returns — the handle records the close itself rather than
+    // inferring it from the session thread having exited — which is why this
+    // assertion is not racy against the scheduler.
     let frame = call(&mut second, 2, "ping", json!({})).await;
     assert_eq!(result(&frame)["session"], "s1");
     assert_eq!(result(&frame)["alive"], false, "{frame}");
