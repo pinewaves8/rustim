@@ -1173,3 +1173,16 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   This also closes the item `CLAUDE.md` called "development list item 1" for every platform it names
   — Linux x86_64 included, which no one had noticed was missing because "verified green on
   linux-aarch64" describes a development machine rather than a runner.
+
+- **A still is an artifact too, so `--png` no longer asks the desktop for a preference.** The video
+  export had always forced `Motion::Full` on the grounds that reduced motion is a *player's*
+  preference and a film rendered on a machine with it enabled would be a different film. The same
+  argument applies verbatim to a still, and the CI run above is what made it urgent: reading the
+  preference on macOS turned `a_tempo_slows_the_still_into_mid_fade` into a machine-dependent test —
+  green on the development machine, red on the runner. Both are now `Full` unless `--motion` is
+  given explicitly, so the default is deterministic and a test has to *opt in* to inheriting a
+  desktop setting. Verified by rendering the same tempo script with and without `--motion full` and
+  getting `max == 0`. `使用说明.md` and `docs/architecture.md` both carry the rule, and the manual's
+  cross-reference is fixed while it was being edited: the macOS switch is **减弱动态效果**, not
+  减少动态效果 — the wrong word is why it could not be found, and `defaults write` cannot be used
+  instead because macOS 26 refuses to write that domain.

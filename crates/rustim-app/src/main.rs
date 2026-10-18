@@ -2430,12 +2430,23 @@ fn main() {
     // rather than in `SceneContext` because a preference is a platform question and
     // the context lives in the wasm kernel — see `rustim_app::motion` for exactly
     // which platforms answer and which do not.
-    // An export is an artifact, so it must not depend on the desktop that made
-    // it: reduced motion is a *player's* preference, and a video rendered on a
-    // machine with it enabled would be a different film from the same command on
-    // another machine. The same reason the golden suite passes `--motion full`.
+    // Anything that **writes a file** is an artifact, so it must not depend on
+    // the desktop that made it: reduced motion is a *player's* preference, and a
+    // video — or a still — rendered on a machine with it enabled would differ
+    // from the same command on another machine. A video was the only case this
+    // knew about, and a still is the same argument: the same `--png` invocation
+    // has to mean the same picture everywhere.
+    //
+    // That is not hypothetical. `--png` reading the platform preference is
+    // exactly what made `a_tempo_slows_the_still_into_mid_fade` pass on the
+    // development machine and fail on the CI runner, whose desktop setting is on;
+    // the fix there was to pin `--motion full`, and this is the same fix applied
+    // to the default, so a test *has* to opt in to the preference to be exposed
+    // to it. The windowed path still asks the platform, which is where a
+    // preference belongs. Same reason the golden suite passes `--motion full`.
+    let writing_an_artifact = exporting_video || png.is_some();
     let motion = motion.unwrap_or_else(|| {
-        if exporting_video {
+        if writing_an_artifact {
             Motion::Full
         } else {
             rustim_app::motion::from_platform()

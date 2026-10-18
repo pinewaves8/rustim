@@ -686,6 +686,16 @@ listener, so a desktop setting changed mid-run is not observed — the explicit 
 route. That mapping lives in `rustim-app` and not in the kernel for the same reason `accesskit` does:
 `rustim-anim` compiles to wasm, and a crate that spawns a process or calls AppKit does not.
 
+**The preference is asked only by the window, not by anything that writes a file.** `--png`,
+`--video` and `--video-png` are all `Motion::Full` unless `--motion` says otherwise: a preference is
+something a *player* has, and an artifact that changed with the machine that produced it would not be
+the same artifact. The video half of that rule came first; the still half arrived when reading the
+preference on macOS turned `a_tempo_slows_the_still_into_mid_fade` into a machine-dependent test — it
+passed here and failed on the CI runner, which has the setting on. The rule for tests follows from
+it: **a test that asserts an animation's state mid-beat passes `--motion full` explicitly** (the
+golden suite always did), so that it opts in to being exposed to a desktop preference rather than
+silently inheriting one.
+
 ## The two structural changes relative to Manim
 
 1. **Transforms are deferred.** Manim bakes a transform into the point array of every descendant, so
