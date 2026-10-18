@@ -562,8 +562,9 @@ of I/O and of a JSON parser (it compiles to wasm).
   cannot be read, `--reply` with no `--script`, and `--reply` with `--inspect` are `exit(2)`.
 - **A script is applied after `construct` and at virtual time zero**, so the scene's own objects keep
   the ids they always had and the same script replays to the same frame (asserted `max == 0`, not the
-  golden tolerance). The feed is orthogonal to the scene: `--scene rotate --script /dev/null` is
-  byte-identical to `--scene rotate`.
+  golden tolerance). The feed is orthogonal to the scene: `--scene rotate` with a script that
+  contains nothing at all is byte-identical to `--scene rotate` — the tests spell that as a real
+  empty file rather than `/dev/null`, which Unix has and Windows does not.
 - **`--script` without `--scene` runs on a `BlankScene`** — an empty `construct`, deliberately **not**
   in the `--scene` registry, so `--help` does not list it and the golden suite does not owe it a
   baseline on three platforms.

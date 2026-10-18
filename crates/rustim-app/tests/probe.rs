@@ -19,14 +19,28 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("the binary under test is built")
 }
 
+/// A path to an empty script that **exists**, so these refusals are about the
+/// *flags* and not about a path the binary could not open.
+///
+/// `/dev/null` was the spelling here, and it does not exist on Windows — which
+/// would have made the third case pass there for the wrong reason, or fail,
+/// depending on when the gate runs. The temp directory is portable.
+fn empty_script() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("rustim-probe-refusal.jsonl");
+    std::fs::write(&path, "").expect("write the empty script");
+    path
+}
+
 #[test]
 fn the_probe_refuses_every_headless_flag() {
+    let script = empty_script();
+    let script = script.to_str().expect("a utf-8 temp path");
     for args in [
-        &["--a11y-probe", "--inspect"][..],
-        &["--a11y-probe", "--png", "unused.png"][..],
-        &["--a11y-probe", "--script", "/dev/null", "--reply"][..],
+        vec!["--a11y-probe", "--inspect"],
+        vec!["--a11y-probe", "--png", "unused.png"],
+        vec!["--a11y-probe", "--script", script, "--reply"],
     ] {
-        let out = run(args);
+        let out = run(&args);
         assert_eq!(
             out.status.code(),
             Some(2),

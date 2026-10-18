@@ -63,6 +63,26 @@ fn scratch(name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// A script that is empty, on every platform.
+///
+/// The Unix idiom for this is `/dev/null`, which **does not exist on Windows** —
+/// and there the binary correctly refuses a missing script path, so a test that
+/// meant "an empty script" was really asserting "a broken one". That is exactly
+/// how the Windows leg of CI read it the first time it ran. Named per caller so
+/// two tests cannot write the same file at once.
+fn empty_script(name: &str) -> PathBuf {
+    scratch(name, "")
+}
+
+/// A path to write a render that the test never looks at.
+///
+/// `/dev/null` again, in its other role: a throwaway *output* rather than a
+/// throwaway input. Windows has a `NUL` device, but going through the artifacts
+/// directory keeps one spelling for both platforms.
+fn discard_png(name: &str) -> PathBuf {
+    out_path(name)
+}
+
 struct Ran {
     status: std::process::ExitStatus,
     stdout: String,
@@ -1142,15 +1162,16 @@ fn a_script_applies_on_top_of_a_named_scene() {
     let bare = out_path("rotate-bare");
     let empty = out_path("rotate-empty");
     run(&["--scene", "rotate", "--png", bare.to_str().unwrap()]).ok("--scene rotate --png");
+    let nothing = empty_script("rotate-empty");
     run(&[
         "--scene",
         "rotate",
         "--script",
-        "/dev/null",
+        nothing.to_str().unwrap(),
         "--png",
         empty.to_str().unwrap(),
     ])
-    .ok("--scene rotate --script /dev/null --png");
+    .ok("--scene rotate --script <empty> --png");
 
     let tolerance = Tolerance::default();
     let same = compare_png_files(&bare, &empty, &tolerance).expect("compare");
@@ -1469,11 +1490,12 @@ fn a_subscribed_script_receives_beat_events_and_a_frame_ready() {
 /// refuse, and a host that asked for a session and got none must hear about it.
 #[test]
 fn a_missing_script_file_is_an_error() {
+    let discard = discard_png("missing-script");
     let ran = run(&[
         "--script",
         "/nonexistent/session.jsonl",
         "--png",
-        "/dev/null",
+        discard.to_str().unwrap(),
     ]);
     assert_eq!(ran.status.code(), Some(2), "got {}", ran.status);
     assert!(
@@ -1490,7 +1512,8 @@ fn a_missing_script_file_is_an_error() {
 /// silence would look exactly like an engine that refuses everything.
 #[test]
 fn the_two_ways_to_misuse_reply_are_refused() {
-    let no_script = run(&["--reply", "--png", "/dev/null"]);
+    let discard = discard_png("reply-no-script");
+    let no_script = run(&["--reply", "--png", discard.to_str().unwrap()]);
     assert_eq!(no_script.status.code(), Some(2), "got {}", no_script.status);
     assert!(
         no_script.stderr.contains("--script"),
@@ -1498,7 +1521,13 @@ fn the_two_ways_to_misuse_reply_are_refused() {
         no_script.stderr
     );
 
-    let both = run(&["--script", "/dev/null", "--reply", "--inspect"]);
+    let nothing = empty_script("reply-inspect");
+    let both = run(&[
+        "--script",
+        nothing.to_str().unwrap(),
+        "--reply",
+        "--inspect",
+    ]);
     assert_eq!(both.status.code(), Some(2), "got {}", both.status);
     assert!(both.stderr.contains("--inspect"), "{}", both.stderr);
 }
