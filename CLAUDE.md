@@ -24,10 +24,14 @@ probes are the evidence for every number quoted in this file and in `方案建�
    projects, and the cross-platform analysis. It **supersedes** the two documents below wherever they
    disagree.
 2. `从零用 Rust 重写 Manim 最小验证教程.wps` — a 22-page tutorial (OLE2/Word 97 format, extract with a
-   custom reader; no `catdoc`/`libreoffice`). Defines a module layout, trait designs and code sketches
-   for a deliberately minimal ~800-line version. **Its code blocks are illustrative sketches, not
-   compilable code**, and the workspace does not follow its flat `src/` layout — see "Where the
-   workspace diverges from the tutorial" in [`docs/architecture.md`](docs/architecture.md).
+   custom reader; no `catdoc`/`libreoffice`) that defined a module layout, trait designs and code
+   sketches for a deliberately minimal ~800-line version. **It is an external input and is
+   deliberately *not* in this repository** — it was removed from the history on 2026-10-19 because
+   its provenance is not ours to redistribute, and a binary Word 97 document is not reviewable here
+   anyway. What the workspace carries is where it **disagrees** with the tutorial, in
+   [`docs/architecture.md`](docs/architecture.md) ("Where the workspace diverges from the
+   tutorial"): **its code blocks are illustrative sketches, not compilable code**, and the workspace
+   does not follow its flat `src/` layout.
 3. `需求探讨.txt` — the original design rationale: why Rust, why this is an architecture change rather
    than a translation, and three candidate technical routes with cost/benefit.
 
