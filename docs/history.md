@@ -1186,3 +1186,38 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   cross-reference is fixed while it was being edited: the macOS switch is **减弱动态效果**, not
   减少动态效果 — the wrong word is why it could not be found, and `defaults write` cannot be used
   instead because macOS 26 refuses to write that domain.
+
+- **The first all-green CI run, and what it cost to get there.** The repository had never run CI —
+  there was no remote — so every platform claim in these documents described a development machine.
+  One push produced a run with **eight jobs green on three platforms at once** (macOS 26 arm64,
+  Ubuntu 24.04 x64, Windows x64), and the six runs it took were not waste: each failure was a real
+  defect, and five were things no amount of local work would have shown.
+
+  1. **`from_reduce_motion_flag` is never used** — the mapping's only caller sits behind
+     `#[cfg(target_os = "macos")]`, so on Linux and Windows the function had no caller and
+     `-D warnings` made that a build failure. Introduced by this session's macOS work, and invisible
+     locally because clippy was only ever run on macOS.
+  2. **`a_tempo_slows_the_still_into_mid_fade`** — a regression from the same work. Reading the
+     system reduce-motion preference on macOS turned a test that asserts an animation's *mid-beat*
+     state into a machine-dependent one, and the runner has the setting on. Reproduced exactly by
+     forcing `--motion reduced` here (`max == 0` against `max == 119`), and it is what pushed `--png`
+     to stop asking for a preference at all: a still is an artifact like a video.
+  3. **CI's Linux leg asks for `linux-x86_64.png`** — the runner is x64 while the committed baseline
+     was `linux-aarch64`, so that leg could never have passed, on any run, and no one had noticed
+     because it had never run.
+  4. **All four baseline sets are byte-identical.** Downloading the two failing legs' artifacts gave
+     the missing pair, and comparing them against the aarch64 baselines gave `max == 0` on all eight
+     scenes across two ISAs and two operating systems. "NEON and SSE/AVX do not round identically" is
+     the stated justification for per-platform baselines everywhere here; it has now been looked for
+     and not found — almost certainly because the build runs `u8_pipeline`, not the `f32_pipeline`
+     the proposal cites. The split stands as a guard whose subject has not appeared.
+  5. **Five tests spelled Unix-only paths**, all found by the Windows leg on its first execution:
+     `/bin/echo` in `motion.rs` (a real failure), and `/dev/null` in five places as the idiom for
+     "an empty script" — one a real failure, four passing by luck because the refusals they test fire
+     before the path is opened. `a_probe_that_cannot_run_answers_nothing` is the sharper case: it used
+     `/bin/false` for "a nonzero exit is not an answer", and on Windows that path is *missing*, so it
+     passed for the wrong reason — the case directly above it already covered missing programs.
+
+  Item 4 also closed the last of the golden-baseline item for every platform, Linux x86_64 included,
+  with no extra hardware: the failing legs upload `target/golden-artifacts/`, which is the route the
+  documents always described and which had never been walked.

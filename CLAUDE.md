@@ -54,15 +54,24 @@ rule is a change to **`驱动协议v1.md`, `使用说明.md` and the conformance
 manual is a user-facing wrong answer that nothing in CI reads. "Confirmed by a doc" is not a test —
 `crates/rustim-app/tests/conformance.rs` is what makes the wire's promises executable.
 
-**Verified green as of 2026-10-18 on two platforms — linux-aarch64 and macos-aarch64: 938 tests**
-(unit, integration and doctest — `cargo test --workspace` reproduces the number), `clippy -D warnings`
-and `cargo fmt --check` clean, the six-crate semantic kernel building for `wasm32-unknown-unknown` with
-no parley or Typst in it, all eight golden scenes matching their checked-in baselines **on both**,
-the conformance suite driving the real binary through `rustim-client` alone, two external runners in
-`sdks/python` and `sdks/typescript` sharing no code with the engine, `rustim-daemon` verified over
-real loopback WebSockets and `rustim-mcp` over a real stdio pipe.
+**Verified green as of 2026-10-19 in CI, on all three target platforms at once** — the first
+all-green run this repository has ever had (macOS 26 arm64, Ubuntu 24.04 x64 and Windows x64, every
+job): **939 tests** (unit, integration and doctest — `cargo test --workspace` reproduces the number),
+`clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` clean, all eight golden
+scenes matching their checked-in baselines **on each platform**, and the two `cargo tree` guard jobs
+(the wasm32 semantic kernel, and Typst staying inside `rustim-text`). Two development machines agree:
+linux-aarch64 and macos-aarch64 also run the whole suite, the conformance suite driving the real
+binary through `rustim-client` alone, the two external runners in `sdks/python` and
+`sdks/typescript` sharing no code with the engine, `rustim-daemon` over real loopback WebSockets and
+`rustim-mcp` over a real stdio pipe.
 [`docs/architecture.md`](docs/architecture.md) describes each subsystem;
 [`docs/history.md`](docs/history.md) says which step last moved the count.
+
+**Until 2026-10-19 that claim was narrower than it looked.** CI had never run — there was no remote —
+so "verified green on linux-aarch64" described a *development machine*, and the two platforms it did
+not cover had never executed a test at all. The first run found five things, three of them
+pre-existing and Windows-only (see `docs/history.md`); that is what a platform matrix is for, and it
+is why the run is now the evidence rather than the configuration.
 
 **Windows has no golden baseline**, so the suite **fails there by design** — a missing baseline is a
 failure, never a skip. That is the expected state on that platform, not a regression: **do not invent
