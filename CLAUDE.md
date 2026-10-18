@@ -305,25 +305,34 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   platform is "download, review, commit". **`linux-aarch64.png` and `macos-aarch64.png` are checked in
   for all eight scenes; Windows has none**, so the suite still fails there by design rather than
   skipping. That remains development-list item 1.
-- **What the macOS baselines turned out to be.** They were made on 2026-10-18 on a macOS 26 arm64
-  machine, and every one is **byte-for-byte identical** to its `linux-aarch64` twin — same pixels
-  (`max == 0`) and the same compressed bytes. That is worth stating plainly, because the rule above
-  is justified by "NEON and SSE/AVX do not round identically" and the two checked-in platforms are
-  the *same* architecture, so nothing here has yet exercised an actual cross-arch divergence. The
-  per-arch split is a **guard**, not a reproduction of an observed difference: what it is waiting for
-  is an x86_64 baseline, or a rustc whose float codegen moves. Do not read the byte-identity as
-  evidence that the split is unnecessary; read it as "the effect it guards against has not been seen
-  yet".
+- **What the baselines turned out to be: four platforms, one image.** All four checked-in sets —
+  `linux-aarch64`, `linux-x86_64`, `macos-aarch64` and `windows-x86_64` — are **byte-for-byte
+  identical** for every scene. The first two were made on development machines; the x86_64 pair came
+  from the CI runners, downloaded from the failing `goldens` jobs as `target/golden-artifacts/`,
+  compared with `rustim-compare` and committed. (GitHub's `ubuntu-latest` and `windows-latest` are
+  both **x64** — the arm64 images are separate labels, `ubuntu-24.04-arm` and `windows-11-arm` — so
+  the Linux leg of CI asks for `linux-x86_64.png` and could never have passed before this.)
+  This is worth stating plainly, because the rule above is justified by "NEON and SSE/AVX do not
+  round identically": that divergence has now been looked for across **two ISAs and two operating
+  systems, on four independently built binaries**, and it does not appear. The likely reason is the
+  pipeline the build actually uses — `u8_pipeline` / `RenderMode::OptimizeSpeed`, not the
+  `f32_pipeline` the proposal cites — which quantises during rasterisation and so absorbs the
+  sub-pixel differences an f32 path would expose.
+  **The per-arch split is a guard, not a reproduction of an observed difference**, and the right
+  reading is "the effect it guards against has not been seen yet", not "the split is unnecessary".
+  What would still move it: a rustc whose codegen changes, a CPU whose runtime SIMD level the
+  current scenes do not reach, or a scene touching a part of the rasteriser these eight do not.
 - **The CI runners are not the machine the baselines were made on, and for Linux that has always
   meant a red leg.** `platform()` derives the name from the *runner's* arch, and GitHub's
   `ubuntu-latest` is **x64** — `Ubuntu 24.04 | x64 | ubuntu-latest`, with the arm64 image under a
   separate label, `ubuntu-24.04-arm` — while `macos-26` is arm64. So the three legs ask for
   `linux-x86_64.png`, `macos-aarch64.png` and `windows-x86_64.png`. The committed pair is
-  `linux-aarch64` + `macos-aarch64`, so **CI's Linux leg has never been able to pass either**, on
-  any run, and the "Verified green … on linux-aarch64" above is a **development machine**, not a
-  runner: to this suite they are different platforms. That is precisely what the CI-artifact route
-  is for — both failing legs upload `target/golden-artifacts/`, so one push yields the
-  `linux-x86_64` and `windows-x86_64` baselines that close the matrix, with no extra hardware.
+  `linux-aarch64` + `macos-aarch64`, so **CI's Linux leg could never have passed either**, on any
+  run, and the "Verified green … on linux-aarch64" status above is a **development machine**, not a
+  runner: to this suite they are different platforms. That is what the CI-artifact route is for, and
+  it worked — both failing legs uploaded `target/golden-artifacts/`, and the `linux-x86_64` and
+  `windows-x86_64` baselines now in the tree came from exactly those downloads. **No extra hardware
+  was needed to close the platform matrix**; all four sets now exist, and they are identical (below).
 - **The macOS route is now local, and it beats the CI-artifact route.** The baseline is produced by
   `BLESS=1 cargo test -p rustim-app --test goldens` on the machine itself (see "Commands"), in the
   **debug** profile, because both CI jobs that run goldens use a plain `cargo test`. `platform()`

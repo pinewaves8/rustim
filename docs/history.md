@@ -1152,3 +1152,24 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   wrong state rather than fixing an observed symptom. Left open, and neither is a code gap:
   **Windows** has no baseline (same procedure, `windows-x86_64`), and **`--video out.mp4`** needs an
   `ffmpeg` neither macOS nor Windows ships.
+
+- **The platform matrix is closed — and the four baselines are one image.** The first CI run this
+  repository ever had failed on both x86_64 legs for want of a baseline and uploaded
+  `target/golden-artifacts/`, which is the route the docs always described and which had never been
+  walked. Downloading those two artifacts, reviewing them and committing them produced
+  `linux-x86_64.png` and `windows-x86_64.png` beside the existing pair, so **all three CI legs now
+  have a baseline, and no extra hardware was involved.**
+
+  The measurement that fell out of it is the one the docs had been asserting without evidence. All
+  four sets — `linux-aarch64`, `linux-x86_64`, `macos-aarch64`, `windows-x86_64` — are
+  **byte-for-byte identical** for every scene: two ISAs (NEON and SSE/AVX), two operating systems,
+  four independently built binaries, `max == 0` everywhere. "NEON and SSE/AVX do not round
+  identically" is true in general and **not observable here**, almost certainly because the build
+  runs `u8_pipeline` / `RenderMode::OptimizeSpeed` rather than the `f32_pipeline` the proposal cites:
+  quantisation during rasterisation absorbs exactly the sub-pixel differences an f32 path would
+  surface. The per-arch split therefore stands as a **guard whose subject has not appeared**, and the
+  docs now say that instead of presenting the divergence as an observed fact.
+
+  This also closes the item `CLAUDE.md` called "development list item 1" for every platform it names
+  — Linux x86_64 included, which no one had noticed was missing because "verified green on
+  linux-aarch64" describes a development machine rather than a runner.
