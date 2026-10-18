@@ -1357,6 +1357,16 @@ impl From<MotionMode> for rustim_anim::Motion {
     }
 }
 
+impl From<rustim_anim::Motion> for MotionMode {
+    /// The reply direction, so that a driver reads back the same name it wrote.
+    fn from(motion: rustim_anim::Motion) -> Self {
+        match motion {
+            rustim_anim::Motion::Full => Self::Full,
+            rustim_anim::Motion::Reduced => Self::Reduced,
+        }
+    }
+}
+
 /// The wire spelling of [`rustim_director::Direction`]: which way
 /// [`Command::NextTo`] places its target.
 ///
@@ -1959,8 +1969,12 @@ impl StateDiff {
 pub enum CommandOutcome {
     /// The command ran. The diff describes the tree change, which may be empty.
     Applied(StateDiff),
-    /// The command read the tree and changed nothing.
-    Queried(SemanticTree),
+    /// The command read the tree and changed nothing, and the session state came
+    /// back beside it — a `query` is the one command that answers with both.
+    Queried {
+        tree: SemanticTree,
+        session: SessionState,
+    },
     /// The command linted the frame and timeline, changing nothing.
     Checked(CheckReport),
     /// The command reported where a lecture plan is, changing nothing.
@@ -1974,9 +1988,41 @@ impl CommandOutcome {
     pub fn diff(&self) -> Option<&StateDiff> {
         match self {
             Self::Applied(diff) => Some(diff),
-            Self::Queried(_) | Self::Checked(_) | Self::Planned(_) | Self::Greeted(_) => None,
+            Self::Queried { .. } | Self::Checked(_) | Self::Planned(_) | Self::Greeted(_) => None,
         }
     }
+}
+
+/// The session's own state, as a `query` reports it.
+///
+/// **Beside the tree, not in it.** The playback machine and the motion policy are
+/// properties of the *session* rather than of any node, and the semantic tree
+/// deliberately has no room for them — a screen reader asking what is on screen
+/// has no use for the tempo. So they travel as a sibling field of the reply,
+/// which is why none of this appears in [`SemanticTree`].
+///
+/// Every field is one a driver can also **write** — `pause`/`resume`, `tempo`,
+/// `motion` and `seek` — and until this existed the protocol was write-only for
+/// all four. A driver taking over a session could not ask what state the previous
+/// one left it in, which is the one thing that matters when two assistants share
+/// an engine.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SessionState {
+    /// True between a `pause` and a `resume`. A pause outlives a `stop`, because
+    /// a viewer's hold is not the content's to undo.
+    pub paused: bool,
+    /// The tempo multiplier of both clocks, in `MIN_TEMPO..=MAX_TEMPO`.
+    pub tempo: f64,
+    /// The policy the **next beat started** will be given. A beat already running
+    /// keeps the policy it was handed, so this is a prediction, not a report.
+    pub motion: MotionMode,
+    /// Whether the timeline is still moving — the beat queue or the scheduler has
+    /// work. True through a pause, for the reason `stop` and `pause` document.
+    pub playing: bool,
+    /// Lecture time in seconds: what `seek` is expressed in, what `tempo` scales,
+    /// and what an `.srt` is timed by. Not wall time, so it is the same number in
+    /// a window at 60 fps and in a headless still.
+    pub clock: f64,
 }
 
 /// What a host gets back for one line of a command feed.
@@ -1999,6 +2045,11 @@ impl CommandOutcome {
 /// `plan.status` gets a `plan`: where the lecture is, including a report that no
 /// plan is loaded. A host that sent a `hello` gets `capabilities`: the
 /// vocabulary of this build, not the state of this session.
+///
+/// `session` is **not one of the six.** It rides with `tree` on a `query` — see
+/// [`SessionState`] — so the presence discriminant is unchanged, and a client
+/// that counts the six by name (all three of the ones in this repository do)
+/// needs no change to keep counting them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandReply {
     /// The 1-based *physical* line the command came from, so a human reading a
@@ -2009,6 +2060,15 @@ pub struct CommandReply {
     /// The document a `query` asked for; see [`SemanticTree`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tree: Option<SemanticTree>,
+    /// The session state a `query` reports **beside** that document; see
+    /// [`SessionState`].
+    ///
+    /// Present exactly when `tree` is, and absent otherwise. It is *not* a
+    /// seventh presence — the six-field discriminant above is unchanged, which is
+    /// what lets a client that counts them by name (`rustim-client`, and both
+    /// SDK runners) keep working without knowing this field exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionState>,
     /// What a `check` found; see [`CheckReport`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<CheckReport>,
@@ -2029,6 +2089,7 @@ impl CommandReply {
             seq,
             diff: Some(diff),
             tree: None,
+            session: None,
             report: None,
             plan: None,
             capabilities: None,
@@ -2037,11 +2098,14 @@ impl CommandReply {
     }
 
     /// The reply to a command that read the tree.
-    pub fn queried(seq: u64, tree: SemanticTree) -> Self {
+    pub fn queried(seq: u64, tree: SemanticTree, session: SessionState) -> Self {
         Self {
             seq,
             diff: None,
             tree: Some(tree),
+            // Always with `tree`, never without it: a `query` is the one command
+            // that answers with both, and the six-presence rule counts neither.
+            session: Some(session),
             report: None,
             plan: None,
             capabilities: None,
@@ -2056,6 +2120,7 @@ impl CommandReply {
             seq,
             diff: None,
             tree: None,
+            session: None,
             report: Some(report),
             plan: None,
             capabilities: None,
@@ -2072,6 +2137,7 @@ impl CommandReply {
             seq,
             diff: None,
             tree: None,
+            session: None,
             report: None,
             plan: Some(plan),
             capabilities: None,
@@ -2086,6 +2152,7 @@ impl CommandReply {
             seq,
             diff: None,
             tree: None,
+            session: None,
             report: None,
             plan: None,
             capabilities: Some(capabilities),
@@ -2100,6 +2167,7 @@ impl CommandReply {
             seq,
             diff: None,
             tree: None,
+            session: None,
             report: None,
             plan: None,
             capabilities: None,
@@ -2136,7 +2204,7 @@ pub fn parse_command(line: &str) -> Option<Result<Command, CommandError>> {
 pub fn reply_line(seq: u64, outcome: Result<CommandOutcome, CommandError>) -> String {
     let reply = match outcome {
         Ok(CommandOutcome::Applied(diff)) => CommandReply::applied(seq, diff),
-        Ok(CommandOutcome::Queried(tree)) => CommandReply::queried(seq, tree),
+        Ok(CommandOutcome::Queried { tree, session }) => CommandReply::queried(seq, tree, session),
         Ok(CommandOutcome::Checked(report)) => CommandReply::checked(seq, report),
         Ok(CommandOutcome::Planned(plan)) => CommandReply::planned(seq, plan),
         Ok(CommandOutcome::Greeted(capabilities)) => CommandReply::greeted(seq, capabilities),
@@ -3160,6 +3228,18 @@ mod tests {
     use super::*;
     use rustim_math::Rect;
 
+    /// A session state to hand to `CommandReply::queried` in tests that are not
+    /// about the session: the values a freshly built context reports.
+    fn session() -> SessionState {
+        SessionState {
+            paused: false,
+            tempo: 1.0,
+            motion: MotionMode::Full,
+            playing: false,
+            clock: 0.0,
+        }
+    }
+
     #[test]
     fn commands_round_trip_through_json() {
         // Ids are opaque 64-bit handles, so the literal in the JSON has to be a
@@ -3630,6 +3710,7 @@ mod tests {
         let read = CommandReply::queried(
             8,
             crate::a11y::build(&SceneTree::new(), &Viewport::default(), None),
+            session(),
         );
         assert!(
             read.diff.is_none()
@@ -3639,6 +3720,16 @@ mod tests {
         );
         assert!(!serde_json::to_string(&read).unwrap().contains("error"));
 
+        // `session` rides with `tree` and is not a seventh half: present exactly
+        // when the tree is, so a client counting the six by name — which is what
+        // `rustim-client` and both SDK runners do — keeps counting six.
+        let read_json = serde_json::to_string(&read).unwrap();
+        assert!(read_json.contains("\"session\""), "{read_json}");
+        assert!(
+            !serde_json::to_string(&ok).unwrap().contains("session"),
+            "a mutation reports no session"
+        );
+
         let lint = CommandReply::checked(11, CheckReport::default());
         assert!(
             lint.diff.is_none()
@@ -3647,6 +3738,10 @@ mod tests {
                 && lint.error.is_none()
         );
         assert!(!serde_json::to_string(&lint).unwrap().contains("null"));
+        assert!(
+            !serde_json::to_string(&lint).unwrap().contains("session"),
+            "a lint reports no session"
+        );
 
         let no = CommandReply::refused(
             9,
@@ -3761,7 +3856,11 @@ mod tests {
     fn a_query_reply_round_trips_through_json() {
         let mut tree = SceneTree::new();
         tree.insert(Mobject::new(vec![]));
-        let reply = CommandReply::queried(6, crate::a11y::build(&tree, &Viewport::default(), None));
+        let reply = CommandReply::queried(
+            6,
+            crate::a11y::build(&tree, &Viewport::default(), None),
+            session(),
+        );
         let json = serde_json::to_string(&reply).unwrap();
         let parsed: CommandReply = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, reply);
@@ -5873,11 +5972,10 @@ mod tests {
         // one thing a query is not.
         let queried: serde_json::Value = serde_json::from_str(&reply_line(
             4,
-            Ok(CommandOutcome::Queried(crate::a11y::build(
-                &SceneTree::new(),
-                &Viewport::default(),
-                None,
-            ))),
+            Ok(CommandOutcome::Queried {
+                tree: crate::a11y::build(&SceneTree::new(), &Viewport::default(), None),
+                session: session(),
+            }),
         ))
         .unwrap();
         assert_eq!(queried["seq"], 4);

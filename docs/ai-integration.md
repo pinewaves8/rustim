@@ -123,6 +123,19 @@ keeps that node and its descendants and sets the document's `root` to it; a miss
 different answers and a host cannot tell them apart afterwards. The reply's `live` is always `null`:
 the announcement text belongs to a host's accessibility layer, not to the kernel.
 
+**A `query` also reports the session, beside the tree.** `{"seq":4,"tree":{…},"session":{…}}`, where
+the session is `{paused, tempo, motion, playing, clock}` — the read half of the four controls a driver
+can write (`pause`/`resume`, `tempo`, `motion`, `seek`). Until it existed the protocol was write-only
+for all four, so a driver taking over a session could not ask what state the previous one left it in;
+that is the one thing that matters when two assistants share an engine, and it is why this is not
+merely redundant with the events a host could have been listening to all along.
+
+It is **not a seventh presence.** The six-field discriminant is unchanged — `session` is present
+exactly when `tree` is — so every client that counts the six by name, which is what `rustim-client`
+and both SDK runners do, needed no change to keep counting them. And it is deliberately *not* in the
+tree: a screen reader asking what is on screen has no use for the tempo, so `SemanticTree` stays what
+it was.
+
 ## Events: what the timeline did
 
 A reply answers a command. An **event** answers nothing — it reports something the engine did on its
@@ -543,7 +556,8 @@ of I/O and of a JSON parser (it compiles to wasm).
   `tree`, `report`, `plan`, `capabilities` and `error` is present**, and the presence is the
   discriminant. `created` is the only way to learn the id of what was just created; a `play` gets a
   present-but-**empty** diff, because queueing a beat changes nothing in the tree; a `query` gets a
-  `tree` and no diff at all, because an empty diff would read as a mutation that did nothing; a
+  `tree` and no diff at all, because an empty diff would read as a mutation that did nothing — and a
+  **`session`** beside that tree, which is *not* a seventh presence: see below; a
   `check` gets a `report` — the empty-findings array is itself the clean answer, so “checked and
   clean” is distinguishable from “did not ask”; a `plan.status` gets a `plan`, and `loaded: false`
   is a legal answer for the same reason; a `hello` gets `capabilities` and none of the other five,

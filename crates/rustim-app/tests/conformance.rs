@@ -399,6 +399,48 @@ fn check_reports_what_the_frame_and_the_timeline_get_wrong() {
         .expect("a query is a reply");
     assert!(after.tree.is_some());
 
+    // A `query` also reports the **session**, beside the tree: the read half of
+    // the four controls a driver can write, so an assistant taking over a session
+    // can ask what state the previous one left rather than guess.
+    client
+        .send_raw(r#"{"action":"pause"}"#)
+        .expect("pause is a reply");
+    client
+        .send_raw(r#"{"action":"tempo","factor":0.25}"#)
+        .expect("tempo is a reply");
+    client
+        .send_raw(r#"{"action":"motion","mode":"reduced"}"#)
+        .expect("motion is a reply");
+    let with_session = client
+        .send_raw(r#"{"action":"query"}"#)
+        .expect("a query is a reply");
+    let session = with_session
+        .session
+        .expect("a query carries the session state beside the tree");
+    assert!(session.paused, "the pause above is what it reports");
+    assert_eq!(session.tempo, 0.25);
+    assert_eq!(session.motion, rustim_scene::command::MotionMode::Reduced);
+    // `playing` is *true*, and that is the honest answer rather than an accident:
+    // this session queued a beat earlier in the test and every line of a feed
+    // applies at virtual time zero, so the beat is still on the clock. A driver
+    // reading this learns the timeline has not drained — which is the point of
+    // reporting it at all.
+    assert!(
+        session.playing,
+        "the beat queued above is still on the clock"
+    );
+    assert!(
+        with_session.tree.is_some(),
+        "and the tree still rides with it"
+    );
+
+    // Not a seventh presence: a mutating reply carries no session at all, which is
+    // what keeps a client counting exactly one of the six working unchanged.
+    let added = client
+        .send_raw(r#"{"action":"add","type":"circle","params":{"radius":1.0}}"#)
+        .expect("add is a reply");
+    assert!(added.session.is_none(), "a mutation reports no session");
+
     finish(client, &png);
 }
 

@@ -1221,3 +1221,30 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   Item 4 also closed the last of the golden-baseline item for every platform, Linux x86_64 included,
   with no extra hardware: the failing legs upload `target/golden-artifacts/`, which is the route the
   documents always described and which had never been walked.
+
+- **A `query` answers with the session state beside the tree, and the four controls stop being
+  write-only.** `pause`/`resume`, `tempo`, `motion` and `seek` could all be *set* and none could be
+  *read*: a driver taking over a session had no way to ask what state the previous one left behind,
+  which is the one question that matters when two assistants share an engine. A `query` now answers
+  `{"seq":n,"tree":{…},"session":{paused,tempo,motion,playing,clock}}`.
+
+  The design decision is what it is *not*. `session` is not a seventh reply presence — the six-field
+  discriminant is untouched, and it is present exactly when `tree` is — so the three clients that
+  count those six by name (`rustim-client` and both SDK runners) needed no change at all; that was
+  checked before the field was added rather than after. And it is not in the tree: the semantic tree
+  is what a screen reader hears, and a screen reader asking what is on screen has no use for the
+  tempo, so `SessionState` rides beside it as a sibling field of the reply.
+
+  `motion` reports the policy the **next beat started** will get, not the one a running beat has,
+  because that is the honest answer and the same one the `motion` command documents. `playing` is
+  true through a pause and true with a beat merely *queued* — the conformance case asserts the latter
+  deliberately, having queued one earlier in the same session, because "is the timeline still moving"
+  is the question and a beat on the clock means yes.
+
+  Evidence: a `context.rs` test that sets all four and reads them back through `handle` (and asserts
+  the tree is unchanged beside it), a `command.rs` reply-shape test that `session` appears with
+  `tree` and in no other reply, and a conformance case driving the real binary over the wire —
+  pause, tempo, motion, then one `query` reporting all three, followed by an `add` whose reply
+  carries no `session` at all. `驱动协议v1.md` §3.9, `使用说明.md` and `docs/ai-integration.md` all
+  carry the field and the "not a seventh presence" rule, which is the three-way sync a wire change
+  owes. Count 939 → 940.

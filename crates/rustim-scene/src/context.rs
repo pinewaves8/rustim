@@ -1197,6 +1197,24 @@ impl SceneContext {
         self.clock
     }
 
+    /// The session's own state, which a `query` reports beside the tree.
+    ///
+    /// Every field here is one a driver can also set — `pause`/`resume`, `tempo`,
+    /// `motion`, `seek` — so this is the read half of the same four, and a driver
+    /// taking over a session can ask what the previous one left behind. It is
+    /// *not* part of the semantic tree: a screen reader asking what is on screen
+    /// has no use for the tempo, which is why [`command::SessionState`] rides
+    /// beside `tree` rather than inside it.
+    pub fn session_state(&self) -> command::SessionState {
+        command::SessionState {
+            paused: self.paused,
+            tempo: self.tempo(),
+            motion: self.motion.into(),
+            playing: self.is_playing(),
+            clock: self.clock,
+        }
+    }
+
     /// Take every narration line whose time has come, oldest first.
     ///
     /// Draining rather than reading: a line is said once, and a frame that
@@ -1964,7 +1982,10 @@ impl SceneContext {
                         .ok_or(CommandError::NoSuchNode { target: id })?
                 }
             };
-            return Ok(CommandOutcome::Queried(tree));
+            return Ok(CommandOutcome::Queried {
+                tree,
+                session: self.session_state(),
+            });
         }
         if let Command::Check = cmd {
             return Ok(CommandOutcome::Checked(self.check()));
@@ -2288,7 +2309,7 @@ mod tests {
     fn applied(ctx: &mut SceneContext, cmd: &Command) -> StateDiff {
         match ctx.handle(cmd).expect("a well-formed command") {
             CommandOutcome::Applied(diff) => diff,
-            CommandOutcome::Queried(_) => panic!("a query is not a mutation"),
+            CommandOutcome::Queried { .. } => panic!("a query is not a mutation"),
             CommandOutcome::Checked(_) => panic!("a check is not a mutation"),
             CommandOutcome::Planned(_) => panic!("a plan status is not a mutation"),
             CommandOutcome::Greeted(_) => panic!("a greeting is not a mutation"),
@@ -2585,7 +2606,7 @@ mod tests {
         applied(&mut ctx, &camera_cmd(Some([1.0, 0.0]), Some(2.0), None));
 
         let outcome = ctx.handle(&Command::Query { target: None }).unwrap();
-        let CommandOutcome::Queried(tree) = outcome else {
+        let CommandOutcome::Queried { tree, .. } = outcome else {
             panic!("a query is a read, not a mutation");
         };
         assert_eq!(tree.nodes.len(), 2, "the synthetic root and one mobject");
@@ -2630,7 +2651,7 @@ mod tests {
                 target: Some(parent.into()),
             })
             .unwrap();
-        let CommandOutcome::Queried(tree) = outcome else {
+        let CommandOutcome::Queried { tree, .. } = outcome else {
             panic!("a query is a read");
         };
         assert_eq!(tree.root, parent, "the subtree is the document now");
@@ -2669,7 +2690,7 @@ mod tests {
                 target: Some("方块".into()),
             })
             .unwrap();
-        let CommandOutcome::Queried(tree) = outcome else {
+        let CommandOutcome::Queried { tree, .. } = outcome else {
             panic!("a query is a read");
         };
         assert_eq!(tree.root, id);
@@ -5737,7 +5758,7 @@ mod tests {
         })
         .map(|outcome| match outcome {
             CommandOutcome::Applied(diff) => diff,
-            CommandOutcome::Queried(_) => panic!("narration is not a query"),
+            CommandOutcome::Queried { .. } => panic!("narration is not a query"),
             CommandOutcome::Checked(_) => panic!("narration is not a check"),
             CommandOutcome::Planned(_) => panic!("narration is not a plan status"),
             CommandOutcome::Greeted(_) => panic!("narration is not a greeting"),
@@ -6196,6 +6217,52 @@ mod playback_control_tests {
         for _ in 0..frames {
             ctx.advance(DT);
         }
+    }
+
+    /// The **read** half of the same four controls: what a driver set, a driver
+    /// can ask back.
+    ///
+    /// This is what lets a second assistant take over a session — it can ask what
+    /// state the first one left behind rather than guess — and none of it is in
+    /// the semantic tree, because a screen reader asking what is on screen has no
+    /// use for the tempo.
+    #[test]
+    fn a_query_reports_what_the_driver_set() {
+        let mut ctx = scene();
+        assert_eq!(
+            ctx.session_state(),
+            command::SessionState {
+                paused: false,
+                tempo: 1.0,
+                motion: command::MotionMode::Full,
+                playing: false,
+                clock: 0.0,
+            },
+            "a fresh context is the default on all four"
+        );
+
+        ctx.handle(&Command::Pause).unwrap();
+        ctx.handle(&Command::Tempo { factor: 0.25 }).unwrap();
+        ctx.handle(&Command::Motion {
+            mode: command::MotionMode::Reduced,
+        })
+        .unwrap();
+
+        let state = ctx.session_state();
+        assert!(state.paused, "a pause is what was just set");
+        assert_eq!(state.tempo, 0.25);
+        assert_eq!(state.motion, command::MotionMode::Reduced);
+        assert!(!state.playing, "nothing is queued");
+
+        // And through the wire rather than only through the accessor: one `query`
+        // answer carries both halves, tree and session.
+        let CommandOutcome::Queried { tree, session } =
+            ctx.handle(&Command::Query { target: None }).unwrap()
+        else {
+            panic!("a query is answered with a document");
+        };
+        assert_eq!(session, state);
+        assert_eq!(tree, ctx.semantic_tree(None));
     }
 
     fn invisible_square(ctx: &mut SceneContext) -> NodeId {
