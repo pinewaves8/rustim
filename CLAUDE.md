@@ -177,6 +177,8 @@ cargo test -p rustim-app --test formula         # formula structure reaches --in
 cargo test -p rustim-app --test conformance     # the protocol, driven only through rustim-client
 python3 -I sdks/python/conformance.py           # ...and from Python, sharing no code with the engine
 node sdks/typescript/conformance.mjs            # ...and from Node, a third independent implementation
+python3 -I sdks/python/jarvis.py --offline --out /tmp/lesson.mp4   # the example AI director, no model
+python3 -I sdks/python/jarvis.py "用三步动画解释勾股定理" --png --out out.png  # ...with a real model
 cargo test -p rustim-client          # the client's framing rules, over in-memory streams
 cargo test -p rustim-daemon          # sessions, RPC envelope, and real loopback WebSockets
 cargo test -p rustim-daemon --test daemon   # ...only the socket-level integration suite
@@ -3627,6 +3629,32 @@ answers — the executable meaning of "switch clients freely". Exit codes are 0 
 failed / 2 the question could not be asked, in both. The untrusted-input rule lives in the
 environment, not here: these SDKs are code the user asked for, so `-I` for Python and no
 `node_modules` for Node are about reproducibility rather than quarantine.
+
+**`sdks/python/jarvis.py` is the worked example of the other half of the separation: an assistant,
+not an engine.** It asks any OpenAI-compatible chat-completions endpoint (`RUSTIM_LLM_BASE` /
+`RUSTIM_LLM_MODEL` / `RUSTIM_LLM_KEY`, falling back to `DEEPSEEK_API_KEY` then `OPENAI_API_KEY`) for
+a `plan.load` document, flattens it into one command log, and drives the unmodified binary through
+`rustim_client`. It contains no engine logic and no rendering; swapping assistants is swapping three
+environment variables. Four things in it are the design rather than the implementation:
+
+- **The plan is flattened before it is sent.** A file or stdin feed applies every command at virtual
+  time zero, so a `say` left inside `plan.load` would all be due in the first frame; the driver
+  rewrites each `say` as `narrate` with an explicit `at`, accumulated from the beats' own nominal
+  durations using the engine's `lag_ratio` arithmetic (`group` defaults to 0.0, `succession` to 1.0).
+  The plan stays the model's product; only its timing is the driver's.
+- **The engine is the validator.** Each candidate runs through `validate` (scratch state),
+  then `batch` + `check` on a throwaway probe session, and `error`/`warning` findings are fed back to
+  the model as a repair hint (at most `MAX_REPAIRS = 2`). `info` findings are pacing observations and
+  are not sent back. This is what makes the linter useful to a model rather than only to a human: two
+  real runs were repaired by an `unparseable` unknown variant and by
+  `overlap（三角形）：boxes overlap by 100%…`, both caught before a frame was rendered.
+- **Pre-flight and export are separate processes.** The frame count has to be on the export
+  command line and is not known until the plan is flattened, so probes use a throwaway `--png` path
+  and the real run is one `batch` on a fresh process — which also means the pre-flight tree is never
+  the rendered one.
+- **Absent from the engine.** Nothing in `crates/` changed to make this work. That is the point of
+  `贾维斯集成方案.md`: the assistant is a client, and a second one — a different model, a different
+  prompt, a different language — drives the same engine unchanged.
 
 ### The daemon: many sessions over a socket
 
