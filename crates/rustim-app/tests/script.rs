@@ -909,7 +909,16 @@ fn a_tempo_slows_the_still_into_mid_fade() {
 
     let normal_png = out_path("tempo-normal");
     let slow_png = out_path("tempo-slow");
+    // `--motion full` explicitly, for the same reason the golden suite passes
+    // it: **this test asserts an animation's state mid-beat**, so it must not
+    // depend on the machine's desktop preference. Under `--motion reduced` every
+    // beat lands on its end state immediately, the fade completes in both runs,
+    // both stills are blank and the `diff.max > 0` below fails — which is exactly
+    // how CI caught it, on a macOS runner whose system setting is on, after macOS
+    // started reading that setting at all.
     let ran = run(&[
+        "--motion",
+        "full",
         "--script",
         slow.to_str().unwrap(),
         "--reply",
@@ -919,6 +928,8 @@ fn a_tempo_slows_the_still_into_mid_fade() {
     ran.ok("--script … --reply --png with a tempo");
     assert!(ran.replies().iter().all(|r| r.error.is_none()));
     run(&[
+        "--motion",
+        "full",
         "--script",
         normal.to_str().unwrap(),
         "--png",

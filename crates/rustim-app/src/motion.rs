@@ -69,11 +69,13 @@ pub fn from_platform() -> Motion {
     probe(command).unwrap_or(Motion::Full)
 }
 
-/// The `bool` a platform reports, as the preference it means.
+/// "Should motion be reduced?", as the preference it maps to.
 ///
-/// Broken out so the mapping is a pure function with its own test on every
-/// platform — the same reason [`parse_output`] exists rather than the comparison
-/// living inside the `gsettings` arm. macOS is the only caller today.
+/// Both backends answer that question as a `bool` — AppKit returns one directly,
+/// and `gsettings` returns the *inverse* (whether animations are enabled) — so
+/// the double negative lives here, in one place, and both callers go through it.
+/// That is also what keeps it used on every platform: it is called from
+/// [`parse_output`], not only from the macOS module.
 fn from_reduce_motion_flag(reduced: bool) -> Motion {
     if reduced {
         Motion::Reduced
@@ -139,12 +141,20 @@ fn probe(command: Option<(&str, &[&str])>) -> Option<Motion> {
 /// Anything else — an empty string, a localized `unknown`, a schema's error text
 /// that somehow reached stdout — is not an answer, and saying `None` rather than
 /// guessing is what keeps this a probe rather than a parser with opinions.
+///
+/// The two arms go through [`from_reduce_motion_flag`] rather than naming their
+/// `Motion` directly, so that **the mapping is used on every platform** and not
+/// only where AppKit is: a private function called solely from the macOS module
+/// is `dead_code` on Linux and Windows, which `-D warnings` turns into a failed
+/// build. CI found exactly that.
 fn parse_output(text: &str) -> Option<Motion> {
     match text.trim() {
-        // `enable-animations = false` is the reduced-motion setting. The double
-        // negative is the whole reason this mapping is spelled out in one place.
-        "false" => Some(Motion::Reduced),
-        "true" => Some(Motion::Full),
+        // `enable-animations = false` is the reduced-motion setting, so the
+        // answer to "should motion be reduced?" is the *negation* of the value
+        // `gsettings` prints. The double negative is the whole reason that
+        // mapping is spelled out in one place, in `from_reduce_motion_flag`.
+        "false" => Some(from_reduce_motion_flag(true)),
+        "true" => Some(from_reduce_motion_flag(false)),
         _ => None,
     }
 }
