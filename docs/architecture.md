@@ -1289,11 +1289,23 @@ which excludes the one node `hidden` cannot — the semantic tree's synthetic ro
 `hidden` is `false` by construction. Without that second clause the root was the first tab stop, and a
 key pressed there was about nothing at all.
 
-Deferred, deliberately: pinch gestures and inertial scrolling; font subsetting and lazy loading (the
-two-page split is the packaging answer for now, and a CJK formula on the web needs fonts
-`from_embedded` does not carry); and WebCodecs/`MediaRecorder` export (the `VideoSink` seam is the
-place it goes). The query command is *not* deferred any more — `Session::apply` answers it through the
-same `reply_line` the desktop feed uses.
+**Recording the canvas has landed, at the page rather than in the engine.** `web/demo.js` exposes
+`window.rustimRecord(seconds, fps)`, which captures the canvas through `MediaRecorder` and resolves
+with the blob's size, type and chunk count. The split is the design: `VideoSink` — the engine's seam —
+writes frames with the **virtual** clock's timestamps, which is what makes an export reproducible
+frame for frame, while `MediaRecorder` records whatever the canvas shows while wall-clock time
+passes, so the same scene twice gives two files and a backgrounded tab records nothing. A browser
+`VideoSink` is the other road and is not taken: `VideoEncoder` needs a **secure origin** (`127.0.0.1`
+is one; measured `typeof VideoEncoder === "undefined"` on a `data:` URL), and its encoded chunks are
+not a playable file without a muxer — a third-party dependency this page deliberately does not carry.
+`tools/web-check.mjs` asserts the bytes, because a recording that produced nothing resolves
+successfully with an empty blob (measured: 19 216 bytes of `video/webm;codecs=vp9`, one chunk, for a
+one-second recording).
+
+Deferred, deliberately: pinch gestures and inertial scrolling; and a CJK formula on the web, which
+needs fonts `from_embedded` does not carry. Font subsetting is **measured and declined** — see the
+number beside the artifact table above. The query command is *not* deferred any more —
+`Session::apply` answers it through the same `reply_line` the desktop feed uses.
 
 ## Naming
 

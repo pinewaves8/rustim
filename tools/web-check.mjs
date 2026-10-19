@@ -521,6 +521,31 @@ try {
     );
   }
 
+  // Recording the canvas, which is the **page's** feature rather than the
+  // engine's export path. `VideoSink` writes frames with the virtual clock's
+  // timestamps and is reproducible frame for frame; `MediaRecorder` records
+  // whatever the canvas shows while wall-clock time passes, so the same scene
+  // twice gives two files. Asserted on the **bytes**, because a recording that
+  // produced nothing resolves successfully with an empty blob and would otherwise
+  // read as a working download.
+  const recorded = await cdp.evaluate(`(async () => {
+    const ticking = setInterval(() => window.rustim.advance(1 / 30), 33);
+    const out = await window.rustimRecord(1.0, 30);
+    clearInterval(ticking);
+    return { bytes: out.bytes, type: out.type, chunks: out.chunks, error: out.error };
+  })()`);
+
+  const recordedOk =
+    recorded.bytes > 0 && String(recorded.type ?? '').startsWith('video/');
+  if (!recordedOk) {
+    console.error(`web-check: recording produced ${JSON.stringify(recorded)}`);
+    exitCode = 1;
+  } else {
+    console.log(
+      `record  ${recorded.bytes} bytes of ${recorded.type} in ${recorded.chunks} chunk(s)`,
+    );
+  }
+
   // The second artifact. Typst is linked only into `pkg-formula`, and this is
   // the only place its wasm build is actually *run* rather than compiled.
   await cdp.send('Page.navigate', { url: `${origin}/formula.html?paused=1` });
