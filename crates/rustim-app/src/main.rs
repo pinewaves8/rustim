@@ -1869,9 +1869,7 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(modifiers) => self.mods = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(intent) =
-                    input::classify(&input::KeyPress::from_event(&event, self.mods))
-                {
+                if let Some(intent) = input::classify(&input::from_event(&event, self.mods)) {
                     self.handle_intent(intent);
                 }
             }

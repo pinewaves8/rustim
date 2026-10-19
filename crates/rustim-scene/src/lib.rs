@@ -49,6 +49,7 @@ pub mod check;
 pub mod command;
 pub mod context;
 pub mod event;
+pub mod input;
 pub mod plan;
 mod templates;
 pub mod text;

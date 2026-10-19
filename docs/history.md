@@ -1248,3 +1248,21 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   carries no `session` at all. `驱动协议v1.md` §3.9, `使用说明.md` and `docs/ai-integration.md` all
   carry the field and the "not a seventh presence" rule, which is the three-way sync a wire change
   owes. Count 939 → 940.
+
+- **The keymap moves down to the kernel, so the browser can have one too.** `space` means
+  play-or-pause and `m` flips the motion policy; if each host decided that for itself the engine
+  would have two keyboards and a user would have to learn which one they were talking to. So
+  `Intent`, `KeyPress` and `classify` moved from `rustim-app::input` into `rustim_scene::input`,
+  over a **winit-free** vocabulary: `Key::{Tab, ArrowUp, …, Char(char), Other}` and
+  `Code::{Comma, Period, KeyM, Other}`. What stays in the desktop host is `from_event` — the
+  spelling conversion — beside `wheel_delta`, which is the same arrangement the pointer already has.
+
+  Both halves of that were forced rather than chosen. `winit` has no wasm32 build, so a keymap naming
+  its types could not be reached from the browser at all; and `Key::Char(char)` rather than a string
+  is honest about what the keymap actually binds, which is why the IME cases (a full-width `，` from a
+  Chinese input method) are expressible in the neutral vocabulary instead of being a desktop quirk.
+  The physical-key fallback survives as `Code`, because an IME that consumes the press outright
+  leaves no logical key while the physical one is still whatever was pressed.
+
+  This is `rustim_math::gesture`'s arrangement applied to the keyboard, and for the reason that step
+  recorded: a vocabulary two hosts share belongs where both can reach it. Count 940 → 941.
