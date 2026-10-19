@@ -191,6 +191,10 @@ impl TransformGroup {
 }
 
 impl Animation for TransformGroup {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.source)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }

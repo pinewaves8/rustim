@@ -1327,3 +1327,31 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   (two seconds at a quarter turn a second puts each corner on the opposite one; the counterfactual is
   that `age / duration` would have crept round instead or, at an infinite period, not moved at all).
   Count 947 → 951.
+
+- **`stop` can be aimed at one object.** The scoped half of the interrupt, deferred because "the
+  `Animation` trait exposes no target, so expressing it would mean adding one to every animation".
+  It did: `Animation::target` — the node an animation is *about*, `None` where that is a real answer
+  rather than an omission. The camera is a field and not a node, `Wait` is about nothing at all, and
+  a `group`/`succession` is a *timeline* whose members may each be about a different node, so scoping
+  a stop to one of them would be arbitrary rather than precise; those are left to the timeline-wide
+  `stop`, and the doc comment says so instead of leaving it to be discovered.
+
+  `{"action":"stop","target":"方块"}` drops the running animations whose subject is that node **and**
+  the queued ones, because a beat that had not started would otherwise animate the object a moment
+  later — the opposite of what was asked. It keeps `stop`'s posture everywhere else: **no `finish`**,
+  so an interrupted `fade_out` leaves its target in the tree at the opacity it reached; the clock and
+  the narration track untouched; idempotent. A target that is not there is `NoSuchNode`/`NoSuchLabel`
+  rather than a quiet everything.
+
+  `Sequence::clear_target` documents the one subtlety: **the beats themselves stay.** A beat that
+  loses all its members becomes an empty one that starts and finishes immediately — the shape of
+  `Wait(0.0)` — rather than being removed, because removing it would renumber the timeline and change
+  what the beats after it are. A caller watching `beat_started` sees the beat happen and do nothing,
+  which is the honest report.
+
+  Evidence: a context test with the two objects fading in **in the same beat** — otherwise "drop the
+  beat holding one of them" would pass it, and the whole point is that the unit is an object rather
+  than a beat — plus a later beat belonging to the same object, which is what shows the queue is
+  reached; and a conformance case that plays a labelled square, stops it by label, stops it again
+  (idempotent), and gets `no_such_label` for a name that is not there. Two round-trip fixtures pin
+  both spellings. Count 952 → 953.

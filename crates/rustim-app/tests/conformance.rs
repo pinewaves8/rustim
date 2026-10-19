@@ -1279,6 +1279,41 @@ fn play_is_an_empty_diff_and_stop_is_idempotent() {
     let tree = reply.tree.expect("a tree");
     assert_eq!(tree.nodes.len(), 2, "root + the square");
 
+    // The **scoped** spelling: the same interrupt, aimed at one object. It is
+    // answered like the bare one (an empty diff, because it changes what will
+    // happen rather than the tree), it accepts either spelling of a target, and a
+    // name that is not there is a refusal rather than a quiet everything.
+    let named = expect_diff(
+        &mut client,
+        r#"{"action":"add","type":"square","params":{"width":1.0,"label":"方块"}}"#,
+    )
+    .created[0]
+        .raw();
+    expect_diff(
+        &mut client,
+        &format!(
+            r#"{{"action":"play","animation":{{"target":{named},"type":"fade_out","duration":1.0}}}}"#
+        ),
+    );
+    let scoped = expect_diff(&mut client, r#"{"action":"stop","target":"方块"}"#);
+    assert!(scoped.is_empty(), "a scoped stop is not a tree change");
+    // Idempotent for the same reason the bare form is: an object with no
+    // animations is already in the state the caller asked for.
+    let again = expect_diff(&mut client, r#"{"action":"stop","target":"方块"}"#);
+    assert!(again.is_empty());
+
+    let refused = client
+        .send_raw(r#"{"action":"stop","target":"没有这个名字"}"#)
+        .expect("a refusal is a reply");
+    assert!(
+        matches!(
+            refused.error,
+            Some(rustim_scene::command::CommandError::NoSuchLabel { .. })
+        ),
+        "a target that is not there must be named, not ignored: {:?}",
+        refused.error
+    );
+
     finish(client, &png);
 }
 

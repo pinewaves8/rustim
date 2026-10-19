@@ -31,7 +31,7 @@
 
 use std::collections::VecDeque;
 
-use rustim_mobject::SceneTree;
+use rustim_mobject::{NodeId, SceneTree};
 
 use crate::{Animation, AnimationScheduler, Motion, Wait};
 
@@ -236,6 +236,31 @@ impl Sequence {
 
     pub fn clear(&mut self) {
         self.steps.clear();
+    }
+
+    /// Drop the beats' animations whose subject is `target`, and nothing else.
+    ///
+    /// A queued beat has not begun, so "stop that object's animation" has to reach
+    /// here as well as into the scheduler — otherwise an `add` + `play` followed
+    /// by a scoped stop would still animate the object a moment later, which is
+    /// the opposite of what the caller asked for.
+    ///
+    /// **The beats themselves stay.** A beat that loses all its members becomes an
+    /// empty one, which starts and finishes immediately — the same shape as
+    /// `Wait(0.0)` — rather than being removed, because removing it would renumber
+    /// the timeline and change what the remaining beats are. A caller watching
+    /// `beat_started` sees the beat happen and do nothing, which is the honest
+    /// report.
+    ///
+    /// Returns how many animations were dropped.
+    pub fn clear_target(&mut self, target: NodeId) -> usize {
+        let mut dropped = 0;
+        for beat in &mut self.steps {
+            let before = beat.len();
+            beat.retain(|animation| animation.target() != Some(target));
+            dropped += before - beat.len();
+        }
+        dropped
     }
 }
 

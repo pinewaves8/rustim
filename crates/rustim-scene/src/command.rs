@@ -681,7 +681,17 @@ pub enum Command {
     /// still talking or a view that has already arrived has nothing to
     /// interrupt. Answered by [`crate::SceneContext::handle`], because only the
     /// playback machine and the scheduler together are "the timeline".
-    Stop,
+    Stop {
+        /// Narrow the interrupt to one object: only animations whose subject is
+        /// this node are dropped, and the rest of the timeline keeps playing.
+        ///
+        /// Absent means the whole timeline, which is what a bare `stop` has always
+        /// meant. A node that is not there is `NoSuchNode` — a caller that named a
+        /// stale handle should hear about it rather than silently stopping
+        /// everything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Target>,
+    },
     /// Freeze the timeline where it is.
     ///
     /// The lecture clock stops with it, so narration due during the pause is not
@@ -1087,7 +1097,7 @@ impl Command {
             Self::ExplainPlot { .. } => "explain.plot",
             Self::Highlight { .. } => "highlight",
             Self::Play { .. } => "play",
-            Self::Stop => "stop",
+            Self::Stop { .. } => "stop",
             Self::Pause => "pause",
             Self::Resume => "resume",
             Self::Seek { .. } => "seek",
@@ -2516,7 +2526,7 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
             // driving `apply` directly gets the round-trip it always got, not a
             // panic.
         }
-        Command::Stop => {
+        Command::Stop { .. } => {
             // Answered by `SceneContext::handle`: interrupting is a property of
             // the playback machine and the scheduler, neither of which is in the
             // tree this function may touch. The arm keeps `apply` total, so a
@@ -3470,6 +3480,11 @@ mod tests {
             // else. An implementation that serialised an empty object or a
             // `null` payload here would change what a relayed log says.
             r#"{"action":"stop"}"#.to_owned(),
+            // The scoped spelling: one object's animations rather than the whole
+            // timeline. It has to round-trip too, or a host that logged a scoped
+            // stop could not replay it.
+            format!(r#"{{"action":"stop","target":{id}}}"#),
+            r#"{"action":"stop","target":"方块"}"#.to_owned(),
             // The playback controls. `pause` and `resume` are unit variants like
             // `stop`; `seek` and `tempo` each carry one number, and an
             // implementation that wrote the defaults back would fail here.
@@ -3607,7 +3622,7 @@ mod tests {
             Command::Hello {
                 protocol: Some(PROTOCOL_VERSION),
             },
-            Command::Stop,
+            Command::Stop { target: None },
             Command::Pause,
             Command::Resume,
             Command::Seek { to: 2.0 },

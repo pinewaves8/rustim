@@ -55,6 +55,10 @@ impl FadeIn {
 }
 
 impl Animation for FadeIn {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.target)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }
@@ -113,6 +117,10 @@ impl FadeOut {
 }
 
 impl Animation for FadeOut {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.target)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }
@@ -220,6 +228,10 @@ impl MoveTo {
 }
 
 impl Animation for MoveTo {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.target)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }
@@ -327,6 +339,10 @@ impl Rotate {
 }
 
 impl Animation for Rotate {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.target)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }
@@ -412,6 +428,10 @@ impl Rotating {
 }
 
 impl Animation for Rotating {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.target)
+    }
+
     /// One full turn — a **period**, not a length: the beat does not end.
     ///
     /// A degenerate rate degrades to a nominal period rather than reporting an
@@ -500,6 +520,10 @@ impl Scale {
 }
 
 impl Animation for Scale {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.target)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }
@@ -650,6 +674,10 @@ impl Animate {
 }
 
 impl Animation for Animate {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.target)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }
@@ -833,6 +861,13 @@ impl Transform {
 }
 
 impl Animation for Transform {
+    fn target(&self) -> Option<NodeId> {
+        // `source`, not `target`: this animation's `target` field is the donor
+        // — a `Mobject` value, not a node in the tree — and the object being
+        // morphed is the source. A scoped stop is about the thing on screen.
+        Some(self.source)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }
@@ -962,6 +997,10 @@ impl Create {
 }
 
 impl Animation for Create {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.target)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }
@@ -1025,6 +1064,10 @@ impl Uncreate {
 }
 
 impl Animation for Uncreate {
+    fn target(&self) -> Option<NodeId> {
+        Some(self.target)
+    }
+
     fn duration(&self) -> f64 {
         self.duration
     }

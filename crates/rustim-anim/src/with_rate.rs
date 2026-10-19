@@ -1,6 +1,7 @@
 //! `WithRate` — a rate override on top of any finished animation.
 
 use crate::{Animation, RateFunc};
+use rustim_mobject::NodeId;
 use rustim_mobject::SceneTree;
 
 /// An animation wrapped so that its progress is eased by `func` instead of the
@@ -49,6 +50,12 @@ impl<A: Animation> WithRate<A> {
 }
 
 impl<A: Animation> Animation for WithRate<A> {
+    /// Forwards to the wrapped animation, so a scoped `stop` sees through the
+    /// wrapper — the same rule the other forwarded methods here follow.
+    fn target(&self) -> Option<NodeId> {
+        self.inner.target()
+    }
+
     fn duration(&self) -> f64 {
         self.inner.duration()
     }

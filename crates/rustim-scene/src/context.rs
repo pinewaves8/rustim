@@ -1174,6 +1174,32 @@ impl SceneContext {
         self.current_beat = None;
     }
 
+    /// Stop **one object's** animations, now and later, leaving the rest playing.
+    ///
+    /// The scoped half of [`Self::stop`], and it keeps that method's posture
+    /// everywhere: no `finish` runs, so an interrupted `FadeOut` leaves its target
+    /// in the tree at the opacity it reached; the lecture clock and the narration
+    /// track are untouched; and it is idempotent, because "stop that object's
+    /// animation" is satisfied by an object that has none running.
+    ///
+    /// It reaches the **queue** as well as the clock: a beat that has not started
+    /// yet would otherwise animate the object a moment later, which is the
+    /// opposite of what the caller asked for. `Sequence::clear_target` documents
+    /// what happens to a beat that loses all its members.
+    ///
+    /// Returns how many animations were dropped.
+    pub fn stop_target(&mut self, target: NodeId) -> usize {
+        let dropped = self.animations.clear_target(target) + self.playback.clear_target(target);
+        // `stop`'s rule for the part that actually went away: an interrupt is not
+        // a completion, so if this emptied the clock there is no beat left to
+        // report as done. If something of the beat is still running, it is still
+        // the current one and the event it produces stays honest.
+        if self.animations.is_empty() {
+            self.current_beat = None;
+        }
+        dropped
+    }
+
     /// Is there anything left to play — now or later?
     ///
     /// Not `!animations.is_empty()`: that reads "finished" during the frame before
@@ -1439,8 +1465,18 @@ impl SceneContext {
             self.play_all([anim]);
             return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
-        if let Command::Stop = cmd {
-            self.stop();
+        if let Command::Stop { target } = cmd {
+            match target {
+                // The whole timeline, which is what a bare `stop` has always
+                // meant.
+                None => self.stop(),
+                // One object's animations, now and later. Resolved first, so a
+                // stale handle is `NoSuchNode` rather than a silent everything.
+                Some(target) => {
+                    let id = target.resolve(&self.tree)?;
+                    self.stop_target(id);
+                }
+            }
             return Ok(CommandOutcome::Applied(StateDiff::default()));
         }
         if let Command::Pause = cmd {
@@ -3005,7 +3041,7 @@ mod tests {
         assert!((half - 0.5).abs() < 1e-12, "opacity {half} is not half-way");
         assert!(ctx.is_playing());
 
-        let diff = applied(&mut ctx, &Command::Stop);
+        let diff = applied(&mut ctx, &Command::Stop { target: None });
         assert_eq!(diff, StateDiff::default(), "stopping is not a tree change");
         assert!(!ctx.is_playing(), "the timeline is over, not paused");
         assert!(ctx.animations.is_empty());
@@ -3013,7 +3049,7 @@ mod tests {
 
         // Idempotent: a second stop is a success that changes nothing. "Make it
         // stop" is satisfied by a scene that has stopped.
-        let again = applied(&mut ctx, &Command::Stop);
+        let again = applied(&mut ctx, &Command::Stop { target: None });
         assert_eq!(again, StateDiff::default());
         assert!(!ctx.is_playing());
 
@@ -3030,6 +3066,62 @@ mod tests {
         tick(&mut ctx, 40);
         assert_eq!(opacity(&ctx, id), 1.0);
         assert!(!ctx.is_playing());
+    }
+
+    /// The scoped half: one object's animations stop and the others keep going.
+    ///
+    /// Both objects fade in **in the same beat** deliberately — otherwise "drop
+    /// the beat holding `a`" would pass this test, and the whole point is that a
+    /// beat is not the unit here, an object is. A later beat also belongs to `a`,
+    /// which is what shows the queue is reached and not only the clock.
+    #[test]
+    fn a_scoped_stop_leaves_the_other_objects_playing() {
+        let mut ctx = scene();
+        let a = invisible_square(&mut ctx);
+        let b = invisible_square(&mut ctx);
+
+        let beat: Vec<Box<dyn Animation>> = vec![
+            Box::new(FadeIn::new(a).with_duration(1.0)),
+            Box::new(FadeIn::new(b).with_duration(1.0)),
+        ];
+        ctx.play_all(beat);
+        ctx.play(FadeOut::new(a).with_duration(1.0));
+        ctx.play(Wait::new(0.5));
+
+        tick(&mut ctx, 30); // half a second, and `ease_in_out(0.5) == 0.5`
+        let a_half = opacity(&ctx, a);
+        assert!(
+            (a_half - 0.5).abs() < 1e-12,
+            "opacity {a_half} is not half-way"
+        );
+
+        // Two: the `fade_in` running now and the `fade_out` `a` is owed later.
+        assert_eq!(ctx.stop_target(a), 2);
+        assert!(
+            ctx.is_playing(),
+            "`b` is still fading, so the beat is not over"
+        );
+
+        tick(&mut ctx, 30);
+        assert_eq!(
+            opacity(&ctx, a),
+            a_half,
+            "`a` froze where the stop found it"
+        );
+        assert_eq!(opacity(&ctx, b), 1.0, "`b` finished its own curve");
+        // No `finish` ran, so nothing was removed — the same posture `stop` has,
+        // and the reason a scoped stop is an interrupt rather than a fast-forward.
+        assert!(ctx.tree.get(a).is_some(), "the target is still in the tree");
+
+        // The queue resumes: the beat that held `a`'s `fade_out` is now empty and
+        // finishes immediately, then the `Wait` runs out.
+        tick(&mut ctx, 40);
+        assert!(!ctx.is_playing(), "the rest of the timeline played out");
+        assert_eq!(
+            opacity(&ctx, a),
+            a_half,
+            "and `a` was not animated by the beat it was taken out of"
+        );
     }
 
     /// The difference between "stop" and "finish", stated on the one animation
@@ -3053,7 +3145,7 @@ mod tests {
         let half = opacity(&ctx, id);
         assert!(half > 0.0 && half < 1.0, "opacity {half} is not mid-fade");
 
-        applied(&mut ctx, &Command::Stop);
+        applied(&mut ctx, &Command::Stop { target: None });
         tick(&mut ctx, 120);
         assert!(
             ctx.tree.get(id).is_some(),
@@ -3090,7 +3182,7 @@ mod tests {
         assert_eq!(opacity(&ctx, id), 0.0);
         assert_eq!(ctx.playback.len(), 1, "the fade is waiting its turn");
 
-        applied(&mut ctx, &Command::Stop);
+        applied(&mut ctx, &Command::Stop { target: None });
         assert_eq!(ctx.playback.len(), 0);
         tick(&mut ctx, 120);
         assert_eq!(opacity(&ctx, id), 0.0, "a dropped beat must never run");
@@ -3108,7 +3200,7 @@ mod tests {
             at: Some(0.25),
         })
         .unwrap();
-        applied(&mut ctx, &Command::Stop);
+        applied(&mut ctx, &Command::Stop { target: None });
         assert!(ctx.take_narration().is_empty(), "not due yet");
 
         tick(&mut ctx, 20);
@@ -3226,7 +3318,7 @@ mod tests {
             ctx.take_events().as_slice(),
             [Event::BeatStarted { beat: 1, .. }]
         ));
-        applied(&mut ctx, &Command::Stop);
+        applied(&mut ctx, &Command::Stop { target: None });
         tick(&mut ctx, 30);
         assert!(
             ctx.take_events().is_empty(),

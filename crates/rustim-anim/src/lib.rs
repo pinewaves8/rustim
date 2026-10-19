@@ -172,6 +172,23 @@ pub trait Animation {
     fn perpetual(&self) -> bool {
         false
     }
+
+    /// The node this animation is *about*, if it is about exactly one.
+    ///
+    /// What a **target-scoped `stop`** needs: "stop that object's animation"
+    /// means "drop the animations whose subject is it", and the scheduler cannot
+    /// answer that from the outside — an `Animation` is an opaque box there.
+    ///
+    /// `None` is a real answer, not an omission. The camera is a field rather
+    /// than a node, so a `CameraMove` is about nothing a caller can name; a
+    /// `Wait` is about nothing at all; and a `group` or `succession` is a
+    /// *timeline* whose members may each be about a different node, so scoping a
+    /// stop to one of them would be arbitrary. A scoped stop therefore leaves
+    /// those running, and the timeline-wide [`crate::AnimationScheduler::clear`]
+    /// is what takes them off.
+    fn target(&self) -> Option<NodeId> {
+        None
+    }
 }
 
 /// A boxed animation is an animation.
@@ -229,6 +246,15 @@ impl<T: Animation + ?Sized> Animation for Box<T> {
     /// the one container every beat is built from.
     fn perpetual(&self) -> bool {
         (**self).perpetual()
+    }
+
+    /// Forwarded for the same reason, and with a failure mode of its own: a boxed
+    /// animation that answered `None` here would be *invisible to a scoped stop*,
+    /// so `{"action":"stop","target":…}` would leave it running while reporting
+    /// success. `target` has a default too, and the scheduler holds nothing but
+    /// boxes.
+    fn target(&self) -> Option<NodeId> {
+        (**self).target()
     }
 }
 
@@ -352,6 +378,27 @@ impl AnimationScheduler {
     pub fn clear(&mut self) {
         self.running.clear();
         self.elapsed = 0.0;
+    }
+
+    /// Drop the running animations whose subject is `target`, and nothing else.
+    ///
+    /// The target-scoped half of `stop`: "stop that object's animation". It has
+    /// `clear`'s posture in every other respect — **no `finish` runs**, so an
+    /// interrupted `FadeOut` leaves its target in the tree at the opacity it
+    /// reached — and it does not touch the clock, because the other animations on
+    /// it are still playing.
+    ///
+    /// An animation whose [`Animation::target`] is `None` is left alone: the
+    /// camera and a `Wait` have no subject to name, and a `group` is a timeline
+    /// whose members may each be about a different node, so scoping to one of
+    /// them would be arbitrary rather than precise.
+    ///
+    /// Returns how many were dropped, which is what lets a host tell "stopped it"
+    /// from "it was not running" without asking a second question.
+    pub fn clear_target(&mut self, target: NodeId) -> usize {
+        let before = self.running.len();
+        self.running.retain(|r| r.anim.target() != Some(target));
+        before - self.running.len()
     }
 
     pub fn elapsed(&self) -> f64 {
