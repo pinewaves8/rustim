@@ -31,6 +31,9 @@ fn poly(corners: &[(f64, f64)], color: rustim_color::Srgb) -> Mobject {
         stroke: color,
         stroke_opacity: 0.0,
         stroke_width: 0.0,
+        // The rest of the paint is the default; a filled silhouette has no
+        // stroke, so its join and cap are latent either way.
+        ..Style::default()
     };
     Mobject::new(pts).with_style(style)
 }

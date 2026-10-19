@@ -7,6 +7,7 @@
 //! vello.
 
 use rustim_color::Srgb;
+use rustim_math::stroke::StrokeStyle;
 use rustim_math::{Affine, BezPath, Rect, Shape, TextGlyph};
 
 /// One drawing command.
@@ -27,9 +28,13 @@ pub enum DrawOp {
     /// Set the transform applied to subsequent geometry.
     SetTransform(Affine),
     FillPath(BezPath),
+    /// Stroke `path`, with a width and the joins, caps and dashes that go with
+    /// it. A stroke whose width **varies along the path** is not expressible
+    /// here — the stroker takes one width — and is drawn as a filled contour
+    /// instead; see `rustim_mobject::stroke_widths`.
     StrokePath {
         path: BezPath,
-        width: f64,
+        stroke: StrokeStyle,
     },
     /// Clip subsequent drawing to `path`, until the matching [`DrawOp::PopClip`].
     PushClip(BezPath),
@@ -240,9 +245,9 @@ fn add_bounds(acc: &mut Option<Rect>, op: &DrawOp, transform: Affine) {
 fn op_bounds(op: &DrawOp, transform: Affine) -> Option<Rect> {
     match op {
         DrawOp::FillPath(path) => Some(transform.transform_rect_bbox(path.bounding_box())),
-        DrawOp::StrokePath { path, width } => {
+        DrawOp::StrokePath { path, stroke } => {
             let b = transform.transform_rect_bbox(path.bounding_box());
-            let pad = width.abs() * 0.5 * max_scale(transform);
+            let pad = stroke.width.abs() * 0.5 * max_scale(transform);
             Some(Rect::new(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad))
         }
         DrawOp::GlyphRun { size, glyphs, .. } => {
@@ -539,7 +544,10 @@ mod tests {
                 DrawOp::SetPaint(rustim_color::RED),
                 DrawOp::StrokePath {
                     path: rect_path(Rect::new(10.0, 10.0, 20.0, 20.0)),
-                    width: w,
+                    stroke: StrokeStyle {
+                        width: w,
+                        ..StrokeStyle::default()
+                    },
                 },
             ]
         };

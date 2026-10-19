@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use rustim_anim::Motion;
 use rustim_app::a11y::{A11y, Request};
 use rustim_app::{AppEvent, Intent, feed, input};
+use rustim_math::stroke::StrokeStyle;
 use rustim_math::{Affine2, BezPath, Camera, Point, Viewport};
 use rustim_mobject::{Mobject, NodeId, NodeKind, Style};
 use rustim_render::{CpuRenderer, Damage, DrawList, DrawOp, RenderError, RenderStats, Renderer};
@@ -73,6 +74,7 @@ fn filled(color: rustim_color::Srgb, alpha: f64) -> Style {
         stroke: color,
         stroke_opacity: 0.0,
         stroke_width: 0.0,
+        ..Style::default()
     }
 }
 
@@ -89,6 +91,7 @@ fn stroked(color: rustim_color::Srgb, width: f64) -> Style {
         stroke: color,
         stroke_opacity: 1.0,
         stroke_width: width,
+        ..Style::default()
     }
 }
 
@@ -401,7 +404,13 @@ impl Scene for PrimitivesScene {
         };
         let stroke = |list: &mut DrawList, c, w, p| {
             list.push(DrawOp::SetPaint(c));
-            list.push(DrawOp::StrokePath { path: p, width: w });
+            list.push(DrawOp::StrokePath {
+                path: p,
+                stroke: rustim_math::stroke::StrokeStyle {
+                    width: w,
+                    ..StrokeStyle::default()
+                },
+            });
         };
 
         // Top row: fills. A curve, a straight-edged closed path, a triangle, and

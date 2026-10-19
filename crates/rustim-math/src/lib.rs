@@ -23,6 +23,7 @@ pub mod gesture;
 pub mod paths;
 pub mod rate;
 pub mod space_ops;
+pub mod stroke;
 pub mod text;
 
 pub use text::TextGlyph;

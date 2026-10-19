@@ -237,7 +237,7 @@ impl ShapeParams {
 /// pixels and does not. That is the honest consequence of this engine folding
 /// the projection into the path transform: a stroked circle and a filled one
 /// zoom together instead of the outline staying a constant screen width.
-pub const DEFAULT_THICKNESS: f64 = 0.045;
+pub use rustim_math::stroke::DEFAULT_THICKNESS;
 
 /// How far a tick rises above its axis when the caller did not say.
 ///
@@ -335,6 +335,11 @@ pub fn build(kind: ShapeKind, params: &ShapeParams) -> Mobject {
             ShapeKind::Line | ShapeKind::Plot => params.thickness(),
             _ => DEFAULT_THICKNESS,
         },
+        // A built shape takes the defaults the stroker already had, so every
+        // existing baseline is untouched by these three existing at all.
+        stroke_join: rustim_math::stroke::Join::default(),
+        stroke_cap: rustim_math::stroke::Cap::default(),
+        stroke_dash: None,
     };
 
     let mut m = Mobject::new(points)

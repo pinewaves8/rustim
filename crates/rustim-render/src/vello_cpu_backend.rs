@@ -26,8 +26,13 @@
 use vello_common::pixmap::Pixmap;
 use vello_cpu::{RasterizerSettings, RenderContext, Resources, TargetInit};
 
+use rustim_math::stroke::{Cap, Join, StrokeStyle};
+// `kurbo` is not a direct dependency of this crate, so the stroker's own enums are
+// reached through `vello_common` and aliased: this file names *both* vocabularies,
+// and the aliases are what keep the one place they meet unambiguous.
 use crate::draw::{Damage, DrawList, DrawOp, PixelRect};
 use crate::{RenderError, RenderStats, Renderer};
+use vello_common::kurbo::{Cap as KCap, Join as KJoin};
 
 /// Rasterises draw lists on the CPU.
 pub struct CpuRenderer {
@@ -106,9 +111,8 @@ impl CpuRenderer {
                 DrawOp::SetPaint(color) => self.ctx.set_paint(*color),
                 DrawOp::SetTransform(affine) => self.ctx.set_transform(shift * *affine),
                 DrawOp::FillPath(path) => self.ctx.fill_path(path),
-                DrawOp::StrokePath { path, width } => {
-                    self.ctx
-                        .set_stroke(vello_common::kurbo::Stroke::new(*width));
+                DrawOp::StrokePath { path, stroke } => {
+                    self.ctx.set_stroke(kurbo_stroke(stroke));
                     self.ctx.stroke_path(path);
                 }
                 DrawOp::PushClip(path) => self.ctx.push_clip_path(path),
@@ -263,6 +267,40 @@ fn copy_region(dst: &mut Pixmap, src: &Pixmap, rect: PixelRect) {
         let s = row * src_stride;
         dst[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
     }
+}
+
+/// The `kurbo` stroke a [`StrokeStyle`] describes.
+///
+/// The conversion lives here rather than in `rustim-math` so the shared
+/// vocabulary names no `kurbo` type: what crosses between the crates is this
+/// workspace's own `Join` and `Cap`, and exactly one function maps them onto the
+/// stroker's. `vello` strokes with this and applies the frame transform
+/// afterwards, so a width is in path space — world units, which is why the pen
+/// thickens when the camera zooms in.
+fn kurbo_stroke(style: &StrokeStyle) -> vello_common::kurbo::Stroke {
+    let mut stroke = vello_common::kurbo::Stroke::new(style.width);
+    // `KJoin`/`KCap` are `vello_common::kurbo`'s, aliased because this file also
+    // names this workspace's `Join` and `Cap` — and the two must not be confused
+    // at the one place they meet.
+    stroke.join = match style.join {
+        Join::Miter => KJoin::Miter,
+        Join::Round => KJoin::Round,
+        Join::Bevel => KJoin::Bevel,
+    };
+    let cap = match style.cap {
+        Cap::Butt => KCap::Butt,
+        Cap::Round => KCap::Round,
+        Cap::Square => KCap::Square,
+    };
+    stroke.start_cap = cap;
+    stroke.end_cap = cap;
+    if let Some([on, off]) = style.dash {
+        // `Dashes` is a `SmallVec<[f64; 4]>` and a `Vec` converts into one, so
+        // the two-length pattern this vocabulary carries costs no import of a
+        // container type it does not otherwise name.
+        stroke.dash_pattern = vec![on, off].into();
+    }
+    stroke
 }
 
 impl Renderer for CpuRenderer {

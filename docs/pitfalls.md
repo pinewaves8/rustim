@@ -388,3 +388,7 @@ available to `Uncreate` with Manim's timing. Recovering `raw` is not an option �
 inverse of a curve that is not injective (`overshoot`), and a numerical inverse would not be
 bit-identical anyway.
 
+
+**`kurbo::Stroke::new` defaults to *round* joins and *round* caps, and those are not its enums' defaults.** `Stroke::new(width)` sets `join: Join::Round`, `start_cap: Cap::Round`, `end_cap: Cap::Round`, while `Join::default()` is `Miter` and `Cap::default()` is `Butt`. So the workspace's strokes have always had round ends — invisibly, because nothing could name a join until the stroke vocabulary landed — and writing that vocabulary's `Default` from the two enums was the obvious-looking thing to do and it **moved two golden baselines** (`axes` and `primitives`, the two scenes with a real stroke): 38 pixels past the tolerance on the axes shaft alone, 27 of them by more than 64.
+
+The lesson is the one the golden suite exists to teach, in a new place: a default is a *claim about the picture*, and the only way to check it is to render. `rustim_math::stroke`'s `Join` and `Cap` therefore default to `Round` **because that is what the engine already did**, and the doc comment says where the number came from rather than presenting it as a choice.

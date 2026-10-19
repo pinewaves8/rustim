@@ -1,6 +1,7 @@
 //! Per-mobject appearance and dirty tracking.
 
 use rustim_color::Srgb;
+use rustim_math::stroke::{Cap, Join};
 
 /// How a mobject is painted.
 ///
@@ -14,6 +15,18 @@ pub struct Style {
     pub stroke: Srgb,
     pub stroke_opacity: f64,
     pub stroke_width: f64,
+    /// How two segments of the stroke meet, and how its ends are finished.
+    ///
+    /// Both are `Copy` and both default to what the stroker already did, so a
+    /// style that never mentions them draws exactly the picture it always did —
+    /// which is what keeps every existing baseline valid.
+    pub stroke_join: Join,
+    pub stroke_cap: Cap,
+    /// `[on, off]` in world units, or `None` for a solid line.
+    ///
+    /// One pair rather than a general pattern, because `Style` is `Copy` and a
+    /// `Vec` is not. See `rustim_math::stroke::StrokeStyle`.
+    pub stroke_dash: Option<[f64; 2]>,
 }
 
 impl Default for Style {
@@ -29,6 +42,9 @@ impl Default for Style {
             // and not a two-unit border. See `shapes::DEFAULT_THICKNESS` for
             // where `0.045` comes from.
             stroke_width: crate::shapes::DEFAULT_THICKNESS,
+            stroke_join: Join::default(),
+            stroke_cap: Cap::default(),
+            stroke_dash: None,
         }
     }
 }
@@ -59,6 +75,15 @@ impl Style {
             stroke: lerp_srgb(a.stroke, b.stroke, k),
             stroke_opacity: lerp_scalar(a.stroke_opacity, b.stroke_opacity, t),
             stroke_width: lerp_scalar(a.stroke_width, b.stroke_width, t),
+            // **Not interpolated, and they cannot be**: a miter does not become a
+            // round half-way through, and halving a dash pattern is not a dash
+            // pattern. A morph keeps the source's until it arrives, and the
+            // `t == 1.0` short-circuit above hands over the target's outright —
+            // which is the honest behaviour for a discrete property, and the
+            // reason it costs no extra branch to get right.
+            stroke_join: a.stroke_join,
+            stroke_cap: a.stroke_cap,
+            stroke_dash: a.stroke_dash,
         }
     }
 }
@@ -131,6 +156,9 @@ mod tests {
             stroke: fill,
             stroke_opacity: 0.0,
             stroke_width,
+            stroke_join: Join::default(),
+            stroke_cap: Cap::default(),
+            stroke_dash: None,
         }
     }
 

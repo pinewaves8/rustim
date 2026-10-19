@@ -2308,7 +2308,12 @@ impl SceneContext {
                 list.push(DrawOp::SetPaint(color));
                 list.push(DrawOp::StrokePath {
                     path,
-                    width: m.style.stroke_width,
+                    stroke: rustim_math::stroke::StrokeStyle {
+                        width: m.style.stroke_width,
+                        join: m.style.stroke_join,
+                        cap: m.style.stroke_cap,
+                        dash: m.style.stroke_dash,
+                    },
                 });
             }
         }
@@ -2545,7 +2550,7 @@ mod tests {
             .ops
             .iter()
             .filter_map(|o| match o {
-                DrawOp::StrokePath { width, .. } => Some(*width),
+                DrawOp::StrokePath { stroke, .. } => Some(stroke.width),
                 _ => None,
             })
             .collect();
