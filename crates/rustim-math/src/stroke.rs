@@ -11,6 +11,10 @@
 //! a join without one of them depending on `kurbo`'s version of the other, and so
 //! that the wire's vocabulary is defined here rather than derived from a
 //! third-party enum's `Debug` output.
+//!
+//! `Join` and `Cap` are also the **wire** spelling: they derive serde with
+//! `snake_case`, so a command says `"round"` and nothing downstream needs a name
+//! table.
 
 /// How two segments of a stroked path meet.
 ///
@@ -23,7 +27,8 @@
 /// default was found: every stroke in this engine has always had round joins and
 /// round caps, and a vocabulary default has to describe the picture that already
 /// exists rather than the one that seemed likely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Join {
     /// Extend the outer edges until they cross, cut off at the miter limit.
     Miter,
@@ -40,7 +45,8 @@ pub enum Join {
 /// what every stroke in this engine has always done. `Butt` stops exactly at the
 /// endpoint and `Square` reaches half a width past it — both are things a caller
 /// should have to ask for, because a cap changes a figure's silhouette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Cap {
     /// Stop at the endpoint.
     Butt,

@@ -159,7 +159,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     // incomplete capability list.
     assert_eq!(caps.shapes.len(), 12, "{:?}", caps.shapes);
     assert_eq!(caps.animations.len(), 12, "{:?}", caps.animations);
-    assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
+    assert_eq!(caps.properties.len(), 13, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
     assert_eq!(caps.actions.len(), 36, "{:?}", caps.actions);
     assert_eq!(

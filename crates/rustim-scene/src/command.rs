@@ -1435,12 +1435,15 @@ impl From<Axis> for rustim_director::Axis {
 /// are the names `Property`'s serde tag produces, and
 /// [`Capabilities::properties`] is the reader; a unit test parses one command
 /// per name so the two cannot drift.
-pub const PROPERTY_NAMES: [&str; 10] = [
+pub const PROPERTY_NAMES: [&str; 13] = [
     "opacity",
     "stroke_width",
     "stroke_opacity",
     "stroke_color",
     "fill_opacity",
+    "stroke_join",
+    "stroke_cap",
+    "stroke_dash",
     "label",
     "kind",
     "position",
@@ -1470,6 +1473,19 @@ pub enum Property {
     /// `params.color` uses, so a host that can create a blue shape can recolour
     /// its outline.
     StrokeColor([u8; 3]),
+    /// How two segments of a stroke meet, and how its ends are finished.
+    ///
+    /// The names are the enums' own serde spelling — `miter` / `round` / `bevel`
+    /// and `butt` / `round` / `square` — so nothing downstream needs a table.
+    StrokeJoin(rustim_math::stroke::Join),
+    StrokeCap(rustim_math::stroke::Cap),
+    /// `[on, off]` in world units, or **`null` for no dash at all**.
+    ///
+    /// This is the one property whose `null` is a value rather than an absent
+    /// field: the question is "what dash pattern", and the answer "none" is a
+    /// legitimate one. An empty list would have been the other spelling, and it
+    /// is worse — it looks like a pattern that dashes nothing.
+    StrokeDash(Option<[f64; 2]>),
     FillOpacity(f64),
     Label(String),
     /// What the object is, for the accessibility tree and the AI layer.
@@ -3190,11 +3206,20 @@ impl Property {
             | Self::Scale(_)
             | Self::Rotation(_)
             | Self::Label(_)
-            | Self::Kind(_) => {
+            | Self::Kind(_)
+            // The stroke's *shape* is discrete for `label`'s reason: there is no
+            // frame at which a join is half round, and interpolating the pattern
+            // of a dashed line would make the dashes crawl.
+            | Self::StrokeJoin(_)
+            | Self::StrokeCap(_)
+            | Self::StrokeDash(_) => {
                 let hint = match self {
                     Self::Position(_) => "a `move_to` animation moves an object",
                     Self::Scale(_) => "a `scale` animation resizes an object",
                     Self::Rotation(_) => "a `rotate` animation turns an object",
+                    Self::StrokeJoin(_) | Self::StrokeCap(_) | Self::StrokeDash(_) => {
+                        "a stroke's join, cap and dash are discrete; set them with `set`"
+                    }
                     _ => "label and kind are set instantly with `set`",
                 };
                 return Err(CommandError::OutOfRange {
@@ -3217,6 +3242,30 @@ impl Property {
             }
             Self::StrokeWidth(v) => {
                 m.style.stroke_width = width_range(*v)?;
+                m.dirty.style = true;
+            }
+            Self::StrokeJoin(join) => {
+                m.style.stroke_join = *join;
+                m.dirty.style = true;
+            }
+            Self::StrokeCap(cap) => {
+                m.style.stroke_cap = *cap;
+                m.dirty.style = true;
+            }
+            Self::StrokeDash(pattern) => {
+                // Both entries finite and positive, or `None`. A pattern with a
+                // zero entry draws a solid line and an infinite one draws
+                // nothing, and neither is a dashed line — the refusal says so
+                // rather than handing the stroker a pattern with no meaning.
+                if let Some([on, off]) = pattern
+                    && (!on.is_finite() || !off.is_finite() || *on <= 0.0 || *off <= 0.0)
+                {
+                    return Err(CommandError::OutOfRange {
+                        property: "stroke_dash".into(),
+                        detail: format!("[{on}, {off}] is not a pair of positive lengths"),
+                    });
+                }
+                m.style.stroke_dash = *pattern;
                 m.dirty.style = true;
             }
             Self::StrokeOpacity(v) => {
@@ -3358,6 +3407,21 @@ mod tests {
             ),
             format!(
                 r#"{{"action":"set","target":{id},"property":{{"name":"stroke_color","value":[100,181,246]}}}}"#
+            ),
+            // The stroke's shape, including the one property whose `null` is a
+            // *value* rather than an absent field: the question is "what dash
+            // pattern" and "none" is a legitimate answer.
+            format!(
+                r#"{{"action":"set","target":{id},"property":{{"name":"stroke_join","value":"bevel"}}}}"#
+            ),
+            format!(
+                r#"{{"action":"set","target":{id},"property":{{"name":"stroke_cap","value":"square"}}}}"#
+            ),
+            format!(
+                r#"{{"action":"set","target":{id},"property":{{"name":"stroke_dash","value":[2.0,1.0]}}}}"#
+            ),
+            format!(
+                r#"{{"action":"set","target":{id},"property":{{"name":"stroke_dash","value":null}}}}"#
             ),
             // The animation specs round-trip too, which is what lets a host log and
             // replay a session: `range`'s absent-field rule holds for `duration`
@@ -3895,6 +3959,10 @@ mod tests {
                 "opacity" | "stroke_width" | "stroke_opacity" | "fill_opacity" | "scale"
                 | "rotation" => "1.0",
                 "stroke_color" => "[1,2,3]",
+                // The stroke's shape, in the enums' own wire spelling.
+                "stroke_join" => "\"round\"",
+                "stroke_cap" => "\"butt\"",
+                "stroke_dash" => "[2.0,1.0]",
                 "label" => "\"方块\"",
                 "kind" => "\"square\"",
                 "position" => "[1.0,2.0]",
@@ -4407,6 +4475,85 @@ mod tests {
         assert!((b - 246.0 / 255.0).abs() < 1e-6, "{b}");
         assert_eq!(a, 1.0, "alpha lives in stroke_opacity, not in the colour");
         assert!(m.dirty.style, "the draw list has to be rebuilt");
+    }
+
+    /// The stroke's **shape** — join, cap, dash — is settable, and it is refused
+    /// from `animate` rather than half-interpolated: there is no frame at which a
+    /// join is half round, and a lerped dash pattern would make the dashes crawl.
+    ///
+    /// A dash is the one property whose `null` is a value: the question is "what
+    /// dash pattern" and "none" is a legitimate answer, so it clears rather than
+    /// being refused as a missing value.
+    #[test]
+    fn the_stroke_shape_is_settable_and_not_animatable() {
+        use rustim_math::stroke::{Cap, Join};
+
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(vec![]));
+
+        let set = |tree: &mut SceneTree, property: Property| {
+            apply(
+                tree,
+                &Command::Set {
+                    target: id.into(),
+                    property,
+                },
+            )
+        };
+
+        set(&mut tree, Property::StrokeJoin(Join::Bevel)).unwrap();
+        set(&mut tree, Property::StrokeCap(Cap::Square)).unwrap();
+        set(&mut tree, Property::StrokeDash(Some([2.0, 1.0]))).unwrap();
+        let style = tree.get(id).unwrap().style;
+        assert_eq!(style.stroke_join, Join::Bevel);
+        assert_eq!(style.stroke_cap, Cap::Square);
+        assert_eq!(style.stroke_dash, Some([2.0, 1.0]));
+        assert!(tree.get(id).unwrap().dirty.style);
+
+        // A pattern with a zero or negative entry draws a solid line or nothing,
+        // and neither is a dashed line — the refusal says so under the field's own
+        // name rather than handing the stroker a pattern with no meaning.
+        for bad in [
+            [0.0, 1.0],
+            [1.0, -1.0],
+            [f64::NAN, 1.0],
+            [1.0, f64::INFINITY],
+        ] {
+            assert!(
+                matches!(
+                    set(&mut tree, Property::StrokeDash(Some(bad))),
+                    Err(CommandError::OutOfRange { ref property, .. }) if property == "stroke_dash"
+                ),
+                "a dash of {bad:?} must be refused"
+            );
+        }
+        assert_eq!(
+            tree.get(id).unwrap().style.stroke_dash,
+            Some([2.0, 1.0]),
+            "a refused write changes nothing"
+        );
+
+        // ...and `null` clears it.
+        set(&mut tree, Property::StrokeDash(None)).unwrap();
+        assert_eq!(tree.get(id).unwrap().style.stroke_dash, None);
+
+        for (name, property) in [
+            ("stroke_join", Property::StrokeJoin(Join::Round)),
+            ("stroke_cap", Property::StrokeCap(Cap::Butt)),
+            ("stroke_dash", Property::StrokeDash(Some([1.0, 1.0]))),
+        ] {
+            let err = property
+                .animatable()
+                .expect_err("discrete, so not animatable");
+            assert!(
+                matches!(err, CommandError::OutOfRange { ref property, .. } if property == "property"),
+                "{name} must be refused under `property`"
+            );
+            assert!(
+                err.to_string().contains("discrete"),
+                "and the hint must say why: {err}"
+            );
+        }
     }
 
     #[test]
