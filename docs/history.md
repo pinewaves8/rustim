@@ -586,8 +586,9 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   session test asserting that a gesture camera moves every projected bound by the drag and that a
   `NaN` zoom is refused without changing the view. **All eight goldens are unchanged** (the browser
   frame still matches `linux-aarch64` with max channel error 1), and the count moved 621 → 628.
-  Deferred: pinch gestures and inertial scrolling, and keyboard/focus commands (still the one
-  interaction the Web version does not promise).
+  Deferred at the time: pinch gestures and inertial scrolling, and keyboard/focus commands — the one
+  interaction the Web version did not promise. Both later: pointer input above, and the keyboard at
+  the end of this file.
 - **Phase 0 of the external-driver plan is done: protocol v1's foundation.** The session handshake
   (`{"action":"hello","protocol":1}` → a `capabilities` document, `PROTOCOL_VERSION = 1`), the
   vocabulary lists derived from the enums the parser uses (`ShapeKind::ALL`,
@@ -1266,3 +1267,37 @@ pairing end to end, because each unit hop can stay green while the scene stops s
 
   This is `rustim_math::gesture`'s arrangement applied to the keyboard, and for the reason that step
   recorded: a vocabulary two hosts share belongs where both can reach it. Count 940 → 941.
+
+- **The browser gets the keyboard, and focus stays the DOM's job.** The Web host was the last place
+  that was not a peer: it could pan and zoom but a user could not operate it without a pointer, and
+  the checks had no keyboard to check. `keys::keydown` translates a DOM `KeyboardEvent` into the
+  shared `rustim_scene::input::KeyPress` — the same adapter shape the desktop has for winit — and
+  `keys::handle` acts on the intents a browser can honour: space (pause/resume), `m` (motion) and the
+  arrows (the focused figure's opacity), each reading the engine for the current value because a
+  toggle means "the other one". It answers `false` for `,`/`.`, Tab, Enter and Escape, which is how a
+  caller knows to leave the key to the page: a browser has no frame clock for a user to step, and its
+  focus ring is the DOM's own.
+
+  **Focus is not re-implemented.** Each overlay element carries `data-rustim-node` and a `tabindex`,
+  so the browser's Tab order over the figures comes for free and this host keeps no `FocusState` —
+  the desktop has one only because it has no DOM. A key that arrives while one of them has focus is
+  therefore a key *about that figure*, which is what makes the arrows mean something.
+
+  Two things the work turned up, both from a check rather than from reasoning. The first tab stop was
+  the semantic tree's **synthetic root** — `NodeId::RESERVED`, a container whose `hidden` is `false`
+  by construction because it is not an object that is painted or not — so the first Tab landed on a
+  node the engine does not hold and an arrow pressed there was about nothing. The condition is now
+  the desktop's focusability rule spelled for this side: `!hidden` (which is already
+  `opacity <= 0.0 || !has_picture()`, exactly what `FocusState::sync` skips) **and** `bounds.is_some()`
+  for the one node `hidden` cannot cover. And the arrow assertion had to pause the timeline first —
+  the Pythagorean scene fades its figures in, so "the canvas changed" would otherwise be the clock's
+  doing rather than the key's, and the check renders twice with no key between them as the
+  counterfactual that proves the comparison can tell.
+
+  Evidence: 9 native tests in `rustim-web` (the DOM spellings including `" "` for space and
+  `"Unidentified"` with a physical `Comma`; both toggles read back through `query`; an arrow clamped
+  at both ends rather than producing a value the command layer would refuse; and the four
+  deliberately-unhonoured intents), and an assertion in `tools/web-check.mjs` through Chrome's real
+  input pipeline — `Input.dispatchKeyEvent`, not a synthetic event — which focuses a figure, tabs to
+  the next, presses space and `m` and reads both back out of the **engine's** session block, then
+  shows the arrows changing the canvas while a paused timeline cannot. Count 941 → 947.

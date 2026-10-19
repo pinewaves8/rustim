@@ -50,7 +50,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{
     CanvasRenderingContext2d, Document, Element, Event, EventTarget, HtmlCanvasElement, ImageData,
-    PointerEvent, WheelEvent,
+    KeyboardEvent, PointerEvent, WheelEvent,
 };
 
 use rustim_math::Camera;
@@ -58,7 +58,10 @@ use rustim_math::gesture::Pointer;
 use rustim_render::straight_rgba_in_place;
 use rustim_scene::a11y::SemanticTree;
 
+use rustim_scene::NodeId;
+
 use crate::aria::{self, AriaNode};
+use crate::keys;
 use crate::pointer;
 use crate::session::{STEP, Session};
 
@@ -335,6 +338,22 @@ impl Inner {
         self.last_tree = Some(tree);
     }
 
+    /// The object the DOM focus is on, if the focus is inside the overlay.
+    ///
+    /// The browser owns the focus ring — the overlay's elements are focusable and
+    /// Tab moves between them — so this host *reads* the answer instead of
+    /// keeping a `FocusState` of its own. A missing or unparsable attribute is
+    /// `None`: a host page's own focusable element is not one of ours, and a key
+    /// pressed there is the page's business.
+    fn focused_node(&self) -> Option<NodeId> {
+        self.document
+            .active_element()?
+            .get_attribute("data-rustim-node")?
+            .parse::<u64>()
+            .ok()
+            .map(NodeId::from_raw)
+    }
+
     fn make_node(&self, node: &AriaNode) -> Option<Element> {
         let element = self.document.create_element("div").ok()?;
         let _ = element.set_attribute("role", node.role);
@@ -346,6 +365,27 @@ impl Inner {
         }
         if node.hidden {
             let _ = element.set_attribute("aria-hidden", "true");
+        }
+        // Which object this element stands for, so a key that arrives while it
+        // has focus is a key about *that* figure. A data attribute rather than
+        // the element's `id`, because a host page may use `id` for its own
+        // anchors and the two must not collide.
+        let _ = element.set_attribute("data-rustim-node", &node.id.to_string());
+        // And focusable, which is what gives the page a Tab order over the
+        // figures for free. Re-implementing focus movement here would be a second
+        // answer to a question the DOM already answers — the desktop keeps a
+        // `FocusState` only because it has no DOM.
+        //
+        // The condition is the desktop's focusability rule, spelled the way this
+        // side has it. `hidden` is already `opacity <= 0.0 || !has_picture()`,
+        // which is exactly what `FocusState::sync` skips; `bounds` excludes the
+        // one node `hidden` cannot — the semantic tree's **synthetic root**, a
+        // container `NodeId::RESERVED` that no `SceneTree::insert` can produce.
+        // Its `hidden` is `false` by construction because it is not an object
+        // that is painted or not, so without this it became the first tab stop
+        // and a key pressed there was about nothing at all.
+        if !node.hidden && node.bounds.is_some() {
+            let _ = element.set_attribute("tabindex", "0");
         }
         let _ = element.set_attribute("style", &placement(node.bounds));
         if let Some(mathml) = &node.mathml {
@@ -438,6 +478,10 @@ fn placement(bounds: Option<rustim_math::Rect>) -> String {
 fn install_listeners(inner: &Rc<RefCell<Inner>>) -> Result<Vec<Listener>, JsValue> {
     let canvas = inner.borrow().canvas.clone();
     let target: EventTarget = canvas.unchecked_into();
+    // The keyboard's target is the overlay, not the canvas: the overlay's
+    // elements are what a user tabs to, and the canvas is not focusable and never
+    // will be. Listening on the canvas would mean no key ever arrived.
+    let overlay_target: EventTarget = inner.borrow().overlay.clone().unchecked_into();
 
     let down = {
         let weak = Rc::downgrade(inner);
@@ -504,6 +548,37 @@ fn install_listeners(inner: &Rc<RefCell<Inner>>) -> Result<Vec<Listener>, JsValu
         })
     };
 
+    // Keyboard, on the **overlay** rather than on the window or the canvas: the
+    // overlay's elements are what a user tabs to, so a key arriving while one of
+    // them has focus is a key about that figure. Attaching this to the document
+    // would swallow the host page's own shortcuts everywhere else on the page.
+    let keyed = {
+        let weak = Rc::downgrade(inner);
+        Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let Some(event) = event.dyn_ref::<KeyboardEvent>() else {
+                return;
+            };
+            let mut inner = inner.borrow_mut();
+            let focused = inner.focused_node();
+            let press = keys::keydown(
+                &event.key(),
+                &event.code(),
+                event.repeat(),
+                event.shift_key(),
+            );
+            // `handle` answers whether the key was ours. A key it did not take is
+            // one the page keeps, so `preventDefault` is the exception here rather
+            // than the rule — which is what stops this from eating a browser
+            // shortcut or a scroll.
+            if keys::handle(&mut inner.session, &press, focused) {
+                event.prevent_default();
+            }
+        })
+    };
+
     let wheel = {
         let weak = Rc::downgrade(inner);
         Closure::<dyn FnMut(Event)>::new(move |event: Event| {
@@ -530,6 +605,7 @@ fn install_listeners(inner: &Rc<RefCell<Inner>>) -> Result<Vec<Listener>, JsValu
         Listener::add(&target, "pointercancel", release(inner))?,
         Listener::add(&target, "pointerleave", release(inner))?,
         Listener::add(&target, "wheel", wheel)?,
+        Listener::add(&overlay_target, "keydown", keyed)?,
     ])
 }
 

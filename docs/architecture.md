@@ -1237,13 +1237,29 @@ uses `FormulaCompiler::from_embedded` — `typst-assets` only, no filesystem —
 no `BUNDLED_DIR`; the embedded half is shared with `new()` so a fragment compiles on both hosts or
 neither.
 
-Deferred, deliberately: **keyboard input and focus commands** (the Web version promises "a screen
-reader can read the structure", not interaction; pointer pan/zoom has landed — see above); pinch
-gestures and inertial scrolling; font subsetting and lazy loading (the two-page split is the
-packaging answer for now, and a CJK formula on the web needs fonts `from_embedded` does not carry);
-and WebCodecs/`MediaRecorder` export (the `VideoSink` seam is the place it goes). The query command
-is *not* deferred any more — `Session::apply` answers it through the same `reply_line` the desktop
-feed uses.
+**Keyboard and focus have landed**, and they are the desktop's keymap reached through the DOM rather
+than a second one. `keys::keydown` converts a `KeyboardEvent` into
+[`rustim_scene::input::KeyPress`] — the same adapter shape `rustim_app::input::from_event` has for
+winit — and `keys::handle` acts on the intents a browser can honour: **space** (pause/resume), **`m`**
+(motion) and the **arrows** (the focused figure's opacity), reading the engine for the current value
+because a toggle means "the other one". It answers `false` for `,`/`.`, Tab, Enter and Escape — which
+is how a caller knows to leave the key to the page — because a browser has no frame clock for a user
+to step and its focus ring is the DOM's own.
+
+**Focus is the DOM's, and that is the point.** Each overlay element carries `data-rustim-node` and a
+`tabindex`, so the browser's own Tab order over the figures is free and this host keeps no
+`FocusState` — the desktop has one only because it has no DOM. The `tabindex` condition is the
+desktop's focusability rule spelled for this side: `!hidden` (`hidden` is already
+`opacity <= 0.0 || !has_picture()`, exactly what `FocusState::sync` skips) **and** `bounds.is_some()`,
+which excludes the one node `hidden` cannot — the semantic tree's synthetic root, a container whose
+`hidden` is `false` by construction. Without that second clause the root was the first tab stop, and a
+key pressed there was about nothing at all.
+
+Deferred, deliberately: pinch gestures and inertial scrolling; font subsetting and lazy loading (the
+two-page split is the packaging answer for now, and a CJK formula on the web needs fonts
+`from_embedded` does not carry); and WebCodecs/`MediaRecorder` export (the `VideoSink` seam is the
+place it goes). The query command is *not* deferred any more — `Session::apply` answers it through the
+same `reply_line` the desktop feed uses.
 
 ## Naming
 

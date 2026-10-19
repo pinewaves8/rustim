@@ -56,6 +56,11 @@ web-sys = { version = "=0.3.77", features = [
     "Node",
     "Performance",
     "PointerEvent",
+    # The keyboard: `KeyboardEvent.key`/`.code`/`.repeat`/`.shiftKey`, and
+    # `Document::active_element` for which figure the focus is on. The keymap
+    # itself is `rustim_scene::input`, shared with the desktop — only the event
+    # fields are read here.
+    "KeyboardEvent",
     "WheelEvent",
     "Window",
 ] }

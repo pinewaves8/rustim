@@ -442,6 +442,85 @@ try {
     );
   }
 
+  // -------------------------------------------------------------------------
+  // Keyboard, through `Input.dispatchKeyEvent` rather than a synthetic
+  // `KeyboardEvent`: it goes through Chrome's own input pipeline, so the
+  // listeners see a real key arriving at a real focus target.
+  //
+  // What is asserted is the **engine's** state — the session block a `query`
+  // reports, which is the same one an AI reads back — rather than the page's
+  // opinion of itself.
+
+  const key = async (k, code, vk) => {
+    const common = { key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk };
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      ...common,
+      ...(k.length === 1 ? { text: k, unmodifiedText: k } : {}),
+    });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...common });
+  };
+  const session = async () =>
+    JSON.parse(await cdp.evaluate(`window.rustim.apply('{"action":"query"}')`)).session;
+  const frame = () => cdp.evaluate('document.getElementById("canvas").toDataURL("image/png")');
+
+  // The figures are focusable, and each carries the node it stands for. That is
+  // what lets a key be *about* one of them, and it is why this host has no
+  // `FocusState`: the browser owns the focus ring.
+  const focused = await cdp.evaluate(`(() => {
+    const el = document.querySelector('[data-rustim-node][tabindex]');
+    if (!el) return null;
+    el.focus();
+    return document.activeElement === el ? el.getAttribute('data-rustim-node') : null;
+  })()`);
+
+  // ...and Tab is the browser's own order over them, not a reimplementation.
+  await key('Tab', 'Tab', 9);
+  const tabbedTo = await cdp.evaluate(
+    `document.activeElement && document.activeElement.getAttribute('data-rustim-node')`,
+  );
+
+  // Space stops the timeline.
+  await key(' ', 'Space', 32);
+  await sleep(50);
+  const stopped = await session();
+
+  // `m` flips the motion policy — the other toggle the browser honours.
+  await key('m', 'KeyM', 77);
+  await sleep(50);
+  const flipped = await session();
+
+  // An arrow moves the *focused* figure's opacity. The timeline is paused by
+  // then, so nothing else can move: a canvas that changed is the arrow's doing,
+  // and rendering twice with no key between is the counterfactual that proves
+  // the comparison can tell.
+  await cdp.evaluate('window.rustim.render()');
+  const idle = await frame();
+  const alsoIdle = await frame();
+  await key('ArrowLeft', 'ArrowLeft', 37);
+  await key('ArrowLeft', 'ArrowLeft', 37);
+  await key('ArrowLeft', 'ArrowLeft', 37);
+  await cdp.evaluate('window.rustim.render()');
+  const pressed = await frame();
+
+  const keyboardOk = focused !== null && tabbedTo !== null && tabbedTo !== focused;
+  const togglesOk = stopped.paused === true && flipped.motion === 'reduced';
+  const arrowOk = idle === alsoIdle && pressed !== idle;
+
+  if (!keyboardOk || !togglesOk || !arrowOk) {
+    console.error(
+      `web-check: keyboard — focused ${focused}, Tab reached ${tabbedTo}; ` +
+        `space gave paused=${stopped.paused}, m gave motion=${flipped.motion}; ` +
+        `idle frames equal=${idle === alsoIdle}, an arrow changed the canvas=${pressed !== idle}`,
+    );
+    exitCode = 1;
+  } else {
+    console.log(
+      `keys  Tab reached node ${tabbedTo} (focused ${focused}); ` +
+        `space -> paused, m -> ${flipped.motion}, arrows changed the canvas`,
+    );
+  }
+
   // The second artifact. Typst is linked only into `pkg-formula`, and this is
   // the only place its wasm build is actually *run* rather than compiled.
   await cdp.send('Page.navigate', { url: `${origin}/formula.html?paused=1` });
