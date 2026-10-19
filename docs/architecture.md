@@ -1246,6 +1246,31 @@ uses `FormulaCompiler::from_embedded` — `typst-assets` only, no filesystem —
 no `BUNDLED_DIR`; the embedded half is shared with `new()` so a fragment compiles on both hosts or
 neither.
 
+**Font subsetting was measured, and the answer is that it is not available.** The deferred item was
+"font subsetting and lazy loading", so here is what is actually in the number (measured 2026-10-20 on
+macos-aarch64):
+
+| | raw | gzip -9 |
+|---|---|---|
+| `pkg-formula` wasm | 34 356 006 B | 14 408 051 B |
+| `pkg` wasm (no Typst) | 2 165 349 B | ~640 000 B |
+| all of `typst-assets`' fonts | 9.2 MB | **6.1 MB** |
+| the **NewCM** faces, which math actually uses | 6.3 MB | 4.03 MB |
+
+So the fonts are **42% of the formula page's compressed download** — and **two thirds of that font
+weight is NewCM, the family a math fragment is rendered in and cannot be dropped**. A glyph-level
+subset is not on the table either: the page's whole purpose is to compile **arbitrary formulas at
+runtime**, so the glyph set is not knowable at build time. What subsetting *could* buy is the ~2.1 MB
+gzip of non-NewCM faces (Libertinus, DejaVu Mono, and eighteen Foxit `.pfb` files that exist for
+PDF export) — at the cost of ~3 MB of font files added to this repository, a second font-loading path
+(`FormulaCompiler::with_fonts` takes a set, so the mechanism exists) and a licence surface. `typst-assets`
+offers no per-font features — its `fonts` feature is all-or-nothing — so a runtime filter would not
+shrink the artifact even slightly: the bytes are linked in regardless.
+
+**The packaging answer already in place is the one that matters**, and it is worth more than the
+2.1 MB: the two pages load different modules, so a reader of the Pythagorean scene downloads 640 KB
+rather than 14.4 MB, and only a page that compiles formulas pays for a compiler.
+
 **Keyboard and focus have landed**, and they are the desktop's keymap reached through the DOM rather
 than a second one. `keys::keydown` converts a `KeyboardEvent` into
 [`rustim_scene::input::KeyPress`] — the same adapter shape `rustim_app::input::from_event` has for

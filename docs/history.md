@@ -1374,3 +1374,23 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   region instead of a full repaint**, which is what `primitives` would have been paying for had it
   moved. **All eight goldens are unchanged** — a damage rule changes what a frame *costs*, not what it
   *is* — and the count moved 961 → 963.
+
+- **Font subsetting was measured rather than implemented, and the measurement is the deliverable.** The
+  deferred item was "font subsetting and lazy loading", and the honest place to start was what is
+  actually in the number. On macos-aarch64 (2026-10-20): the formula page's wasm is 34 356 006 B raw /
+  **14 408 051 B gzip**, of which **`typst-assets`' fonts are 6.1 MB gzip — 42% of the download**. And
+  **two thirds of that font weight is NewCM (4.03 MB gzip), the family a math fragment is rendered in**:
+  the part that cannot be dropped is most of the part there is.
+
+  A glyph-level subset is not available either, for a reason that is the page's whole point: it compiles
+  **arbitrary formulas at runtime**, so the glyph set is not knowable at build time. What subsetting
+  could buy is the ~2.1 MB gzip of faces math never touches — Libertinus, DejaVu Mono, and eighteen
+  Foxit `.pfb` files that exist for PDF export — at the cost of ~3 MB of font files in this repository, a
+  second font-loading path, and a licence surface. `typst-assets` has exactly one feature (`fonts`,
+  all-or-nothing), so a *runtime* filter would not shrink the artifact at all: the bytes are linked
+  regardless. That is the trap this measurement exists to avoid walking into.
+
+  What is already in place beats the 2.1 MB: the two pages load **different modules**, so a reader of the
+  Pythagorean scene downloads ~640 KB and only a page that compiles formulas pays for a compiler. The
+  numbers are now in `docs/architecture.md` beside the artifact table they belong to, so the next person
+  to read "font subsetting" as an outstanding win can see what it is worth before starting.
