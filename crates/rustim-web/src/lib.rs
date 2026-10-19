@@ -24,6 +24,7 @@
 //! everywhere else.
 
 pub mod aria;
+pub mod keys;
 pub mod pointer;
 pub mod session;
 #[cfg(feature = "formula")]

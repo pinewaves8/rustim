@@ -2657,6 +2657,24 @@ pub fn apply(tree: &mut SceneTree, cmd: &Command) -> Result<StateDiff, CommandEr
 ///
 /// `center` is not range-checked, matching `move_to`'s `to`: JSON cannot carry a
 /// non-finite float and every finite point is a legitimate centre.
+/// The command for "move this node's opacity by `delta`".
+///
+/// Clamped **here** rather than left to the command layer, which would *refuse*
+/// an out-of-range value: an arrow key held at the end of the range should be a
+/// no-op, not an error message.
+///
+/// It lives in the command layer because two hosts press that key: the desktop's
+/// window and the browser page, whose keymaps share `rustim_scene::input` and
+/// would otherwise share the keypress and disagree about what it does. Every
+/// other intent is either a command already or a host affordance with no
+/// equivalent on the other side.
+pub fn opacity_step(target: NodeId, current: f64, delta: f64) -> Command {
+    Command::Set {
+        target: target.into(),
+        property: Property::Opacity((current + delta).clamp(0.0, 1.0)),
+    }
+}
+
 pub fn camera_for(
     tree: &SceneTree,
     viewport: &Viewport,

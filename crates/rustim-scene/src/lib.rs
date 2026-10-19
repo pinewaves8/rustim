@@ -57,7 +57,9 @@ pub mod typeset;
 
 pub use a11y::{CameraView, SemanticNode, SemanticRole, SemanticTree, SemanticValue};
 pub use check::{CheckCode, CheckReport, Finding, Severity};
-pub use command::{Command, CommandError, CommandOutcome, CommandReply, StateDiff, Target};
+pub use command::{
+    Command, CommandError, CommandOutcome, CommandReply, SessionState, StateDiff, Target,
+};
 pub use context::{Scene, SceneContext};
 pub use event::{Event, EventKind, EventLine, MAX_EVENTS, event_line};
 pub use plan::{Plan, PlanStatus, PlanStep};

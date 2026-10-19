@@ -26,6 +26,7 @@ use rustim_math::{Camera, Viewport};
 use rustim_render::{CpuRenderer, DrawList, Renderer};
 use rustim_scene::a11y::SemanticTree;
 use rustim_scene::command::{Command, parse_command, reply_line};
+use rustim_scene::{NodeId, SessionState};
 use rustim_scene::{Scene, SceneContext};
 
 /// The virtual timestep the still path, the exporter and the browser's
@@ -244,17 +245,44 @@ impl Session {
     /// until it ends, exactly as an instant `{"action":"camera"}` does on the
     /// desktop.
     pub fn set_camera(&mut self, camera: Camera) -> Result<(), String> {
-        let command = Command::Camera {
+        self.command(&Command::Camera {
             center: Some([camera.center.0, camera.center.1]),
             zoom: Some(camera.zoom),
             focus: None,
             duration: None,
-        };
-        let outcome = self.ctx.handle(&command).map_err(|e| e.to_string())?;
+        })
+    }
+
+    /// Apply a command the host built rather than parsed.
+    ///
+    /// The same route `set_camera` takes and the keyboard needs: a command this
+    /// host constructs still goes through `SceneContext::handle`, so it meets the
+    /// same validator a script line does and cannot reach a state the protocol
+    /// would refuse. A refusal is a `String` rather than a panic, because a host
+    /// has no terminal to print one to.
+    pub fn command(&mut self, cmd: &Command) -> Result<(), String> {
+        let outcome = self.ctx.handle(cmd).map_err(|e| e.to_string())?;
         if let Some(diff) = outcome.diff() {
             self.scene.on_command(diff, &mut self.ctx);
         }
         Ok(())
+    }
+
+    /// The session's own state — what a `query` reports beside the tree.
+    ///
+    /// The keyboard needs it to *toggle*: `space` means "the other one", and the
+    /// engine is where the current one lives.
+    pub fn session_state(&self) -> SessionState {
+        self.ctx.session_state()
+    }
+
+    /// One node's opacity, or `None` if it is not there.
+    ///
+    /// An arrow key has to build an absolute value — the protocol has no
+    /// "adjust by" command — so the host reads the current one first, exactly as
+    /// the desktop's keymap does.
+    pub fn node_opacity(&self, id: NodeId) -> Option<f64> {
+        Some(self.ctx.tree.get(id)?.opacity)
     }
 
     /// Frames whose state was built (not just presented).

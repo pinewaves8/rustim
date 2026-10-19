@@ -345,14 +345,11 @@ impl A11yCore {
     pub fn adjust(&mut self, delta: f64, ctx: &SceneContext) -> Option<Command> {
         let target = self.focus.focused()?;
         let current = ctx.tree.get(target)?.opacity;
-        // Clamped here rather than left to the command layer, which would
-        // *refuse* an out-of-range value: an arrow key at the end of the range
-        // should be a no-op, not an error message.
-        let value = (current + delta).clamp(0.0, 1.0);
-        Some(Command::Set {
-            target: target.into(),
-            property: Property::Opacity(value),
-        })
+        // The arithmetic is `rustim_scene`'s rather than this host's: the browser
+        // page presses the same arrow key, so the two must not disagree about
+        // what one press means. See `command::opacity_step` for why it clamps
+        // here rather than letting the command layer refuse.
+        Some(rustim_scene::command::opacity_step(target, current, delta))
     }
 
     /// Set the focus directly, as an assistive technology does.
