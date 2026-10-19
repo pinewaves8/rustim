@@ -357,6 +357,106 @@ impl Animation for Rotate {
     }
 }
 
+/// Keeps turning, until something stops it.
+///
+/// **The one animation with no end**, and the reason [`Animation::perpetual`]
+/// exists: the scheduler's ordinary rule is `alpha = elapsed / duration`, which
+/// for an endless thing would be `age / ∞ = 0` — frozen at its start while
+/// `is_playing` stayed true. A perpetual animation is handed its own **age**
+/// instead, and this reads an angle out of it.
+///
+/// `turns_per_second` is the whole parameter, and its **sign is the direction**:
+/// `0.25` is one turn every four seconds, `-0.25` the same the other way. A rate
+/// rather than a period because the angle is exactly `age × rate × τ` — a period
+/// would be divided back out on every frame, and the division is where a
+/// `f64::INFINITY` would come back from.
+///
+/// It is a **beat that never ends**: the queue will not advance past it, and the
+/// `stop` command — [`AnimationScheduler::clear`] — is how it is taken off the
+/// clock. `duration()` reports the *period*, one full cycle, because that is all
+/// an endless animation can honestly offer and it is what a `beat_started` event
+/// has a field for.
+#[derive(Debug, Clone)]
+pub struct Rotating {
+    target: NodeId,
+    turns_per_second: f64,
+    start: Option<Affine2>,
+    /// A *world* point, as a caller thinks of it; converted once in `begin`.
+    about_point: Option<Point>,
+    /// The same point in the parent's space, which is what
+    /// [`Mobject::rotate_about`] takes.
+    pivot: Option<Point>,
+}
+
+impl Rotating {
+    /// Turn `target` about its own centre at `turns_per_second`, forever.
+    ///
+    /// A zero or non-finite rate is a caller bug, and the command layer refuses
+    /// one rather than this constructor: that is where a model can reach, and this
+    /// is the Rust-level API a scene author uses deliberately.
+    pub fn new(target: NodeId, turns_per_second: f64) -> Self {
+        Self {
+            target,
+            turns_per_second,
+            start: None,
+            about_point: None,
+            pivot: None,
+        }
+    }
+
+    /// Turn about a **world** point instead of the object's own centre.
+    pub fn about_point(mut self, point: Point) -> Self {
+        self.about_point = Some(point);
+        self
+    }
+}
+
+impl Animation for Rotating {
+    /// One full turn — a **period**, not a length: the beat does not end.
+    ///
+    /// A degenerate rate degrades to a nominal period rather than reporting an
+    /// infinity, which is the same posture a shape builder takes to a bad
+    /// parameter and for a concrete reason: an `∞` here would reach a
+    /// `beat_started` event, and JSON has no spelling for one.
+    fn duration(&self) -> f64 {
+        let rate = self.turns_per_second.abs();
+        if rate.is_finite() && rate > 0.0 {
+            1.0 / rate
+        } else {
+            1.0
+        }
+    }
+
+    fn perpetual(&self) -> bool {
+        true
+    }
+
+    fn begin(&mut self, tree: &SceneTree) {
+        let Some(m) = tree.get(self.target) else {
+            return;
+        };
+        self.start = Some(m.transform);
+        self.pivot = match self.about_point {
+            // `critical_point` answers in the parent's space already, so the
+            // default pivot needs no inverse — the same note `Rotate` carries.
+            None => m.critical_point((0.0, 0.0)),
+            Some(world) => to_parent_space(tree.parent_transform(self.target), world),
+        };
+    }
+
+    /// `elapsed` here is **seconds**, not progress — see [`Animation::perpetual`].
+    fn interpolate(&mut self, elapsed: f64, tree: &mut SceneTree) {
+        let (Some(start), Some(pivot)) = (self.start, self.pivot) else {
+            return;
+        };
+        let Some(m) = tree.get_mut(self.target) else {
+            return;
+        };
+        let angle = elapsed * self.turns_per_second * std::f64::consts::TAU;
+        m.set_transform(Affine2::rotate_about(angle, pivot) * start);
+    }
+}
+
 /// Grows or shrinks an object **in place**.
 ///
 /// Manim has no `Scale` animation: scaling is `ScaleInPlace` (`animation/transform.py:562`),
@@ -1161,6 +1261,88 @@ mod tests {
         let mut tree = SceneTree::new();
         let id = tree.insert(m);
         (tree, id)
+    }
+
+    /// The `Box` forwarding trap, and it is not hypothetical here: the scheduler
+    /// holds `Box<dyn Animation>`, so a missing forward makes a perpetual
+    /// animation answer `false` — and then the scheduler divides its age by a
+    /// period and it freezes at its start while `is_playing` stays true. That is
+    /// the failure `perpetual` exists to prevent, arriving through the one
+    /// container every beat is built from.
+    #[test]
+    fn a_boxed_perpetual_animation_is_still_perpetual() {
+        let (_, id) = scene(square());
+        let boxed: Box<dyn Animation> = Box::new(Rotating::new(id, 0.25));
+        assert!(boxed.perpetual(), "the box must forward it");
+        assert_eq!(boxed.duration(), 4.0, "a quarter turn a second");
+    }
+
+    /// The scheduler hands a perpetual animation its **age**, so `interpolate` is
+    /// called with seconds. Two seconds at a quarter turn per second is half a
+    /// turn, and the check is a geometric one — each corner lands on the opposite
+    /// one — rather than the same expression written twice.
+    #[test]
+    fn a_perpetual_animation_reads_its_argument_as_seconds() {
+        let (mut tree, id) = scene(square());
+        let start = tree.world_anchors(id).unwrap();
+
+        let mut anim = Rotating::new(id, 0.25);
+        anim.begin(&tree);
+        anim.interpolate(2.0, &mut tree);
+
+        let turned = tree.world_anchors(id).unwrap();
+        assert!(
+            (turned[0].x + start[0].x).abs() < 1e-9 && (turned[0].y + start[0].y).abs() < 1e-9,
+            "half a turn puts corner {:?} on the opposite one, not at {:?}",
+            start[0],
+            turned[0]
+        );
+    }
+
+    #[test]
+    fn a_perpetual_animations_duration_is_a_period_and_never_an_infinity() {
+        let (_, id) = scene(square());
+        assert_eq!(Rotating::new(id, 0.25).duration(), 4.0);
+        assert_eq!(
+            Rotating::new(id, -0.25).duration(),
+            4.0,
+            "the sign is the direction, not the length"
+        );
+        // A degenerate rate is a caller bug that the command layer refuses; here
+        // it degrades to a nominal period rather than reporting an `∞`, which
+        // would reach a `beat_started` event and JSON has no spelling for one.
+        assert!(Rotating::new(id, 0.0).duration().is_finite());
+        assert!(Rotating::new(id, f64::NAN).duration().is_finite());
+    }
+
+    /// The whole point of the concept, checked through the scheduler rather than
+    /// by calling `interpolate` by hand: `age / duration` would be `age / 4` here,
+    /// and the animation would creep round rather than turn — or, with a period of
+    /// infinity, stand still.
+    #[test]
+    fn the_scheduler_never_finishes_a_perpetual_animation() {
+        use crate::AnimationScheduler;
+
+        let (mut tree, id) = scene(square());
+        let start = tree.world_anchors(id).unwrap();
+        let mut sched = AnimationScheduler::new();
+        sched.add(Box::new(Rotating::new(id, 0.25)));
+
+        for _ in 0..120 {
+            sched.update(1.0 / 60.0, &mut tree);
+        }
+
+        assert!(
+            !sched.is_empty(),
+            "it has no end, so it is still on the clock"
+        );
+        let after = tree.world_anchors(id).unwrap();
+        assert!(
+            (after[0].x + start[0].x).abs() < 1e-6 && (after[0].y + start[0].y).abs() < 1e-6,
+            "two seconds is half a turn: corner {:?} should be opposite {:?}",
+            after[0],
+            start[0]
+        );
     }
 
     /// The end state is written, not computed: `x0 + (x1 - x0) * 1.0` is not

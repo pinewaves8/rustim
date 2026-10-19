@@ -1301,3 +1301,29 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   input pipeline — `Input.dispatchKeyEvent`, not a synthetic event — which focuses a figure, tabs to
   the next, presses space and `m` and reads both back out of the **engine's** session block, then
   shows the arrows changing the canvas while a paused timeline cannot. Count 941 → 947.
+
+- **An animation with no end, and the scheduler concept it needed.** `Rotating` was deferred with the
+  reason written down: `duration = ∞` makes `alpha = age / ∞ = 0`, so the object freezes at its start
+  while `is_playing` stays true forever — which every "react when the timeline drains" scene depends
+  on. The fix is a trait method rather than a very large number: `Animation::perpetual`, defaulting to
+  `false`, and the scheduler hands a perpetual animation **raw elapsed seconds** instead of progress,
+  skips `ease` for it (which clamps to `0.0..=1.0`, and a second is not a progress value), and
+  excludes it from both the completion pass and the sweep. It has no end, so `finish` never runs
+  either — a `FadeOut` and a `Rotating` differ in exactly that.
+
+  **`Rotating::duration()` is a period, not a length.** `turns_per_second` is the parameter and its
+  sign is the direction, because the angle is exactly `age × rate × τ`; a period would be divided
+  back out every frame and the division is where an infinity would come back from. It reports one
+  full cycle — all an endless animation can honestly offer, and what a `beat_started` event has a
+  field for — and **degrades to a nominal period for a degenerate rate** rather than reporting an
+  `∞`, which would reach that event and JSON has no spelling for one.
+
+  The `Box` forwarding is the load-bearing line, and this repository has been bitten by exactly this
+  twice: the scheduler holds `Box<dyn Animation>`, `perpetual` has a default, so a missing forward
+  would make a *boxed* `Rotating` answer `false` and freeze it — the bug the method exists to
+  prevent, arriving through the one container every beat is built from. There is a test named for it.
+
+  Evidence: four `ops.rs` tests, including the scheduler one rather than a hand-called `interpolate`
+  (two seconds at a quarter turn a second puts each corner on the opposite one; the counterfactual is
+  that `age / duration` would have crept round instead or, at an infinite period, not moved at all).
+  Count 947 → 951.

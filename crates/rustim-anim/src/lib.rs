@@ -149,6 +149,29 @@ pub trait Animation {
     fn ease(&self, raw: f64) -> f64 {
         (self.rate_func())(rate::clamp01(raw))
     }
+
+    /// Whether this animation runs until it is stopped rather than to an end.
+    ///
+    /// The scheduler's ordinary contract is `alpha = elapsed / duration`, and a
+    /// perpetual animation breaks it in a way that is silent rather than loud:
+    /// with `duration() = ∞` that quotient is **0**, so the object freezes at its
+    /// start while `is_playing` stays true forever. (That is the failure the
+    /// deferral note recorded, and it is why this is a scheduler concept rather
+    /// than a very large duration.)
+    ///
+    /// So a perpetual animation is handed **raw elapsed seconds** instead, and the
+    /// eased-progress machinery is skipped: `ease` clamps to `0.0..=1.0`, and a
+    /// second of elapsed time is not a progress value. It never completes, so
+    /// `finish` never runs either.
+    ///
+    /// `duration()` still means something for one — the **period**, one full
+    /// cycle — because that is what a `beat_started` event can report and all an
+    /// endless thing has to offer. It is not a length: the beat does not end, and
+    /// [`crate::AnimationScheduler::clear`] (the `stop` command) is what takes it
+    /// off the clock.
+    fn perpetual(&self) -> bool {
+        false
+    }
 }
 
 /// A boxed animation is an animation.
@@ -195,6 +218,17 @@ impl<T: Animation + ?Sized> Animation for Box<T> {
 
     fn rate_func(&self) -> RateFunc {
         (**self).rate_func()
+    }
+
+    /// Forwarded, for `finish`'s reason and with the same failure mode.
+    ///
+    /// `perpetual` has a default, the scheduler holds `Box<dyn Animation>`, and a
+    /// boxed `Rotating` that answered `false` here would be driven as if it had an
+    /// end: `age / ∞` is 0, so it would freeze at its start while `is_playing`
+    /// stayed true — the exact bug the method exists to prevent, arriving through
+    /// the one container every beat is built from.
+    fn perpetual(&self) -> bool {
+        (**self).perpetual()
     }
 }
 
@@ -272,8 +306,16 @@ impl AnimationScheduler {
         for r in &mut self.running {
             let d = r.anim.duration();
             let age = self.elapsed - r.started_at;
-            let raw = if d <= 0.0 { 1.0 } else { age / d };
-            let alpha = r.anim.ease(raw);
+            // A perpetual animation is handed its own age rather than a fraction
+            // of a length it does not have — `age / ∞` is 0, which would freeze it
+            // while `is_playing` stayed true. Easing is skipped for it too: `ease`
+            // clamps to `0.0..=1.0`, and elapsed seconds are not progress.
+            let alpha = if r.anim.perpetual() {
+                age
+            } else {
+                let raw = if d <= 0.0 { 1.0 } else { age / d };
+                r.anim.ease(raw)
+            };
             r.anim.interpolate(alpha, tree);
         }
         // Completion, then the sweep. The predicate is the exact complement of
@@ -282,15 +324,19 @@ impl AnimationScheduler {
         // zero-duration animation on its very first tick (`raw` is forced to 1.0
         // above, and `0.0 < 0.0` is already false for `retain`).
         //
+        // A perpetual animation is excluded from both: it has no end to reach, so
+        // `finish` (which removes a `FadeOut`'s target) must not run, and it must
+        // not be swept off the clock.
+        //
         // `finish` may remove nodes from `tree`; `running` is a different field, so
         // the two borrows are disjoint and the walk stays valid.
         for r in &mut self.running {
-            if self.elapsed - r.started_at >= r.anim.duration() {
+            if !r.anim.perpetual() && self.elapsed - r.started_at >= r.anim.duration() {
                 r.anim.finish(tree);
             }
         }
         self.running
-            .retain(|r| self.elapsed - r.started_at < r.anim.duration());
+            .retain(|r| r.anim.perpetual() || self.elapsed - r.started_at < r.anim.duration());
     }
 
     /// True when nothing is left to play.
