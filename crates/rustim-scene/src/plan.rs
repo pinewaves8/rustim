@@ -240,6 +240,7 @@ mod tests {
             duration: None,
             to: None,
             angle: None,
+            turns_per_second: None,
             factor: None,
             property: None,
             about_point: None,

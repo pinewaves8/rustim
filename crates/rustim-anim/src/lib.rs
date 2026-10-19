@@ -61,8 +61,8 @@ use rustim_mobject::{NodeId, SceneTree};
 pub use composition::{AnimationGroup, DEFAULT_LAGGED_START_LAG_RATIO, Succession};
 pub use family::TransformGroup;
 pub use ops::{
-    Animate, CameraMove, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale, StyleProperty, Transform,
-    Uncreate, Wait,
+    Animate, CameraMove, Create, FadeIn, FadeOut, MoveTo, Rotate, Rotating, Scale, StyleProperty,
+    Transform, Uncreate, Wait,
 };
 pub use rustim_math::rate::{self, Rate, RateFunc};
 pub use sequence::{Sequence, StartedBeat};

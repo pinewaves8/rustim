@@ -7,7 +7,7 @@ use crate::check::CheckReport;
 use crate::event::EventKind;
 use crate::plan::{Plan, PlanStatus};
 use rustim_anim::{
-    Animate, Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Scale,
+    Animate, Animation, AnimationGroup, Create, FadeIn, FadeOut, MoveTo, Rotate, Rotating, Scale,
     StyleProperty, Succession, TransformGroup, Uncreate, WithRate,
 };
 use rustim_math::rate::Rate;
@@ -1499,6 +1499,14 @@ pub struct AnimationSpec {
     /// [`animation_for`]'s doc for why the π/4 default is not one to reproduce.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub angle: Option<f64>,
+    /// How fast a `rotating` turns, in **turns per second**.
+    ///
+    /// A rate rather than a period, and its **sign is the direction**: `0.25` is
+    /// one turn every four seconds, `-0.25` the same the other way. Required by
+    /// `rotating` and refused when absent or degenerate — a rate of zero is an
+    /// animation that does nothing, which is never what a caller meant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns_per_second: Option<f64>,
     /// What a `scale` multiplies the size by. Must be positive and finite.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub factor: Option<f64>,
@@ -1583,6 +1591,12 @@ pub enum AnimationKind {
     FadeOut,
     MoveTo,
     Rotate,
+    /// Keep turning until something stops it — the one kind with no end.
+    ///
+    /// `stop` is what ends it; the beat queue will not advance past one, because
+    /// there is nothing to advance past. `turns_per_second` is the parameter and
+    /// its sign is the direction.
+    Rotating,
     Scale,
     /// Trace the object's path on from its first point.
     Create,
@@ -1608,12 +1622,13 @@ impl AnimationKind {
     /// list. A variant added to the enum but not to this array would be
     /// invisible to a client, and no compiler can count an array literal —
     /// which is why the conformance suite asserts every name here is accepted
-    /// and the count is 11.
-    pub const ALL: [AnimationKind; 11] = [
+    /// and the count is 12.
+    pub const ALL: [AnimationKind; 12] = [
         Self::FadeIn,
         Self::FadeOut,
         Self::MoveTo,
         Self::Rotate,
+        Self::Rotating,
         Self::Scale,
         Self::Create,
         Self::Uncreate,
@@ -2917,6 +2932,30 @@ fn simple_for(tree: &SceneTree, spec: &AnimationSpec) -> Result<Box<dyn Animatio
             }
             Box::new(anim)
         }
+        AnimationKind::Rotating => {
+            let Some(rate) = spec.turns_per_second else {
+                return Err(CommandError::OutOfRange {
+                    property: "turns_per_second".into(),
+                    detail: "a rotating needs a rate in turns per second".into(),
+                });
+            };
+            // Finite **and non-zero**: zero is an animation that does nothing,
+            // and a rate that is not a number is not a rate. Both are refusals
+            // rather than silent no-ops — a model that sent one has a bug worth
+            // hearing about, and a beat that reports success while turning
+            // nothing is the class of wrong answer this layer exists to prevent.
+            if !rate.is_finite() || rate == 0.0 {
+                return Err(CommandError::OutOfRange {
+                    property: "turns_per_second".into(),
+                    detail: format!("{rate} is not a non-zero finite rate"),
+                });
+            }
+            let mut anim = Rotating::new(target, rate);
+            if let Some([x, y]) = spec.about_point {
+                anim = anim.about_point(Point::new(x, y));
+            }
+            Box::new(anim)
+        }
         AnimationKind::Scale => {
             let Some(factor) = spec.factor else {
                 return Err(CommandError::OutOfRange {
@@ -3329,6 +3368,16 @@ mod tests {
             ),
             format!(
                 r#"{{"action":"play","animation":{{"target":{id},"type":"rotate","angle":1.2,"about_point":[1.0,-2.0]}}}}"#
+            ),
+            // The one kind with no end, and the only one whose canonical spelling
+            // carries a *rate* rather than a length. A negative rate is spelled
+            // too, because the sign is the direction and a round trip that only
+            // saw positives would not pin that.
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"rotating","turns_per_second":0.25}}}}"#
+            ),
+            format!(
+                r#"{{"action":"play","animation":{{"target":{id},"type":"rotating","turns_per_second":-0.25,"about_point":[1.0,-2.0]}}}}"#
             ),
             format!(
                 r#"{{"action":"play","animation":{{"target":{id},"type":"scale","factor":2.5}}}}"#
@@ -4419,6 +4468,7 @@ mod tests {
                     duration: None,
                     to: None,
                     angle: None,
+                    turns_per_second: None,
                     factor: None,
                     property: None,
                     about_point: None,
@@ -4454,6 +4504,7 @@ mod tests {
             duration: None,
             to: None,
             angle: None,
+            turns_per_second: None,
             factor: None,
             property: None,
             about_point: None,
@@ -4655,6 +4706,40 @@ mod tests {
             animation_for(&tree, &spec(id, AnimationKind::Rotate)),
             Err(CommandError::OutOfRange { property, .. }) if property == "angle"
         ));
+    }
+
+    /// `turns_per_second` is required, and **zero is a refusal rather than a
+    /// no-op**: a rotating that turns nothing answers success while doing
+    /// nothing, which is the class of wrong answer this layer exists to prevent.
+    /// A **negative** rate is legal — the sign is the direction.
+    #[test]
+    fn a_rotating_command_needs_a_non_zero_finite_rate() {
+        let (tree, id) = scene_with_a_blank();
+        assert!(matches!(
+            animation_for(&tree, &spec(id, AnimationKind::Rotating)),
+            Err(CommandError::OutOfRange { property, .. }) if property == "turns_per_second"
+        ));
+        for bad in [0.0, f64::INFINITY, f64::NAN] {
+            let mut what = spec(id, AnimationKind::Rotating);
+            what.turns_per_second = Some(bad);
+            assert!(
+                matches!(
+                    animation_for(&tree, &what),
+                    Err(CommandError::OutOfRange { ref property, .. })
+                        if property == "turns_per_second"
+                ),
+                "a rate of {bad} must be refused"
+            );
+        }
+        // Both directions are rates. Asking through the box is also the one place
+        // in the command layer that exercises the `perpetual` forward: the
+        // scheduler drives every animation through this same container.
+        for rate in [0.25, -0.25] {
+            let mut what = spec(id, AnimationKind::Rotating);
+            what.turns_per_second = Some(rate);
+            let anim = animation_for(&tree, &what).expect("a signed rate is a rate");
+            assert!(anim.perpetual(), "and it is the kind with no end");
+        }
     }
 
     #[test]
@@ -4902,6 +4987,7 @@ mod tests {
             duration: None,
             to: None,
             angle: None,
+            turns_per_second: None,
             factor: None,
             property: None,
             about_point: None,

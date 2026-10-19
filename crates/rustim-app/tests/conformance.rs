@@ -11,7 +11,7 @@
 //! What it pins, in the order `驱动协议v1.md` §7 lists them:
 //!
 //! 1. `hello` answers with protocol 1 and a non-empty vocabulary of the sizes
-//!    the build actually has (36 actions, 12 shapes, 11 animations, 10
+//!    the build actually has (36 actions, 12 shapes, 12 animations, 10
 //!    properties, 45 rates);
 //! 2. every advertised shape and animation is accepted by the binary, and every
 //!    advertised rate is accepted on a `play` — the capability list is measured
@@ -158,7 +158,7 @@ fn hello_answers_with_the_builds_vocabulary() {
     // animation added without joining `ALL` fails here before it can ship an
     // incomplete capability list.
     assert_eq!(caps.shapes.len(), 12, "{:?}", caps.shapes);
-    assert_eq!(caps.animations.len(), 11, "{:?}", caps.animations);
+    assert_eq!(caps.animations.len(), 12, "{:?}", caps.animations);
     assert_eq!(caps.properties.len(), 10, "{:?}", caps.properties);
     assert_eq!(caps.rates.len(), 45, "{:?}", caps.rates);
     assert_eq!(caps.actions.len(), 36, "{:?}", caps.actions);
@@ -229,6 +229,11 @@ fn every_advertised_word_is_accepted_by_the_binary() {
             "rotate" => format!(r#"{{"target":{a},"type":"rotate","angle":0.5}}"#),
             "scale" => format!(r#"{{"target":{a},"type":"scale","factor":1.5}}"#),
             "transform" => format!(r#"{{"target":{a},"type":"transform","into":{b}}}"#),
+            // `rotating` has no end, which is precisely why the `stop` below is
+            // not just tidying: it is the only way a perpetual beat leaves the
+            // clock, and this loop is the one place in the suite that proves a
+            // vocabulary word can be *started* as well as accepted.
+            "rotating" => format!(r#"{{"target":{a},"type":"rotating","turns_per_second":0.25}}"#),
             "animate" => format!(
                 r#"{{"target":{a},"type":"animate","property":{{"name":"opacity","value":0.5}}}}"#
             ),
