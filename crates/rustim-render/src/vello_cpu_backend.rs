@@ -639,6 +639,82 @@ mod tests {
         );
     }
 
+    /// A **clipped** frame is the case the damage diff used to refuse outright:
+    /// vello's clip stack is positional, and a region render starts a fresh
+    /// context. The stack *is* positional — and that is why the escape was
+    /// unnecessary, because a region render replays the whole op list with an
+    /// integer shift, so the clip is re-established inside the region through the
+    /// same path moved by the same integer. This is the assertion that decides it,
+    /// and it is `assert_eq!` on the pixels rather than a tolerance.
+    ///
+    /// The square straddles the clip deliberately: if the clip were dropped, the
+    /// incremental frame would paint the corners the full render leaves empty, and
+    /// the buffers would differ.
+    #[test]
+    fn a_region_render_of_a_clipped_frame_matches_a_full_one_exactly() {
+        fn frame(colour: rustim_color::Srgb) -> DrawList {
+            let mut list = DrawList::new(32, 32);
+            list.background = Some(rustim_color::BG);
+            list.push(DrawOp::PushClip(rect_path(Rect::new(4.0, 4.0, 20.0, 20.0))));
+            list.push(DrawOp::SetTransform(Affine::IDENTITY));
+            list.push(DrawOp::SetPaint(colour));
+            list.push(DrawOp::FillPath(rect_path(Rect::new(2.0, 2.0, 26.0, 26.0))));
+            list.push(DrawOp::PopClip);
+            list
+        }
+
+        let old = frame(rustim_color::RED);
+        let new = frame(rustim_color::YELLOW);
+        let damage = new.damage_since(&old);
+        assert!(matches!(damage, Damage::Region(_)), "{damage:?}");
+
+        let mut incremental = CpuRenderer::new(32, 32);
+        incremental.render(&old).unwrap();
+        incremental.render_damaged(&new, damage).unwrap();
+
+        let mut full = CpuRenderer::new(32, 32);
+        full.render(&new).unwrap();
+        assert_eq!(
+            incremental.pixels(),
+            full.pixels(),
+            "a replayed clip has to clip the region exactly as it clipped the frame"
+        );
+    }
+
+    /// The **layer** stack's half of the same claim. A layer is positional state
+    /// too, and it was covered by the same escape; it is replayed for the same
+    /// reason, and this is the assertion rather than the argument.
+    #[test]
+    fn a_region_render_of_a_layered_frame_matches_a_full_one_exactly() {
+        fn frame(colour: rustim_color::Srgb) -> DrawList {
+            let mut list = DrawList::new(32, 32);
+            list.background = Some(rustim_color::BG);
+            list.push(DrawOp::PushLayer);
+            list.push(DrawOp::SetTransform(Affine::IDENTITY));
+            list.push(DrawOp::SetPaint(colour));
+            list.push(DrawOp::FillPath(rect_path(Rect::new(6.0, 6.0, 22.0, 22.0))));
+            list.push(DrawOp::PopLayer);
+            list
+        }
+
+        let old = frame(rustim_color::RED);
+        let new = frame(rustim_color::YELLOW);
+        let damage = new.damage_since(&old);
+        assert!(matches!(damage, Damage::Region(_)), "{damage:?}");
+
+        let mut incremental = CpuRenderer::new(32, 32);
+        incremental.render(&old).unwrap();
+        incremental.render_damaged(&new, damage).unwrap();
+
+        let mut full = CpuRenderer::new(32, 32);
+        full.render(&new).unwrap();
+        assert_eq!(
+            incremental.pixels(),
+            full.pixels(),
+            "a replayed layer has to compose exactly as it did in the full frame"
+        );
+    }
+
     #[test]
     fn an_unchanged_frame_does_not_touch_the_pixels() {
         let frame = two_square_frame(rustim_color::RED);

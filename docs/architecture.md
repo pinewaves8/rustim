@@ -88,12 +88,21 @@ one op, so a change to any glyph damages the union of that run's glyph boxes. Co
 right side to err on.
 
 **The escapes to `Full` are the cases a region render cannot express.** A size or background change
-(the frame is new, or what is under every pixel changed); a transparent background (`None` means "do
-not touch the target", which a fresh region cannot honour — it would leave the previous frame's
-pixels inside the region); and any `PushClip`/`PopClip`/`PushLayer`/`PopLayer`. The last is not
-caution: vello's clip and layer stacks are *positional*, and a region render starts a fresh context,
-so the state at the top of the region is not the state the full frame would have had there. A change
-entirely outside the frame is `None`; an identical list is `None`.
+(the frame is new, or what is under every pixel changed); and a transparent background (`None` means
+"do not touch the target", which a fresh region cannot honour — it would leave the previous frame's
+pixels inside the region). A change entirely outside the frame is `None`; an identical list is
+`None`.
+
+**A clip or a layer used to be a third escape, and it turned out not to be one.** The argument was
+that vello's two stacks are *positional* state and a region render starts a fresh context, so a clip
+opened before the region would be missing. The stacks are positional — and that is precisely why the
+escape was unnecessary: a region render replays the **whole** op list with an integer shift, so the
+clip is re-established inside the region through the same path moved by the same integer, and a layer
+composes the same way. The tests that decided it are
+`a_region_render_of_a_clipped_frame_matches_a_full_one_exactly` and its layered twin in the backend,
+whose assertion is `assert_eq!` on the pixel buffers rather than a tolerance. The consequence for a
+host is that a scene which clips *and* animates now gets a region instead of a full repaint — which
+is what the `primitives` scene would have been paying for had it moved.
 
 **The region render shifts the scene rather than the target.** In vello_cpu 0.3.0
 `RasterizerSettings::offset` is `(u16, u16)` — an *unsigned* offset, so a region at `(x0, y0)` cannot

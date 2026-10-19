@@ -129,11 +129,20 @@ impl DrawList {
     /// (an object inserted first) damages the union of every shifted op's
     /// bounds — larger than necessary, still correct.
     ///
-    /// Three cases return [`Damage::Full`] regardless of the ops: a size change,
-    /// a change of background (or a transparent one, which cannot be repainted
-    /// from nothing), and any clip or layer op — those two stacks are
-    /// positional state, and a region render starts a fresh context in which a
-    /// clip that opened before the region would be missing.
+    /// Two cases return [`Damage::Full`] regardless of the ops: a size change,
+    /// and a change of background (or a transparent one, which cannot be
+    /// repainted from nothing).
+    ///
+    /// **A clip or layer op used to be a third**, on the grounds that vello's
+    /// two stacks are positional state and a region render starts a fresh
+    /// context — in which a clip opened before the region would be missing. The
+    /// stacks *are* positional, and that is exactly why the escape turned out to
+    /// be unnecessary: a region render replays the **whole** op list with an
+    /// integer shift, so the clip is re-established inside the region through the
+    /// same path moved by the same integer. The test that decided it is
+    /// `a_region_render_of_a_clipped_frame_matches_a_full_one_exactly` in the
+    /// backend, whose assertion is `assert_eq!` on the pixel buffers rather than
+    /// a tolerance.
     pub fn damage_since(&self, old: &DrawList) -> Damage {
         if (self.width, self.height) != (old.width, old.height) {
             return Damage::Full;
@@ -149,15 +158,6 @@ impl DrawList {
         {
             return Damage::Full;
         }
-        if self.ops.iter().chain(old.ops.iter()).any(|op| {
-            matches!(
-                op,
-                DrawOp::PushClip(_) | DrawOp::PopClip | DrawOp::PushLayer | DrawOp::PopLayer
-            )
-        }) {
-            return Damage::Full;
-        }
-
         let mut bounds: Option<Rect> = None;
         let mut old_state = OpState::default();
         let mut new_state = OpState::default();
@@ -509,8 +509,11 @@ mod tests {
         assert_eq!(new.damage_since(&old), Damage::Full);
     }
 
+    /// A clip no longer forces a full repaint, and what replaces the old
+    /// expectation is the backend's pixel-for-pixel test: this one only says the
+    /// diff *finds* the moved square, which is the half that belongs here.
     #[test]
-    fn a_clip_makes_the_frame_positional_and_dirty() {
+    fn a_clip_no_longer_makes_the_frame_positional() {
         let old = frame(vec![
             DrawOp::PushClip(rect_path(Rect::new(0.0, 0.0, 32.0, 32.0))),
             DrawOp::SetPaint(rustim_color::RED),
@@ -519,7 +522,10 @@ mod tests {
         ]);
         let mut new = old.clone();
         new.ops[2] = square(5.0, 5.0, 15.0, 15.0);
-        assert_eq!(new.damage_since(&old), Damage::Full);
+        assert!(
+            matches!(new.damage_since(&old), Damage::Region(_)),
+            "a clip is replayed inside the region, so it is not a reason to repaint everything"
+        );
     }
 
     #[test]

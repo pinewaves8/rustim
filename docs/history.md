@@ -1355,3 +1355,22 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   reached; and a conformance case that plays a labelled square, stops it by label, stops it again
   (idempotent), and gets `no_such_label` for a name that is not there. Two round-trip fixtures pin
   both spellings. Count 952 → 953.
+
+- **The clip was not a reason to repaint the whole frame, and the argument for it looked sound.** The
+  damage diff returned `Damage::Full` for any `PushClip`/`PopClip`/`PushLayer`/`PopLayer`, on the
+  stated grounds that vello's two stacks are *positional* and a region render starts a fresh context
+  — so a clip opened before the region would be missing. The stacks are positional, and that is
+  exactly why the escape was unnecessary: a region render replays the **whole** op list with an
+  integer shift, so the clip is re-established inside the region through the same path moved by the
+  same integer, and a layer composes the same way.
+
+  It was settled by rendering rather than by argument, which is the only way this kind of claim can be
+  settled: two backend tests whose assertion is `assert_eq!` on the pixel buffers — a clipped frame
+  and a layered one, each changed inside the clip and repainted as a region — both byte-identical to
+  the full render. The square in the clipped case straddles the clip deliberately, so a dropped clip
+  would paint corners the full render leaves empty.
+
+  The consequence is a capability rather than a number: **a scene that clips and animates now gets a
+  region instead of a full repaint**, which is what `primitives` would have been paying for had it
+  moved. **All eight goldens are unchanged** — a damage rule changes what a frame *costs*, not what it
+  *is* — and the count moved 961 → 963.
