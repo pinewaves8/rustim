@@ -19,6 +19,7 @@
 //!    cacheable step that produces final coordinates.
 
 pub mod kind;
+pub mod ribbon;
 pub mod shapes;
 pub mod style;
 pub mod text;

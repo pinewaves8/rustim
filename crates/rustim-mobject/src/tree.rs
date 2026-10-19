@@ -110,6 +110,20 @@ pub struct Mobject {
     pub id: NodeId,
     /// Points in *local* space, before [`Mobject::transform`] is applied.
     pub points: Vec<Point>,
+    /// A width **per on-curve point**, for a stroke whose width varies along the
+    /// path — or `None` for the ordinary stroke, where the width is one number.
+    ///
+    /// It lives here rather than in [`Style`] for two reasons that agree: a width
+    /// per vertex *is* geometry rather than paint, and `Style` has to stay `Copy`
+    /// (it is copied into every draw op the walk emits) which a list cannot.
+    ///
+    /// A mobject that sets this is drawn as a filled **ribbon** rather than
+    /// through the stroker, because the stroker takes one width; see
+    /// [`crate::ribbon`] for why that is not the ribbon `Plot` was moved off.
+    /// The list must be as long as the mobject has **on-curve** points — not
+    /// control points, four per curve — and the command layer refuses a mismatch
+    /// by name rather than truncating.
+    pub stroke_widths: Option<Vec<f64>>,
     pub style: Style,
     /// The deferred transform. O(1) to set; see [`Mobject::materialize`].
     pub transform: Affine2,
@@ -192,6 +206,7 @@ impl Mobject {
         Self {
             id: NodeId::default(),
             points,
+            stroke_widths: None,
             style: Style::default(),
             transform: Affine2::IDENTITY,
             opacity: 1.0,
@@ -236,6 +251,7 @@ impl Mobject {
         let Mobject {
             id,
             points,
+            stroke_widths,
             style,
             transform,
             opacity,
@@ -251,6 +267,7 @@ impl Mobject {
         } = self;
         *id != other.id
             || *points != other.points
+            || *stroke_widths != other.stroke_widths
             || *style != other.style
             || *transform != other.transform
             || *opacity != other.opacity

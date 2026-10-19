@@ -2299,7 +2299,29 @@ impl SceneContext {
                 list.push(DrawOp::SetPaint(color));
                 list.push(DrawOp::FillPath(path.clone()));
             }
-            if m.style.stroke_opacity > 0.0
+            // **A stroke whose width varies along the path is not a stroke.**
+            // The stroker takes one width, so a variable-width line is drawn as
+            // the region it covers — a filled contour through the same anchors.
+            // It takes the *stroke's* colour and opacity, because that is what it
+            // is: the stroke, expressed the only way it can be. See
+            // `rustim_mobject::ribbon`.
+            if let Some(widths) = &m.stroke_widths {
+                if m.style.stroke_opacity > 0.0
+                    // `anchors` answers `None` for a ragged point array, which is
+                    // also the ribbon's own answer: no geometry, no contour.
+                    && let Some(anchors) = rustim_math::bezier::anchors(&m.points)
+                    && let Some(contour) = rustim_mobject::ribbon::contour(
+                        &anchors,
+                        widths,
+                        m.style.stroke_cap,
+                    )
+                {
+                    let mut color = m.style.stroke;
+                    color.components[3] = (m.opacity * m.style.stroke_opacity) as f32;
+                    list.push(DrawOp::SetPaint(color));
+                    list.push(DrawOp::FillPath(contour));
+                }
+            } else if m.style.stroke_opacity > 0.0
                 && m.style.stroke_width > 0.0
                 && m.style.stroke_width.is_finite()
             {
@@ -2516,6 +2538,61 @@ mod tests {
             .unwrap();
         // Composes multiplicatively, per CLAUDE.md's convention.
         assert!((alpha - 0.25).abs() < 1e-6, "got {alpha}");
+    }
+
+    /// A stroke whose **width varies** is drawn as the region it covers, and the
+    /// change of route is what this pins: `stroke_widths` set means one
+    /// `FillPath` and no `StrokePath`, because the stroker takes a single width.
+    ///
+    /// The counterfactual is the test above: the same plot with no width list is
+    /// a `StrokePath` and *not* a fill, so the two halves of this pair show that
+    /// the choice is the width list's and not the shape's.
+    #[test]
+    fn a_varying_width_is_a_filled_ribbon_rather_than_a_stroke() {
+        let mut ctx = scene();
+        let id = ctx.add(rustim_mobject::shapes::build(
+            ShapeKind::Plot,
+            &ShapeParams {
+                points: Some(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]),
+                thickness: Some(0.05),
+                ..Default::default()
+            },
+        ));
+        // Four widths for four anchors: `bezier::anchors` reports the start and
+        // end of *every* curve, so a two-curve plot has its shared vertex listed
+        // twice. The ribbon merges those and averages the two widths, so a caller
+        // who cares about a shared vertex gives it the same number twice — which
+        // is what the pair at the apex does here.
+        ctx.tree.get_mut(id).unwrap().stroke_widths = Some(vec![0.05, 0.4, 0.4, 0.05]);
+        ctx.tree.get_mut(id).unwrap().dirty.style = true;
+
+        let mut list = DrawList::default();
+        ctx.build_draw_list(&mut list);
+
+        assert_eq!(
+            list.ops
+                .iter()
+                .filter(|o| matches!(o, DrawOp::StrokePath { .. }))
+                .count(),
+            0,
+            "the stroker takes one width, so a varying one cannot go through it"
+        );
+        let fills: Vec<_> = list
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                DrawOp::FillPath(path) => Some(rustim_math::Shape::bounding_box(path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills.len(), 1, "one contour");
+        // Three anchors at y = 0, 1, 0 with a half-width of 0.2 in the middle:
+        // the ribbon reaches 1.2 at its widest, which a 0.05 stroke could not.
+        assert!(
+            (fills[0].y1 - 1.2).abs() < 1e-9,
+            "the ribbon is as wide as the widest width asked for: {:?}",
+            fills[0]
+        );
     }
 
     /// A plot reaches the backend as a **stroke**, never as a fill.

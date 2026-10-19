@@ -1435,7 +1435,7 @@ impl From<Axis> for rustim_director::Axis {
 /// are the names `Property`'s serde tag produces, and
 /// [`Capabilities::properties`] is the reader; a unit test parses one command
 /// per name so the two cannot drift.
-pub const PROPERTY_NAMES: [&str; 13] = [
+pub const PROPERTY_NAMES: [&str; 14] = [
     "opacity",
     "stroke_width",
     "stroke_opacity",
@@ -1449,6 +1449,7 @@ pub const PROPERTY_NAMES: [&str; 13] = [
     "position",
     "scale",
     "rotation",
+    "stroke_widths",
 ];
 
 /// A named, settable property.
@@ -1486,6 +1487,15 @@ pub enum Property {
     /// legitimate one. An empty list would have been the other spelling, and it
     /// is worse — it looks like a pattern that dashes nothing.
     StrokeDash(Option<[f64; 2]>),
+    /// A width **per on-curve point**, for a stroke that varies along the path.
+    ///
+    /// The list must be as long as `bezier::anchors` reports — which is the start
+    /// and end of *every* curve, so an interior vertex appears twice and the two
+    /// widths naming it are averaged. An **empty list clears it**, back to the
+    /// one-width stroke; that spelling is clear here where it was not for
+    /// `stroke_dash`, because "no per-point widths" is exactly what an empty list
+    /// of per-point widths means.
+    StrokeWidths(Vec<f64>),
     FillOpacity(f64),
     Label(String),
     /// What the object is, for the accessibility tree and the AI layer.
@@ -3212,13 +3222,17 @@ impl Property {
             // of a dashed line would make the dashes crawl.
             | Self::StrokeJoin(_)
             | Self::StrokeCap(_)
-            | Self::StrokeDash(_) => {
+            | Self::StrokeDash(_)
+            | Self::StrokeWidths(_) => {
                 let hint = match self {
                     Self::Position(_) => "a `move_to` animation moves an object",
                     Self::Scale(_) => "a `scale` animation resizes an object",
                     Self::Rotation(_) => "a `rotate` animation turns an object",
                     Self::StrokeJoin(_) | Self::StrokeCap(_) | Self::StrokeDash(_) => {
                         "a stroke's join, cap and dash are discrete; set them with `set`"
+                    }
+                    Self::StrokeWidths(_) => {
+                        "a width per point is geometry, not a style channel to interpolate"
                     }
                     _ => "label and kind are set instantly with `set`",
                 };
@@ -3266,6 +3280,42 @@ impl Property {
                     });
                 }
                 m.style.stroke_dash = *pattern;
+                m.dirty.style = true;
+            }
+            Self::StrokeWidths(widths) => {
+                if widths.is_empty() {
+                    m.stroke_widths = None;
+                    m.dirty.style = true;
+                    return Ok(());
+                }
+                if let Some(bad) = widths.iter().find(|w| !w.is_finite() || **w <= 0.0) {
+                    return Err(CommandError::OutOfRange {
+                        property: "stroke_widths".into(),
+                        detail: format!("{bad} is not a positive finite width"),
+                    });
+                }
+                // The count has to match the geometry, and the refusal names both
+                // numbers: a caller can only fix a mismatch if it learns what the
+                // mobject actually has. `None` from `anchors` is a ragged point
+                // array, which is a different bug and gets its own sentence.
+                let Some(anchors) = rustim_math::bezier::anchors(&m.points) else {
+                    return Err(CommandError::OutOfRange {
+                        property: "stroke_widths".into(),
+                        detail: "this object's point array is not a whole number of curves".into(),
+                    });
+                };
+                if widths.len() != anchors.len() {
+                    return Err(CommandError::OutOfRange {
+                        property: "stroke_widths".into(),
+                        detail: format!(
+                            "{} widths for {} anchors; `bezier::anchors` reports the start and \
+                             end of every curve, so an interior vertex appears twice",
+                            widths.len(),
+                            anchors.len()
+                        ),
+                    });
+                }
+                m.stroke_widths = Some(widths.clone());
                 m.dirty.style = true;
             }
             Self::StrokeOpacity(v) => {
@@ -3422,6 +3472,9 @@ mod tests {
             ),
             format!(
                 r#"{{"action":"set","target":{id},"property":{{"name":"stroke_dash","value":null}}}}"#
+            ),
+            format!(
+                r#"{{"action":"set","target":{id},"property":{{"name":"stroke_widths","value":[0.1,0.2,0.3,0.4]}}}}"#
             ),
             // The animation specs round-trip too, which is what lets a host log and
             // replay a session: `range`'s absent-field rule holds for `duration`
@@ -3963,6 +4016,7 @@ mod tests {
                 "stroke_join" => "\"round\"",
                 "stroke_cap" => "\"butt\"",
                 "stroke_dash" => "[2.0,1.0]",
+                "stroke_widths" => "[0.1,0.2]",
                 "label" => "\"方块\"",
                 "kind" => "\"square\"",
                 "position" => "[1.0,2.0]",
@@ -4554,6 +4608,71 @@ mod tests {
                 "and the hint must say why: {err}"
             );
         }
+    }
+
+    /// A width per on-curve point, and the refusal that names **both numbers**
+    /// when the list does not match the geometry — because a count is only
+    /// fixable by someone who learns what the object actually has.
+    ///
+    /// The empty list clears it, and that spelling is clear here where it was not
+    /// for `stroke_dash`: "no per-point widths" is exactly what an empty list of
+    /// per-point widths means.
+    #[test]
+    fn stroke_widths_must_match_the_anchor_count() {
+        let points = rustim_mobject::shapes::build(
+            ShapeKind::Plot,
+            &ShapeParams {
+                points: Some(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]),
+                ..Default::default()
+            },
+        )
+        .points;
+        let mut tree = SceneTree::new();
+        let id = tree.insert(Mobject::new(points));
+        let anchors = rustim_math::bezier::anchors(&tree.get(id).unwrap().points).unwrap();
+        assert_eq!(
+            anchors.len(),
+            4,
+            "two curves, so the start and end of each: an interior vertex twice"
+        );
+
+        let set = |tree: &mut SceneTree, widths: Vec<f64>| {
+            apply(
+                tree,
+                &Command::Set {
+                    target: id.into(),
+                    property: Property::StrokeWidths(widths),
+                },
+            )
+        };
+
+        let err = set(&mut tree, vec![0.5; anchors.len() + 1]).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("5 widths"), "{text}");
+        assert!(text.contains("4 anchors"), "{text}");
+        assert!(
+            text.contains("twice"),
+            "and it has to explain the duplicate: {text}"
+        );
+        assert_eq!(
+            tree.get(id).unwrap().stroke_widths,
+            None,
+            "a refusal changes nothing"
+        );
+
+        set(&mut tree, vec![0.5; anchors.len()]).unwrap();
+        assert_eq!(
+            tree.get(id).unwrap().stroke_widths.as_ref().map(Vec::len),
+            Some(anchors.len())
+        );
+
+        assert!(matches!(
+            set(&mut tree, vec![0.0; anchors.len()]),
+            Err(CommandError::OutOfRange { ref property, .. }) if property == "stroke_widths"
+        ));
+
+        set(&mut tree, Vec::new()).unwrap();
+        assert_eq!(tree.get(id).unwrap().stroke_widths, None);
     }
 
     #[test]
