@@ -1150,9 +1150,9 @@ pairing end to end, because each unit hop can stay green while the scene stops s
   `frame: [2560, 1440]` with `visible` unchanged at `[14.222, 8.0]`, i.e. the same world extent at
   the right resolution. Honest note: `Resized` does arrive before the first redraw on macOS in
   practice, so that one was **not** demonstrated as a user-visible defect — it removes a transient
-  wrong state rather than fixing an observed symptom. Left open, and neither is a code gap:
-  **Windows** has no baseline (same procedure, `windows-x86_64`), and **`--video out.mp4`** needs an
-  `ffmpeg` neither macOS nor Windows ships.
+  wrong state rather than fixing an observed symptom. Left open at that point, and neither was a code
+  gap: **Windows** had no baseline (the same procedure, `windows-x86_64`, closed by the next entry),
+  and **`--video out.mp4`** needs an `ffmpeg` neither macOS nor Windows ships.
 
 - **The platform matrix is closed — and the four baselines are one image.** The first CI run this
   repository ever had failed on both x86_64 legs for want of a baseline and uploaded

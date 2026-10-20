@@ -26,9 +26,13 @@ probes are the evidence for every number quoted in this file and in `方案建�
 2. `从零用 Rust 重写 Manim 最小验证教程.wps` — a 22-page tutorial (OLE2/Word 97 format, extract with a
    custom reader; no `catdoc`/`libreoffice`) that defined a module layout, trait designs and code
    sketches for a deliberately minimal ~800-line version. **It is an external input and is
-   deliberately *not* in this repository** — it was removed from the history on 2026-10-19 because
-   its provenance is not ours to redistribute, and a binary Word 97 document is not reviewable here
-   anyway. What the workspace carries is where it **disagrees** with the tutorial, in
+   deliberately *not* in this repository** — its provenance is not ours to redistribute, and a binary
+   Word 97 document is not reviewable here anyway. It was removed from the branch history on
+   2026-10-19, then purged from the server on 2026-10-20 by deleting the GitHub repository and
+   recreating it from the same commits, so the blob is unreachable by SHA as well as by path.
+   **That also reset the repository's CI history**: the "first all-green run" quoted below is a real
+   run whose record lived in the deleted repository, and the run on the recreated one is where the
+   record lives now. What the workspace carries is where it **disagrees** with the tutorial, in
    [`docs/architecture.md`](docs/architecture.md) ("Where the workspace diverges from the
    tutorial"): **its code blocks are illustrative sketches, not compilable code**, and the workspace
    does not follow its flat `src/` layout.
@@ -56,7 +60,9 @@ manual is a user-facing wrong answer that nothing in CI reads. "Confirmed by a d
 
 **Verified green as of 2026-10-19 in CI, on all three target platforms at once** — the first
 all-green run this repository has ever had (macOS 26 arm64, Ubuntu 24.04 x64 and Windows x64, every
-job): **939 tests** (unit, integration and doctest — `cargo test --workspace` reproduces the number),
+job): **963 tests** (unit, integration and doctest — `cargo test --workspace` reproduces the number;
+the run that first went green measured 939, and the suite has grown since, which
+`docs/history.md`'s "count moved …" lines track step by step),
 `clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` clean, all eight golden
 scenes matching their checked-in baselines **on each platform**, and the two `cargo tree` guard jobs
 (the wasm32 semantic kernel, and Typst staying inside `rustim-text`). Two development machines agree:
@@ -73,9 +79,11 @@ not cover had never executed a test at all. The first run found five things, thr
 pre-existing and Windows-only (see `docs/history.md`); that is what a platform matrix is for, and it
 is why the run is now the evidence rather than the configuration.
 
-**Windows has no golden baseline**, so the suite **fails there by design** — a missing baseline is a
-failure, never a skip. That is the expected state on that platform, not a regression: **do not invent
-a baseline, and do not weaken the missing-baseline rule** to make a job green.
+**All four baseline sets are committed, so no platform is missing one.** The missing-baseline rule
+still stands *as a rule* — a missing baseline is a failure, never a skip, because skipping is how a
+whole platform goes unchecked — but it no longer names a platform: Windows was the last one owed, and
+`windows-x86_64.png` closed it from the CI artifact (see the golden rules below). **Do not weaken the
+rule** for a platform that has genuinely never rendered.
 
 ## What rustim is
 
@@ -150,8 +158,8 @@ cargo build --release -p rustim-mcp  # the MCP server a client launches on stdio
 cargo run -p rustim-mcp -- --scene blank --clock manual   # speak JSON-RPC on stdin by hand
 #   initialize / tools/list / tools/call; see 驱动协议v1.md §1.3 and 使用说明.md §4.6
 cargo test --workspace               # unit tests across all crates
-#   Windows: the 8 golden cases FAIL by design — no windows-*.png baselines are committed
-#   (a missing baseline is a failure, never a skip). Read the golden rules below before touching them.
+#   the 8 golden cases each need a <os>-<arch> baseline; all four sets are committed, so no
+#   platform skips — a missing baseline is a failure, never a skip. Read the golden rules below.
 cargo test -p rustim-math ease_in_out       # a single test by name
 cargo test -p rustim-math --test manim_parity   # replay the checked-in Manim fixtures
 cargo test -p rustim-app --test goldens         # compare renders to the checked-in baselines
@@ -315,9 +323,9 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   registry and the suite disagree in either direction, so a new scene cannot skip its baseline.
 - **A missing baseline fails.** Never skip: that is how a whole platform goes unchecked. The failing
   run leaves its render in `target/golden-artifacts/`, which the CI job uploads, so bootstrapping a
-  platform is "download, review, commit". **`linux-aarch64.png` and `macos-aarch64.png` are checked in
-  for all eight scenes; Windows has none**, so the suite still fails there by design rather than
-  skipping. That remains development-list item 1.
+  platform is "download, review, commit". **All four sets are checked in for all eight scenes** —
+  `linux-aarch64`, `linux-x86_64`, `macos-aarch64` and `windows-x86_64` — so no platform skips today;
+  the route above is what closed the last two, and it is the route to use for a fifth one.
 - **What the baselines turned out to be: four platforms, one image.** All four checked-in sets —
   `linux-aarch64`, `linux-x86_64`, `macos-aarch64` and `windows-x86_64` — are **byte-for-byte
   identical** for every scene. The first two were made on development machines; the x86_64 pair came
@@ -335,17 +343,17 @@ every scene the `--scene` registry offers and compares the render, pixel by pixe
   reading is "the effect it guards against has not been seen yet", not "the split is unnecessary".
   What would still move it: a rustc whose codegen changes, a CPU whose runtime SIMD level the
   current scenes do not reach, or a scene touching a part of the rasteriser these eight do not.
-- **The CI runners are not the machine the baselines were made on, and for Linux that has always
-  meant a red leg.** `platform()` derives the name from the *runner's* arch, and GitHub's
-  `ubuntu-latest` is **x64** — `Ubuntu 24.04 | x64 | ubuntu-latest`, with the arm64 image under a
-  separate label, `ubuntu-24.04-arm` — while `macos-26` is arm64. So the three legs ask for
-  `linux-x86_64.png`, `macos-aarch64.png` and `windows-x86_64.png`. The committed pair is
-  `linux-aarch64` + `macos-aarch64`, so **CI's Linux leg could never have passed either**, on any
-  run, and the "Verified green … on linux-aarch64" status above is a **development machine**, not a
-  runner: to this suite they are different platforms. That is what the CI-artifact route is for, and
-  it worked — both failing legs uploaded `target/golden-artifacts/`, and the `linux-x86_64` and
-  `windows-x86_64` baselines now in the tree came from exactly those downloads. **No extra hardware
-  was needed to close the platform matrix**; all four sets now exist, and they are identical (below).
+- **The CI runners are not the machine the baselines were made on, which is why CI went red before it
+  went green.** `platform()` derives the name from the *runner's* arch, and GitHub's `ubuntu-latest`
+  is **x64** — `Ubuntu 24.04 | x64 | ubuntu-latest`, with the arm64 image under a separate label,
+  `ubuntu-24.04-arm` — while `macos-26` is arm64. So the three legs ask for `linux-x86_64.png`,
+  `macos-aarch64.png` and `windows-x86_64.png`, while only `linux-aarch64` + `macos-aarch64` were
+  committed: **the Linux leg could never have passed, on any run**, and the "Verified green … on
+  linux-aarch64" status above described a **development machine**, not a runner — to this suite they
+  are different platforms. That is what the CI-artifact route is for, and it worked: both failing legs
+  uploaded `target/golden-artifacts/`, and the `linux-x86_64` and `windows-x86_64` baselines in the
+  tree came from exactly those downloads. **No extra hardware was needed to close the platform
+  matrix**; all four sets now exist, and they are identical (below).
 - **The macOS route is now local, and it beats the CI-artifact route.** The baseline is produced by
   `BLESS=1 cargo test -p rustim-app --test goldens` on the machine itself (see "Commands"), in the
   **debug** profile, because both CI jobs that run goldens use a plain `cargo test`. `platform()`

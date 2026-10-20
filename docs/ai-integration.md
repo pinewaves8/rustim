@@ -581,7 +581,7 @@ of I/O and of a JSON parser (it compiles to wasm).
   empty file rather than `/dev/null`, which Unix has and Windows does not.
 - **`--script` without `--scene` runs on a `BlankScene`** — an empty `construct`, deliberately **not**
   in the `--scene` registry, so `--help` does not list it and the golden suite does not owe it a
-  baseline on three platforms.
+  baseline on any platform (the count is not the point — not being in the registry is).
 - **A `narrate` line is paced by `at`, not by where it sits in the file.** Every line of a file feed
   is applied at t = 0 — that is the determinism property, not a quirk — so two `narrate` lines
   without `at` are both due in the frame the file is read. Its reply is a present-but-empty diff,
