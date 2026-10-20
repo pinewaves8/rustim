@@ -412,8 +412,10 @@ matched pair: the `scene_by_name` match (~:1106) and the literal array in `scene
 `--help` prints. The baseline guarantee above reads `--help`, so a scene wired into the match but not
 into that array is *not* offered by `--help`, and the suite's check cannot see it — it compiles, runs,
 and silently skips its baseline. Register it in both, then bootstrap the baseline for the arch you
-are on; the other two platforms would be bootstrapped from the CI artifact, which is still owed
-(above).
+are on — `BLESS=1` locally, or the failing CI job's `target/golden-artifacts/` for a platform you
+cannot run (above). All four sets are committed today, so this applies to a **new scene**, which
+owes a baseline on every one of them.
+
 ## Architecture
 
 This section is **orientation only**: the crate map, the frame, the two structural changes relative to
